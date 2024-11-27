@@ -2881,6 +2881,80 @@ def predict_next_hour(model, X, hour, prev_value, data, target_date):
             else:
                 prediction = max(prediction, clear_sky * 0.1)  # At least 10% of clear sky
         
+        # Add specific handling for afternoon decline (15-17)
+        elif 15 <= hour <= 17:
+            # Get historical data for this hour
+            historical_days = 7
+            historical_values = []
+            
+            for i in range(1, historical_days + 1):
+                prev_day = target_date - pd.Timedelta(days=i)
+                prev_day_data = data[
+                    (data['timestamp'].dt.date == prev_day) & 
+                    (data['hour'] == hour)
+                ]
+                if not prev_day_data.empty:
+                    historical_values.append(prev_day_data['Solar Rad - W/m^2'].iloc[0])
+            
+            # Calculate afternoon decline rate
+            decline_factors = {
+                15: 0.6,  # Expect 60% of 14:00 value
+                16: 0.4,  # Expect 40% of 14:00 value
+                17: 0.2   # Expect 20% of 14:00 value
+            }
+            
+            # Get the 14:00 value as reference
+            reference_data = data[
+                (data['timestamp'].dt.date == target_date) & 
+                (data['hour'] == 14)
+            ]
+            
+            if not reference_data.empty:
+                reference_value = reference_data['Solar Rad - W/m^2'].iloc[0]
+                # Base prediction on reference value
+                prediction = reference_value * decline_factors[hour]
+            else:
+                # Use previous hour as reference if 14:00 not available
+                prediction = prev_value * 0.7  # 30% decline from previous hour
+            
+            # Get current weather conditions
+            current_conditions = data[data['timestamp'].dt.date == target_date].iloc[0]
+            
+            # Weather-based adjustments
+            if current_conditions['Average Humidity'] > 85:
+                prediction *= 0.8  # Reduce more for high humidity
+            elif current_conditions['Average Humidity'] < 75:
+                prediction *= 1.2  # Reduce less for low humidity
+            
+            # UV Index impact
+            if current_conditions['UV Index'] > 0:
+                prediction *= (1 + current_conditions['UV Index'] * 0.1)
+            
+            # Set reasonable bounds based on historical data
+            if historical_values:
+                min_value = min(historical_values) * 0.8
+                max_value = max(historical_values) * 1.2
+            else:
+                # Fallback bounds based on hour
+                if hour == 15:
+                    min_value, max_value = 150, 300
+                elif hour == 16:
+                    min_value, max_value = 100, 200
+                else:  # hour 17
+                    min_value, max_value = 30, 100
+            
+            # Ensure prediction stays within bounds
+            prediction = min(max(prediction, min_value), max_value)
+            
+            # Ensure prediction doesn't exceed previous hour
+            if prev_value > 0:
+                prediction = min(prediction, prev_value * 0.95)  # Max 95% of previous hour
+            
+            # Clear sky adjustment
+            clear_sky = calculate_clear_sky_radiation(hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, target_date)
+            max_clear_sky = clear_sky * decline_factors[hour]  # Use same decline factors for clear sky
+            prediction = min(prediction, max_clear_sky)
+
         return prediction
         
     except Exception as e:
