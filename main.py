@@ -511,8 +511,7 @@ class CustomLoss(nn.Module):
                 torch.clamp(morning_penalty.mean(), max=1e6) +
                 torch.clamp(peak_penalty.mean(), max=1e6) +
                 torch.clamp(night_penalty.mean(), max=1e6) +
-                torch.clamp(rapid_change_penalty.mean(), max=1e6)
-            )
+                torch.clamp(rapid_change_penalty.mean(), max=1e6))
             
             return total_loss
             
@@ -2480,8 +2479,8 @@ def predict_historical_hours(model, data, target_date):
         print("\nHistorical Predictions Analysis:")
         print("================================")
         
-        # Predict each hour from 0 to current_hour-1
-        for hour in range(current_hour):
+        # Predict each hour up to and including current hour
+        for hour in range(current_hour + 1):  # Changed to include current hour
             try:
                 # Get actual value for this hour directly from dataset
                 hour_data = day_data[day_data['hour'] == hour]
@@ -2494,68 +2493,184 @@ def predict_historical_hours(model, data, target_date):
                 prev_hour_data = day_data[day_data['hour'] == hour - 1]
                 prev_value = prev_hour_data['Solar Rad - W/m^2'].iloc[0] if not prev_hour_data.empty else 0
                 
-                # Prepare base features first
-                feature_vector = []
-                for feature in base_features:
-                    if feature in hour_data.columns:
-                        feature_vector.append(float(hour_data[feature].iloc[0]))
-                    else:
-                        print(f"Warning: Missing feature {feature}")
-                        feature_vector.append(0.0)
-                
-                # Add time features
-                hour_sin = np.sin(2 * np.pi * hour / 24)
-                hour_cos = np.cos(2 * np.pi * hour / 24)
-                
-                # Combine all features
-                X = np.array([feature_vector + [hour_sin, hour_cos]])
+                # Calculate all features consistently
+                feature_vector = calculate_prediction_features(data, day_data, hour, prev_value, target_date)
                 
                 # Scale features
-                X_scaled = scaler_X.transform(X)
+                X_scaled = scaler_X.transform(np.array([feature_vector]))
+                
+                # Split features for model input
+                weather_features = torch.FloatTensor(X_scaled[:, :-2])
+                time_features = torch.FloatTensor(X_scaled[:, -2:])
                 
                 # Make prediction
-                prediction = predict_next_hour(model, X_scaled, hour, prev_value, data, target_date)
+                model.eval()
+                with torch.no_grad():
+                    prediction = model(weather_features, time_features)
+                    prediction = scaler_y.inverse_transform(prediction.numpy())[0][0]
                 
-                # Store prediction if valid
-                if prediction is not None:
-                    predictions.append({
-                        'hour': hour,
-                        'timestamp': f"{target_date} {hour:02d}:00",
-                        'actual': actual_value,
-                        'predicted': prediction,
-                        'absolute_error': abs(prediction - actual_value),
-                        'relative_error': (abs(prediction - actual_value) / actual_value * 100) if actual_value != 0 else 0
-                    })
-                    
-                    print(f"\nHour {hour:02d}:00")
-                    print(f"Actual: {actual_value:.2f} W/m²")
-                    print(f"Predicted: {prediction:.2f} W/m²")
-                    print(f"Absolute Error: {abs(prediction - actual_value):.2f} W/m²")
-                    print(f"Relative Error: {(abs(prediction - actual_value) / actual_value * 100) if actual_value != 0 else 0:.1f}%")
+                # Validate and adjust prediction
+                prediction = validate_and_adjust_prediction(prediction, hour, prev_value, target_date)
+                
+                # Store prediction
+                predictions.append({
+                    'hour': hour,
+                    'timestamp': f"{target_date} {hour:02d}:00",
+                    'actual': actual_value,
+                    'predicted': prediction,
+                    'absolute_error': abs(prediction - actual_value),
+                    'relative_error': (abs(prediction - actual_value) / actual_value * 100) if actual_value != 0 else 0
+                })
+                
+                print(f"\nHour {hour:02d}:00")
+                print(f"Actual: {actual_value:.2f} W/m²")
+                print(f"Predicted: {prediction:.2f} W/m²")
+                print(f"Absolute Error: {abs(prediction - actual_value):.2f} W/m²")
+                print(f"Relative Error: {(abs(prediction - actual_value) / actual_value * 100) if actual_value != 0 else 0:.1f}%")
                 
             except Exception as hour_error:
                 print(f"Error processing hour {hour}: {str(hour_error)}")
                 continue
         
-        if not predictions:
-            print("No valid predictions generated")
-            return None
-            
-        # Create DataFrame with results
-        results_df = pd.DataFrame(predictions)
-        
-        # Calculate summary statistics
-        mean_abs_error = results_df['absolute_error'].mean()
-        mean_rel_error = results_df['relative_error'].mean()
-        
-        print("\nSummary Statistics:")
-        print(f"Mean Absolute Error: {mean_abs_error:.2f} W/m²")
-        print(f"Mean Relative Error: {mean_rel_error:.1f}%")
-        
-        return results_df
+        return pd.DataFrame(predictions) if predictions else None
         
     except Exception as e:
         print(f"Error in predict_historical_hours: {str(e)}")
+        traceback.print_exc()
+        return None
+
+def calculate_prediction_features(data, day_data, hour, prev_value, target_date):
+    """Calculate features consistently for both historical and next hour predictions"""
+    try:
+        # Get data up to the prediction hour
+        historical_data = data[
+            (data['timestamp'].dt.date <= target_date) & 
+            ((data['timestamp'].dt.date < target_date) | 
+             (data['timestamp'].dt.date == target_date) & 
+             (data['hour'] < hour))
+        ]
+        
+        # Calculate rolling statistics
+        rolling_mean_3h = historical_data.groupby('date')['Solar Rad - W/m^2'].rolling(3).mean().reset_index()['Solar Rad - W/m^2'].iloc[-1]
+        
+        # Get previous day same hour
+        prev_day = target_date - pd.Timedelta(days=1)
+        prev_day_same_hour = data[
+            (data['timestamp'].dt.date == prev_day) & 
+            (data['hour'] == hour)
+        ]['Solar Rad - W/m^2'].iloc[0] if not data[
+            (data['timestamp'].dt.date == prev_day) & 
+            (data['hour'] == hour)
+        ].empty else 0
+        
+        # Calculate clear sky radiation
+        clear_sky = calculate_clear_sky_radiation(hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, target_date)
+        
+        # Get current weather conditions
+        current_conditions = day_data[day_data['hour'] == hour].iloc[0]
+        
+        # Calculate all base features
+        feature_vector = []
+        
+        # Ramp features
+        ramp_up_rate = prev_value - historical_data['Solar Rad - W/m^2'].iloc[-1] if len(historical_data) > 0 else 0
+        clear_sky_ratio = prev_value / clear_sky if clear_sky > 0 else 0
+        hour_ratio = hour / 24.0
+        
+        # Add features in the same order as base_features
+        feature_vector.extend([
+            ramp_up_rate,
+            clear_sky_ratio,
+            hour_ratio,
+            prev_value,
+            rolling_mean_3h,
+            prev_day_same_hour,
+            current_conditions['UV Index'],
+            current_conditions['Average Temperature'],
+            current_conditions['Average Humidity'],
+            clear_sky
+        ])
+        
+        # Add time features
+        hour_sin = np.sin(2 * np.pi * hour / 24)
+        hour_cos = np.cos(2 * np.pi * hour / 24)
+        feature_vector.extend([hour_sin, hour_cos])
+        
+        return feature_vector
+        
+    except Exception as e:
+        print(f"Error in calculate_prediction_features: {str(e)}")
+        traceback.print_exc()
+        return None
+
+def validate_and_adjust_prediction(prediction, hour, prev_value, target_date):
+    """Validate and adjust predictions consistently"""
+    try:
+        # Night hours (0-5, 18-23) should be zero
+        if hour < 6 or hour >= 18:
+            return 0.0
+            
+        # Get clear sky radiation for reference
+        clear_sky = calculate_clear_sky_radiation(hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, target_date)
+        
+        # Apply time-based adjustments
+        if hour == 6:
+            prediction = min(max(prediction, 10), 50)
+        elif hour == 7:
+            prediction = min(max(prediction, 50), 200)
+        elif hour >= 8 and hour <= 16:
+            prediction = min(prediction, clear_sky * 1.1)
+            if 10 <= hour <= 14:  # Peak hours
+                prediction = max(prediction, clear_sky * 0.3)
+            else:
+                prediction = max(prediction, clear_sky * 0.1)
+        elif hour == 17:
+            prediction = min(prediction, prev_value * 0.7)
+            
+        return max(0, prediction)  # Ensure non-negative
+        
+    except Exception as e:
+        print(f"Error in validate_and_adjust_prediction: {str(e)}")
+        return prediction
+
+def predict_next_hour(model, data, current_hour, target_date):
+    """Predict next hour using the same process as historical predictions"""
+    try:
+        next_hour = current_hour + 1
+        
+        # Get previous value (current hour's value)
+        current_hour_data = data[
+            (data['timestamp'].dt.date == target_date) & 
+            (data['hour'] == current_hour)
+        ]
+        prev_value = current_hour_data['Solar Rad - W/m^2'].iloc[0] if not current_hour_data.empty else 0
+        
+        # Calculate features using the same function as historical predictions
+        feature_vector = calculate_prediction_features(data, current_hour_data, next_hour, prev_value, target_date)
+        
+        if feature_vector is None:
+            return None
+            
+        # Scale features
+        X_scaled = scaler_X.transform(np.array([feature_vector]))
+        
+        # Split features for model input
+        weather_features = torch.FloatTensor(X_scaled[:, :-2])
+        time_features = torch.FloatTensor(X_scaled[:, -2:])
+        
+        # Make prediction
+        model.eval()
+        with torch.no_grad():
+            prediction = model(weather_features, time_features)
+            prediction = scaler_y.inverse_transform(prediction.numpy())[0][0]
+        
+        # Validate and adjust prediction
+        prediction = validate_and_adjust_prediction(prediction, next_hour, prev_value, target_date)
+        
+        return prediction
+        
+    except Exception as e:
+        print(f"Error in predict_next_hour: {str(e)}")
         traceback.print_exc()
         return None
 
@@ -2706,262 +2821,6 @@ def augment_training_data(X, y):
     
     return X, y
 
-def predict_next_hour(model, X, hour, prev_value, data, target_date):
-    try:
-        # Verify input dimensions
-        if X.shape[1] != 12:  # 10 weather features + 2 time features
-            raise ValueError(f"Expected 12 features, got {X.shape[1]}")
-        
-        # Split features
-        weather_features = torch.FloatTensor(X[:, :-2])  # First 10 features
-        time_features = torch.FloatTensor(X[:, -2:])     # Last 2 features
-        
-        # Night hours (0-5, 18-23) should be zero
-        if hour < 6 or hour >= 18:
-            return 0.0
-            
-        # Make base prediction
-        model.eval()
-        with torch.no_grad():
-            prediction = model(weather_features, time_features)
-            if prediction is None:
-                return None
-                
-            # Inverse transform the prediction to get actual scale
-            prediction = scaler_y.inverse_transform(prediction.numpy())[0][0]
-        
-        # Get clear sky radiation for reference
-        clear_sky = calculate_clear_sky_radiation(
-            hour, 
-            DAVAO_LATITUDE, 
-            DAVAO_LONGITUDE, 
-            target_date
-        )
-        
-        # Enhanced early morning adjustments (6-7 AM)
-        if hour == 6:
-            # Get the last 7 days of 6 AM values for better historical context
-            historical_days = 7
-            historical_6am = []
-            
-            for i in range(1, historical_days + 1):
-                prev_day = target_date - pd.Timedelta(days=i)
-                prev_day_data = data[
-                    (data['timestamp'].dt.date == prev_day) & 
-                    (data['hour'] == 6)
-                ]
-                if not prev_day_data.empty:
-                    historical_6am.append(prev_day_data['Solar Rad - W/m^2'].iloc[0])
-            
-            if historical_6am:
-                # Calculate statistics from historical data
-                avg_6am = np.mean(historical_6am)
-                max_6am = np.max(historical_6am)
-                min_6am = np.min(historical_6am)
-                
-                # Get current weather conditions
-                current_conditions = data[data['timestamp'].dt.date == target_date].iloc[0]
-                
-                # Base prediction on historical average
-                prediction = avg_6am
-                
-                # Adjust based on weather conditions
-                if current_conditions['Average Humidity'] > 85:
-                    prediction = min_6am * 1.2  # Use 120% of historical minimum for very humid conditions
-                elif current_conditions['Average Humidity'] < 75:
-                    prediction = max_6am * 0.9  # Use 90% of historical maximum for dry conditions
-                
-                # Temperature adjustment
-                if current_conditions['Average Temperature'] > 24:
-                    prediction *= 1.2  # Increase for warmer mornings
-                elif current_conditions['Average Temperature'] < 22:
-                    prediction *= 0.8  # Decrease for cooler mornings
-                
-                # Ensure prediction stays within reasonable bounds
-                min_value = max(15, min_6am * 0.8)  # At least 15 W/m² or 80% of historical minimum
-                max_value = min(50, max_6am * 1.2)  # At most 50 W/m² or 120% of historical maximum
-                prediction = min(max(prediction, min_value), max_value)
-            else:
-                # Fallback if no historical data
-                prediction = 25  # Conservative baseline
-            
-        elif hour == 7:
-            # Get historical 7 AM data
-            historical_days = 7
-            historical_7am = []
-            historical_6am_to_7am_ratios = []  # Track the 6AM to 7AM increase ratios
-            
-            for i in range(1, historical_days + 1):
-                prev_day = target_date - pd.Timedelta(days=i)
-                prev_day_7am = data[
-                    (data['timestamp'].dt.date == prev_day) & 
-                    (data['hour'] == 7)
-                ]
-                prev_day_6am = data[
-                    (data['timestamp'].dt.date == prev_day) & 
-                    (data['hour'] == 6)
-                ]
-                
-                if not prev_day_7am.empty and not prev_day_6am.empty:
-                    val_7am = prev_day_7am['Solar Rad - W/m^2'].iloc[0]
-                    val_6am = prev_day_6am['Solar Rad - W/m^2'].iloc[0]
-                    historical_7am.append(val_7am)
-                    if val_6am > 0:
-                        historical_6am_to_7am_ratios.append(val_7am / val_6am)
-            
-            if historical_7am:
-                # Calculate statistics
-                avg_7am = np.mean(historical_7am)
-                max_7am = np.max(historical_7am)
-                min_7am = np.min(historical_7am)
-                avg_ratio = np.mean(historical_6am_to_7am_ratios) if historical_6am_to_7am_ratios else 6.0
-                
-                # Get current weather conditions
-                current_conditions = data[data['timestamp'].dt.date == target_date].iloc[0]
-                
-                # Start with historical average as base
-                prediction = avg_7am
-                
-                # Adjust based on previous hour (6 AM) value
-                if prev_value > 0:
-                    ratio_prediction = prev_value * avg_ratio
-                    # Blend historical average with ratio-based prediction
-                    prediction = (prediction * 0.3) + (ratio_prediction * 0.7)
-                
-                # Weather adjustments
-                if current_conditions['Average Humidity'] > 85:
-                    prediction *= 0.8  # Reduce for high humidity
-                elif current_conditions['Average Humidity'] < 75:
-                    prediction *= 1.2  # Increase for low humidity
-                
-                # Temperature impact
-                if current_conditions['Average Temperature'] > 24:
-                    prediction *= 1.2
-                elif current_conditions['Average Temperature'] < 22:
-                    prediction *= 0.8
-                
-                # UV Index impact
-                if current_conditions['UV Index'] > 0:
-                    prediction *= (1 + current_conditions['UV Index'] * 0.2)
-                
-                # Set minimum and maximum bounds
-                min_value = max(150, min_7am)  # At least 150 W/m² or historical minimum
-                max_value = min(350, max_7am * 1.2)  # At most 350 W/m² or 120% of historical maximum
-                
-                # If previous hour (6 AM) was high, ensure significant increase
-                if prev_value > 30:
-                    min_value = max(min_value, prev_value * 4)  # At least 4x the 6 AM value
-                
-                prediction = min(max(prediction, min_value), max_value)
-                
-                # Clear sky adjustment
-                clear_sky = calculate_clear_sky_radiation(hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, target_date)
-                max_clear_sky = clear_sky * 0.6  # Allow up to 60% of clear sky at 7 AM
-                prediction = min(prediction, max_clear_sky)
-                
-            else:
-                # Fallback with more aggressive baseline
-                prediction = 200  # Higher baseline for 7 AM
-                
-                # Still consider rate of increase from 6 AM
-                if prev_value > 0:
-                    prediction = max(prediction, prev_value * 5)  # At least 5x the 6 AM value
-                
-                # Clear sky adjustment
-                clear_sky = calculate_clear_sky_radiation(hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, target_date)
-                prediction = min(prediction, clear_sky * 0.6)
-        
-        elif hour >= 8 and hour <= 16:
-            # Ensure prediction doesn't exceed clear sky radiation
-            prediction = min(prediction, clear_sky * 1.1)  # Allow slight exceed for edge cases
-            
-            # Ensure reasonable minimum based on time of day
-            if 10 <= hour <= 14:  # Peak hours
-                prediction = max(prediction, clear_sky * 0.3)  # At least 30% of clear sky
-            else:
-                prediction = max(prediction, clear_sky * 0.1)  # At least 10% of clear sky
-        
-        # Add specific handling for afternoon decline (15-17)
-        elif 15 <= hour <= 17:
-            # Get historical data for this hour
-            historical_days = 7
-            historical_values = []
-            
-            for i in range(1, historical_days + 1):
-                prev_day = target_date - pd.Timedelta(days=i)
-                prev_day_data = data[
-                    (data['timestamp'].dt.date == prev_day) & 
-                    (data['hour'] == hour)
-                ]
-                if not prev_day_data.empty:
-                    historical_values.append(prev_day_data['Solar Rad - W/m^2'].iloc[0])
-            
-            # Calculate afternoon decline rate
-            decline_factors = {
-                15: 0.6,  # Expect 60% of 14:00 value
-                16: 0.4,  # Expect 40% of 14:00 value
-                17: 0.2   # Expect 20% of 14:00 value
-            }
-            
-            # Get the 14:00 value as reference
-            reference_data = data[
-                (data['timestamp'].dt.date == target_date) & 
-                (data['hour'] == 14)
-            ]
-            
-            if not reference_data.empty:
-                reference_value = reference_data['Solar Rad - W/m^2'].iloc[0]
-                # Base prediction on reference value
-                prediction = reference_value * decline_factors[hour]
-            else:
-                # Use previous hour as reference if 14:00 not available
-                prediction = prev_value * 0.7  # 30% decline from previous hour
-            
-            # Get current weather conditions
-            current_conditions = data[data['timestamp'].dt.date == target_date].iloc[0]
-            
-            # Weather-based adjustments
-            if current_conditions['Average Humidity'] > 85:
-                prediction *= 0.8  # Reduce more for high humidity
-            elif current_conditions['Average Humidity'] < 75:
-                prediction *= 1.2  # Reduce less for low humidity
-            
-            # UV Index impact
-            if current_conditions['UV Index'] > 0:
-                prediction *= (1 + current_conditions['UV Index'] * 0.1)
-            
-            # Set reasonable bounds based on historical data
-            if historical_values:
-                min_value = min(historical_values) * 0.8
-                max_value = max(historical_values) * 1.2
-            else:
-                # Fallback bounds based on hour
-                if hour == 15:
-                    min_value, max_value = 150, 300
-                elif hour == 16:
-                    min_value, max_value = 100, 200
-                else:  # hour 17
-                    min_value, max_value = 30, 100
-            
-            # Ensure prediction stays within bounds
-            prediction = min(max(prediction, min_value), max_value)
-            
-            # Ensure prediction doesn't exceed previous hour
-            if prev_value > 0:
-                prediction = min(prediction, prev_value * 0.95)  # Max 95% of previous hour
-            
-            # Clear sky adjustment
-            clear_sky = calculate_clear_sky_radiation(hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, target_date)
-            max_clear_sky = clear_sky * decline_factors[hour]  # Use same decline factors for clear sky
-            prediction = min(prediction, max_clear_sky)
-
-        return prediction
-        
-    except Exception as e:
-        print(f"Error in predict_next_hour: {str(e)}")
-        traceback.print_exc()
-        return None
-
 def main():
     try:
         print("Starting solar radiation prediction pipeline...")
@@ -3021,104 +2880,40 @@ def main():
             print("\nGenerating Historical Predictions...")
             historical_results = predict_historical_hours(model, data, target_date)
             
-            # Get current hour data and make prediction for it
-            current_data = data[data['timestamp'] == last_timestamp].iloc[0]
-            current_actual = current_data['Solar Rad - W/m^2']
-            
-            # Prepare base features first (10 weather features)
-            feature_vector = []
-            for feature in base_features:
-                if feature in current_data:
-                    feature_vector.append(float(current_data[feature]))
-                else:
-                    print(f"Warning: Missing feature {feature}, using 0")
-                    feature_vector.append(0.0)
-            
-            # Add time features (2 features)
-            hour_sin = np.sin(2 * np.pi * current_hour / 24)
-            hour_cos = np.cos(2 * np.pi * current_hour / 24)
-            
-            # Combine all features (10 + 2 = 12 features)
-            X = np.array([feature_vector + [hour_sin, hour_cos]])
-            
-            print(f"Feature vector shape before scaling: {X.shape}")
-            print("Features included:", base_features + ['hour_sin', 'hour_cos'])
-            
-            # Scale features
-            X_scaled = scaler_X.transform(X)
-            
-            # Make prediction
-            prediction = predict_next_hour(model, X_scaled, current_hour + 1, current_actual, data, target_date)
-            
-            # Add current hour to historical results with proper error handling
-            if historical_results is not None and prediction is not None:
-                current_hour_data = pd.DataFrame([{
-                    'hour': current_hour + 1,
-                    'timestamp': f"{target_date} {current_hour+1:02d}:00",
-                    'actual': current_actual,
-                    'predicted': prediction,
-                    'absolute_error': abs(prediction - current_actual) if prediction is not None else None,
-                    'relative_error': (abs(prediction - current_actual) / current_actual * 100) 
-                                if prediction is not None and current_actual != 0 else None
-                }])
-                
-                historical_results = pd.concat([historical_results, current_hour_data], ignore_index=True)
-            
-            # Then make next hour prediction using same feature preparation method
-            feature_vector = []
-            for feature in base_features:
-                feature_vector.append(float(current_data[feature]))
-            
-            # Add time features (2 features)
-            hour_sin = np.sin(2 * np.pi * (current_hour + 1) / 24)
-            hour_cos = np.cos(2 * np.pi * (current_hour + 1) / 24)
-            
-            # Combine all features (10 + 2 = 12 features)
-            X = np.array([feature_vector + [hour_sin, hour_cos]])
-            
-            print(f"Feature vector shape before scaling: {X.shape}")
-            print("Features included:", base_features + ['hour_sin', 'hour_cos'])
-            
-            # Scale features
-            X_scaled = scaler_X.transform(X)
-            
-            # Make prediction
-            prediction = predict_next_hour(model, X_scaled, current_hour + 1, current_actual, data, target_date)
-            
-            # Create combined results DataFrame
             if historical_results is not None:
-                next_hour_pred = pd.DataFrame([{
-                    'hour': current_hour + 1,
-                    'timestamp': f"{target_date} {current_hour+1:02d}:00",
-                    'actual': None,  # Future value not known
-                    'predicted': prediction,
-                    'absolute_error': None,
-                    'relative_error': None
-                }])
+                # Make next hour prediction
+                next_hour_prediction = predict_next_hour(model, data, current_hour, target_date)
                 
-                combined_results = pd.concat([historical_results, next_hour_pred], ignore_index=True)
+                if next_hour_prediction is not None:
+                    # Add next hour prediction to results
+                    next_hour_data = pd.DataFrame([{
+                        'hour': current_hour + 1,
+                        'timestamp': f"{target_date} {current_hour+1:02d}:00",
+                        'actual': None,  # Future value not known
+                        'predicted': next_hour_prediction,
+                        'absolute_error': None,
+                        'relative_error': None
+                    }])
+                    
+                    # Combine results
+                    combined_results = pd.concat([historical_results, next_hour_data], ignore_index=True)
+                    
+                    # Sort by hour
+                    combined_results = combined_results.sort_values('hour').reset_index(drop=True)
+                    
+                    # Save results
+                    combined_results.to_csv('figures/hourly_predictions.csv', index=False)
+                    
+                    # Create visualization
+                    plot_predictions(combined_results, 'figures/hourly_predictions.png')
+                    
+                    print("\nPrediction Results:")
+                    print(f"Current Hour ({current_hour}:00): {historical_results.iloc[-1]['predicted']:.2f} W/m²")
+                    print(f"Next Hour ({current_hour+1}:00): {next_hour_prediction:.2f} W/m²")
                 
-                # Sort by hour to ensure correct order
-                combined_results = combined_results.sort_values('hour').reset_index(drop=True)
-                
-                # Save combined results
-                combined_results.to_csv('figures/hourly_predictions.csv', index=False)
-                
-                # Create visualization
-                plot_predictions(combined_results, 'figures/hourly_predictions.png')
+            else:
+                print("Error: Historical predictions failed")
             
-            # Print comprehensive prediction analysis
-            print("\nComprehensive Prediction Analysis:")
-            print(f"Current Hour: {current_hour}:00")
-            print(f"Current Hour Actual: {current_actual:.2f} W/m²")
-            print(f"Current Hour Predicted: {prediction:.2f} W/m²")
-            print(f"Current Hour Error: {abs(prediction - current_actual):.2f} W/m²")
-            print(f"\nPredicting for: {current_hour+1}:00")
-            print(f"Previous Hour Value: {current_actual:.2f} W/m²")
-            
-            print("\nPrediction Details:")
-            print(f"Final Predicted Value: {prediction:.2f} W/m²")
-        
         else:
             print("\nError: Model training failed")
             
