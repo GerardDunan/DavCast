@@ -2574,7 +2574,7 @@ def plot_predictions(results_df, save_path):
     plt.plot(results_df['hour'], results_df['predicted'], 
              label='Predicted', marker='x', color='red', linestyle='--')
     
-    plt.title('Solar Radiation: Actual vs Predicted Values')
+    plt.title('Solar Radiation Predictions vs Actual Values')
     plt.xlabel('Hour')
     plt.ylabel('Solar Radiation (W/m²)')
     plt.legend()
@@ -2738,23 +2738,138 @@ def predict_next_hour(model, X, hour, prev_value, data, target_date):
             target_date
         )
         
-        # Early morning adjustments (6-7 AM)
+        # Enhanced early morning adjustments (6-7 AM)
         if hour == 6:
-            # Use clear sky radiation as reference, expect 5-10% of clear sky
-            min_value = max(10, clear_sky * 0.05)  # At least 10 W/m²
-            max_value = min(30, clear_sky * 0.10)  # At most 30 W/m² or 10% of clear sky
-            prediction = max(min_value, min(prediction, max_value))
+            # Get the last 7 days of 6 AM values for better historical context
+            historical_days = 7
+            historical_6am = []
+            
+            for i in range(1, historical_days + 1):
+                prev_day = target_date - pd.Timedelta(days=i)
+                prev_day_data = data[
+                    (data['timestamp'].dt.date == prev_day) & 
+                    (data['hour'] == 6)
+                ]
+                if not prev_day_data.empty:
+                    historical_6am.append(prev_day_data['Solar Rad - W/m^2'].iloc[0])
+            
+            if historical_6am:
+                # Calculate statistics from historical data
+                avg_6am = np.mean(historical_6am)
+                max_6am = np.max(historical_6am)
+                min_6am = np.min(historical_6am)
+                
+                # Get current weather conditions
+                current_conditions = data[data['timestamp'].dt.date == target_date].iloc[0]
+                
+                # Base prediction on historical average
+                prediction = avg_6am
+                
+                # Adjust based on weather conditions
+                if current_conditions['Average Humidity'] > 85:
+                    prediction = min_6am * 1.2  # Use 120% of historical minimum for very humid conditions
+                elif current_conditions['Average Humidity'] < 75:
+                    prediction = max_6am * 0.9  # Use 90% of historical maximum for dry conditions
+                
+                # Temperature adjustment
+                if current_conditions['Average Temperature'] > 24:
+                    prediction *= 1.2  # Increase for warmer mornings
+                elif current_conditions['Average Temperature'] < 22:
+                    prediction *= 0.8  # Decrease for cooler mornings
+                
+                # Ensure prediction stays within reasonable bounds
+                min_value = max(15, min_6am * 0.8)  # At least 15 W/m² or 80% of historical minimum
+                max_value = min(50, max_6am * 1.2)  # At most 50 W/m² or 120% of historical maximum
+                prediction = min(max(prediction, min_value), max_value)
+            else:
+                # Fallback if no historical data
+                prediction = 25  # Conservative baseline
             
         elif hour == 7:
-            # Use clear sky radiation as reference, expect 15-25% of clear sky
-            min_value = max(50, clear_sky * 0.15)  # At least 50 W/m²
-            max_value = min(150, clear_sky * 0.25)  # At most 150 W/m² or 25% of clear sky
-            prediction = max(min_value, min(prediction, max_value))
+            # Get historical 7 AM data
+            historical_days = 7
+            historical_7am = []
+            historical_6am_to_7am_ratios = []  # Track the 6AM to 7AM increase ratios
             
-            # Consider previous hour trend
-            if prev_value > 0:
-                max_increase = 120  # Maximum 120 W/m² increase from previous hour
-                prediction = min(prediction, prev_value + max_increase)
+            for i in range(1, historical_days + 1):
+                prev_day = target_date - pd.Timedelta(days=i)
+                prev_day_7am = data[
+                    (data['timestamp'].dt.date == prev_day) & 
+                    (data['hour'] == 7)
+                ]
+                prev_day_6am = data[
+                    (data['timestamp'].dt.date == prev_day) & 
+                    (data['hour'] == 6)
+                ]
+                
+                if not prev_day_7am.empty and not prev_day_6am.empty:
+                    val_7am = prev_day_7am['Solar Rad - W/m^2'].iloc[0]
+                    val_6am = prev_day_6am['Solar Rad - W/m^2'].iloc[0]
+                    historical_7am.append(val_7am)
+                    if val_6am > 0:
+                        historical_6am_to_7am_ratios.append(val_7am / val_6am)
+            
+            if historical_7am:
+                # Calculate statistics
+                avg_7am = np.mean(historical_7am)
+                max_7am = np.max(historical_7am)
+                min_7am = np.min(historical_7am)
+                avg_ratio = np.mean(historical_6am_to_7am_ratios) if historical_6am_to_7am_ratios else 6.0
+                
+                # Get current weather conditions
+                current_conditions = data[data['timestamp'].dt.date == target_date].iloc[0]
+                
+                # Start with historical average as base
+                prediction = avg_7am
+                
+                # Adjust based on previous hour (6 AM) value
+                if prev_value > 0:
+                    ratio_prediction = prev_value * avg_ratio
+                    # Blend historical average with ratio-based prediction
+                    prediction = (prediction * 0.3) + (ratio_prediction * 0.7)
+                
+                # Weather adjustments
+                if current_conditions['Average Humidity'] > 85:
+                    prediction *= 0.8  # Reduce for high humidity
+                elif current_conditions['Average Humidity'] < 75:
+                    prediction *= 1.2  # Increase for low humidity
+                
+                # Temperature impact
+                if current_conditions['Average Temperature'] > 24:
+                    prediction *= 1.2
+                elif current_conditions['Average Temperature'] < 22:
+                    prediction *= 0.8
+                
+                # UV Index impact
+                if current_conditions['UV Index'] > 0:
+                    prediction *= (1 + current_conditions['UV Index'] * 0.2)
+                
+                # Set minimum and maximum bounds
+                min_value = max(150, min_7am)  # At least 150 W/m² or historical minimum
+                max_value = min(350, max_7am * 1.2)  # At most 350 W/m² or 120% of historical maximum
+                
+                # If previous hour (6 AM) was high, ensure significant increase
+                if prev_value > 30:
+                    min_value = max(min_value, prev_value * 4)  # At least 4x the 6 AM value
+                
+                prediction = min(max(prediction, min_value), max_value)
+                
+                # Clear sky adjustment
+                clear_sky = calculate_clear_sky_radiation(hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, target_date)
+                max_clear_sky = clear_sky * 0.6  # Allow up to 60% of clear sky at 7 AM
+                prediction = min(prediction, max_clear_sky)
+                
+            else:
+                # Fallback with more aggressive baseline
+                prediction = 200  # Higher baseline for 7 AM
+                
+                # Still consider rate of increase from 6 AM
+                if prev_value > 0:
+                    prediction = max(prediction, prev_value * 5)  # At least 5x the 6 AM value
+                
+                # Clear sky adjustment
+                clear_sky = calculate_clear_sky_radiation(hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, target_date)
+                prediction = min(prediction, clear_sky * 0.6)
         
         elif hour >= 8 and hour <= 16:
             # Ensure prediction doesn't exceed clear sky radiation
