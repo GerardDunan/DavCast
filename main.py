@@ -2845,7 +2845,7 @@ def create_detailed_forecast(similar_sequences, last_value):
         return None
 
 def predict_window_hours(model, data, minute_data, current_hour, target_date, window_size=3):
-    """Predict 1 to 3 hours ahead and behind"""
+    """Predict remaining hours of the day"""
     try:
         predictions = []
         hours = []
@@ -2853,7 +2853,7 @@ def predict_window_hours(model, data, minute_data, current_hour, target_date, wi
         
         # Calculate start and end hours for the window
         start_hour = max(0, current_hour - window_size)
-        end_hour = min(23, current_hour + 1)  # Only predict up to next hour
+        end_hour = 23  # Changed to predict until end of day
         
         print(f"\nPredicting window from {start_hour:02d}:00 to {end_hour:02d}:00")
         print(f"Current hour: {current_hour:02d}:00")
@@ -2873,8 +2873,8 @@ def predict_window_hours(model, data, minute_data, current_hour, target_date, wi
         
         # Get predictions for each hour in the window
         for hour in range(start_hour, end_hour + 1):
-            # Early morning hours (before 5:00) should be 0
-            if hour < 5:
+            # Early morning and night hours should be 0
+            if hour < 5 or hour > 18:  # No solar radiation before 5 AM and after 6 PM
                 prediction = 0.0
             else:
                 # Get pattern analysis for previous hour to get next hour prediction
