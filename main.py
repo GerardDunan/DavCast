@@ -110,70 +110,86 @@ def preprocess_data(data_path):
         if 'timestamp' not in data.columns:
             data['timestamp'] = pd.to_datetime(data['Date & Time'])
         
-        data['date'] = data['timestamp'].dt.date
-        data['hour'] = data['timestamp'].dt.hour
-        data['month'] = data['timestamp'].dt.month
-        data['day_of_year'] = data['timestamp'].dt.dayofyear
+        # Create two versions of the data: hourly and 5-minute intervals
+        hourly_data = data[data['timestamp'].dt.minute == 0].copy()
+        minute_data = data.copy()  # Keep all 5-minute data
         
-        # Enhanced time features
-        data['hour_sin'] = np.sin(2 * np.pi * data['hour']/24)
-        data['hour_cos'] = np.cos(2 * np.pi * data['hour']/24)
-        data['day_sin'] = np.sin(2 * np.pi * data['day_of_year']/365)
-        data['day_cos'] = np.cos(2 * np.pi * data['day_of_year']/365)
+        # Process hourly data
+        hourly_data['date'] = hourly_data['timestamp'].dt.date
+        hourly_data['hour'] = hourly_data['timestamp'].dt.hour
+        hourly_data['month'] = hourly_data['timestamp'].dt.month
+        hourly_data['day_of_year'] = hourly_data['timestamp'].dt.dayofyear
         
-        # Calculate clear sky radiation first
-        data['clear_sky_radiation'] = data.apply(
-            lambda row: calculate_clear_sky_radiation(
-                row['hour'], 
-                DAVAO_LATITUDE, 
-                DAVAO_LONGITUDE, 
-                pd.to_datetime(row['date'])
-            ), 
-            axis=1
-        )
+        # Process minute data (keep original timestamps)
+        minute_data['date'] = minute_data['timestamp'].dt.date
+        minute_data['hour'] = minute_data['timestamp'].dt.hour
+        minute_data['month'] = minute_data['timestamp'].dt.month
+        minute_data['day_of_year'] = minute_data['timestamp'].dt.dayofyear
+        minute_data['minute'] = minute_data['timestamp'].dt.minute  # Add minute information
         
-        # Improved rolling statistics with larger window
-        data['rolling_mean_3h'] = data.groupby('date')['Solar Rad - W/m^2'].transform(
-            lambda x: x.rolling(window=3, min_periods=1).mean()
-        )
-        data['rolling_mean_6h'] = data.groupby('date')['Solar Rad - W/m^2'].transform(
-            lambda x: x.rolling(window=6, min_periods=1).mean()  # Fixed missing parenthesis
-        )
-        data['rolling_std_3h'] = data.groupby('date')['Solar Rad - W/m^2'].transform(
-            lambda x: x.rolling(window=3, min_periods=1).std()
-        )
+        # Calculate clear sky radiation for both datasets
+        for df in [hourly_data, minute_data]:
+            df['clear_sky_radiation'] = df.apply(
+                lambda row: calculate_clear_sky_radiation(
+                    row['hour'] + row['minute']/60 if 'minute' in df.columns else row['hour'],  # Use decimal hours
+                    DAVAO_LATITUDE, 
+                    DAVAO_LONGITUDE, 
+                    row['date']
+                ), 
+                axis=1
+            )
         
-        # Calculate cloud impact
-        data['cloud_impact'] = 1 - (data['Solar Rad - W/m^2'] / data['clear_sky_radiation'].clip(lower=1))
+        # Calculate feature averages from hourly data
+        feature_averages = {
+            col: hourly_data[col].mean() 
+            for col in hourly_data.select_dtypes(include=[np.number]).columns 
+            if col not in ['hour', 'month', 'day_of_year', 'minute']
+        }
         
-        # Calculate solar trend
-        data['solar_trend'] = data.groupby('date')['Solar Rad - W/m^2'].diff()
+        # Process the rest of the features for hourly data
+        process_features(hourly_data)
+        process_features(minute_data)
         
-        # Enhanced lag features
-        data['prev_hour'] = data.groupby('date')['Solar Rad - W/m^2'].shift(1)
-        data['prev_2hour'] = data.groupby('date')['Solar Rad - W/m^2'].shift(2)
-        data['prev_3hour'] = data.groupby('date')['Solar Rad - W/m^2'].shift(3)
-        data['prev_day_same_hour'] = data.groupby('hour')['Solar Rad - W/m^2'].shift(24)
-        
-        # Interaction features
-        data['clear_sky_ratio'] = data['Solar Rad - W/m^2'] / data['clear_sky_radiation'].clip(lower=1)
-        data['humidity_impact'] = 1 - (data['Average Humidity'] / 100)
-        data['temp_clear_sky_interaction'] = data['Average Temperature'] * data['clear_sky_radiation'] / 1000
-        
-        # Fill NaN values
-        for col in data.select_dtypes(include=[np.number]).columns:
-            if col != 'hour':
-                if 'prev' in col or 'rolling' in col:
-                    data[col] = data[col].fillna(method='ffill').fillna(method='bfill')
-                else:
-                    data[col] = data[col].fillna(data.groupby('hour')[col].transform('mean'))
-        
-        return data, data['date'].max(), None
+        return hourly_data, minute_data, feature_averages
         
     except Exception as e:
         print(f"Error in preprocess_data: {str(e)}")
         traceback.print_exc()
         return None, None, None
+
+def process_features(data):
+    """Process features for both hourly and minute data"""
+    # Enhanced time features
+    data['hour_sin'] = np.sin(2 * np.pi * data['hour']/24)
+    data['hour_cos'] = np.cos(2 * np.pi * data['hour']/24)
+    data['day_sin'] = np.sin(2 * np.pi * data['day_of_year']/365)
+    data['day_cos'] = np.cos(2 * np.pi * data['day_of_year']/365)
+    
+    # Calculate rolling statistics
+    data['rolling_mean_3h'] = data.groupby('date')['Solar Rad - W/m^2'].transform(
+        lambda x: x.rolling(window=36, min_periods=1).mean()  # 36 5-minute intervals = 3 hours
+    )
+    data['rolling_mean_6h'] = data.groupby('date')['Solar Rad - W/m^2'].transform(
+        lambda x: x.rolling(window=72, min_periods=1).mean()  # 72 5-minute intervals = 6 hours
+    )
+    data['rolling_std_3h'] = data.groupby('date')['Solar Rad - W/m^2'].transform(
+        lambda x: x.rolling(window=36, min_periods=1).std()
+    )
+    
+    # Other features
+    data['cloud_impact'] = 1 - (data['Solar Rad - W/m^2'] / data['clear_sky_radiation'].clip(lower=1))
+    data['solar_trend'] = data.groupby('date')['Solar Rad - W/m^2'].diff()
+    data['clear_sky_ratio'] = data['Solar Rad - W/m^2'] / data['clear_sky_radiation'].clip(lower=1)
+    data['humidity_impact'] = 1 - (data['Average Humidity'] / 100)
+    data['temp_clear_sky_interaction'] = data['Average Temperature'] * data['clear_sky_radiation'] / 1000
+    
+    # Fill NaN values
+    for col in data.select_dtypes(include=[np.number]).columns:
+        if col != 'hour':
+            if 'prev' in col or 'rolling' in col:
+                data[col] = data[col].fillna(method='ffill').fillna(method='bfill')
+            else:
+                data[col] = data[col].fillna(data.groupby('hour')[col].transform('mean'))
 
 def analyze_features(data):
     """Analyze and select the most important features using multiple methods"""
@@ -280,11 +296,11 @@ def analyze_features(data):
 
 def prepare_features(df):
     try:
+        # Filter for exact hour values
+        df = df[df['timestamp'].dt.minute == 0].copy()
+        
         # Calculate all features first
         df = calculate_all_features(df)
-        
-        # Fill NaN values
-        df = df.copy()
         
         # Prepare feature matrix ensuring all features exist
         feature_matrix = []
@@ -567,6 +583,7 @@ def train_model(X_train, y_train, X_test, y_test, scaler_y, epochs=200):
         early_stopping = EarlyStopping(patience=20)
         best_model = None
         best_val_loss = float('inf')
+        corrections = None  # Initialize corrections
         
         print("\nTraining Progress:")
         print("Epoch | Train Loss | Val Loss | Correlation | R² Score")
@@ -637,13 +654,14 @@ def train_model(X_train, y_train, X_test, y_test, scaler_y, epochs=200):
                     if early_stopping(avg_val_loss):
                         print(f"Early stopping triggered at epoch {epoch+1}")
                         break
-            
-        return best_model, None, [], [], epoch + 1
+        
+        # Return exactly three values: model, corrections, and completed epochs
+        return best_model, corrections, epoch + 1
         
     except Exception as e:
         print(f"Error in train_model: {str(e)}")
         traceback.print_exc()
-        return None, None, [], [], 0
+        return None, None, 0
 
 def predict_hourly_radiation(model, features, scaler_X, scaler_y, date, base_features):
     """Make predictions for all hours in a day"""
@@ -811,7 +829,7 @@ class CloudAwareRNN(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dim, output_dim)           
         )
         
     def forward(self, x):
@@ -957,29 +975,76 @@ def calculate_confidence_intervals(model, X_test, n_samples=100):
 def predict_with_correction(model, X, hour, prev_value):
     """Make prediction with time-based corrections"""
     try:
-        # Split features
-        weather_features = torch.FloatTensor(X[:, :-2])
-        time_features = torch.FloatTensor(X[:, -2:])
+        # Ensure X is a 2D array
+        if len(X.shape) == 1:
+            X = X.reshape(1, -1)
+            
+        # Scale the input features
+        X_scaled = scaler_X.transform(X)
+            
+        # Split features - handle both numpy arrays and torch tensors
+        if isinstance(X_scaled, torch.Tensor):
+            weather_features = X_scaled[:, :-2]
+            time_features = X_scaled[:, -2:]
+        else:
+            weather_features = torch.FloatTensor(X_scaled[:, :-2])
+            time_features = torch.FloatTensor(X_scaled[:, -2:])
         
         # Get base prediction
         model.eval()
         with torch.no_grad():
             prediction = model(weather_features, time_features)
-            prediction = prediction.numpy()[0][0]
+            prediction = prediction.numpy()[0][0] if isinstance(prediction, torch.Tensor) else prediction[0][0]
+            
+            # Inverse transform the prediction
+            prediction = scaler_y.inverse_transform([[prediction]])[0][0]
         
         # Print debug information
         print(f"\nDebug Information:")
-        print(f"Base prediction: {prediction:.2f}")
+        print(f"Input features shape: {X.shape}")
+        print(f"Weather features shape: {weather_features.shape}")
+        print(f"Time features shape: {time_features.shape}")
+        print(f"Raw prediction: {prediction:.2f}")
         print(f"Previous value: {prev_value:.2f}")
         print(f"Hour: {hour}")
+        
+        # Basic validation for daylight hours
+        if 6 <= hour <= 18:
+            # Ensure prediction is at least 20% of previous value during daylight
+            min_value = prev_value * 0.2
+            prediction = max(prediction, min_value)
+            
+            # Calculate clear sky radiation for maximum bound
+            clear_sky = calculate_clear_sky_radiation(
+                hour, 
+                DAVAO_LATITUDE, 
+                DAVAO_LONGITUDE, 
+                datetime.now().date()
+            )
+            # Allow up to 110% of clear sky radiation
+            max_value = clear_sky * 1.1
+            prediction = min(prediction, max_value)
         
         # Validate prediction
         prediction = validate_predictions(prediction, hour)
         
+        # Apply time-based corrections
+        if 6 <= hour <= 9:  # Morning hours
+            prediction = adjust_morning_prediction(prediction, hour, prev_value)
+        elif 14 <= hour <= 17:  # Afternoon hours
+            prediction = adjust_afternoon_prediction(prediction, hour, prev_value)
+            
+        # Ensure reasonable change from previous value
+        max_increase = prev_value * 2.0  # Maximum 100% increase
+        max_decrease = prev_value * 0.3  # Maximum 70% decrease
+        prediction = min(max(prediction, max_decrease), max_increase)
+        
+        print(f"Final adjusted prediction: {prediction:.2f}")
         return prediction
             
     except Exception as e:
         print(f"Error in predict_with_correction: {str(e)}")
+        traceback.print_exc()
         return None
 
 def add_peak_features(df):
@@ -1130,26 +1195,62 @@ def validate_data(df):
     
     return True
 
-def validate_predictions(predictions, hour):
+def validate_predictions(prediction, hour):
     """Enhanced validation of predictions based on time of day"""
     try:
-        # Night hours (0-5, 18-23) should be zero
-        if hour < 6 or hour >= 18:
+        # Night hours (0-4, 19-23) should be near zero - more lenient with early morning
+        if hour < 4 or hour >= 19:
             return 0.0
         
-        # Maximum theoretical clear sky radiation for Davao
-        max_radiation = calculate_clear_sky_radiation(
-            hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, 
+        # Get clear sky radiation for the hour
+        clear_sky = calculate_clear_sky_radiation(
+            hour, 
+            DAVAO_LATITUDE, 
+            DAVAO_LONGITUDE, 
             datetime.now().date()
         )
         
-        # Add 10% margin to maximum theoretical value
-        max_allowed = max_radiation * 1.1
+        # Minimum values based on hour - much more lenient in early morning
+        min_values = {
+            4: 0,     # Pre-dawn
+            5: 0,     # Dawn beginning
+            6: 10,    # Dawn
+            7: 30,    # Early morning
+            8: 100,   # Morning
+            9: 200,   # Late morning
+            10: 300,  # Late morning
+            11: 400,  # Near noon
+            12: 400,  # Noon
+            13: 400,  # Early afternoon
+            14: 300,  # Mid afternoon
+            15: 200,  # Late afternoon
+            16: 100,  # Evening
+            17: 50,   # Dusk
+            18: 10    # Late dusk
+        }
         
-        # Ensure predictions are within physical limits
-        predictions = np.clip(predictions, 0, max_allowed)
+        # Get minimum value for current hour, with more gradual limits
+        min_value = min_values.get(hour, 0)
         
-        return float(predictions)
+        # Special handling for early morning and late afternoon
+        if 4 <= hour <= 7:  # Early morning hours
+            # Use a percentage of the prediction instead of fixed minimum
+            min_value = min(min_value, prediction * 0.1)  # Allow down to 10% of predicted value
+            # Also ensure we're not forcing too high a minimum during early hours
+            min_value = min(min_value, clear_sky * 0.3)  # Cap at 30% of clear sky
+        elif 16 <= hour <= 18:  # Late afternoon
+            min_value = min(min_value, clear_sky * 0.3)
+        
+        # Maximum value based on clear sky and hour
+        if 5 <= hour <= 7:  # Early morning
+            max_value = clear_sky * 1.2  # More lenient in early morning
+        else:
+            max_value = clear_sky * 1.1  # Normal hours
+        
+        # Clip prediction between min and max values
+        prediction = np.clip(prediction, min_value, max_value)
+        
+        return float(prediction)
         
     except Exception as e:
         print(f"Error in validate_predictions: {str(e)}")
@@ -1281,7 +1382,7 @@ def analyze_recent_patterns(minute_data, last_timestamp, lookback_minutes=30):
         recent_data = minute_data[
             (minute_data['timestamp'] >= start_time) & 
             (minute_data['timestamp'] <= last_timestamp)
-        ].copy()
+        ]
         
         if recent_data.empty:
             print("Warning: No recent data available for pattern analysis")
@@ -1290,6 +1391,8 @@ def analyze_recent_patterns(minute_data, last_timestamp, lookback_minutes=30):
         # Sort and calculate rolling means for smoother analysis
         recent_data = recent_data.sort_values('timestamp')
         recent_data['radiation_rolling'] = recent_data['Solar Rad - W/m^2'].rolling(3, min_periods=1).mean()
+        recent_data['rolling_mean_6h'] = recent_data['Solar Rad - W/m^2'].rolling(6, min_periods=1).mean()
+        recent_data['rolling_std_3h'] = recent_data['Solar Rad - W/m^2'].rolling(3, min_periods=1).std()
         
         # Initialize patterns with default values
         patterns = {
@@ -1876,114 +1979,110 @@ def adjust_prediction_with_risk(pred, risk_factors, hour):
         
     return adjusted_pred
 
-def analyze_extended_patterns(minute_data, last_timestamp, lookback_days=120):
-    """Analyze 5-minute patterns over multiple time horizons"""
+def analyze_extended_patterns(minute_data, timestamp, target_hour):
+    """Analyze patterns using 3-hour windows"""
     try:
-        # Use the last timestamp from dataset instead of current time
-        data_end_date = last_timestamp.floor('H')
+        # Use the target hour's timestamp
+        target_timestamp = pd.Timestamp.combine(
+            timestamp.date(),
+            pd.Timestamp(f"{target_hour:02d}:00").time()
+        )
         
-        # Get current patterns
-        current_patterns = {
-            'short': get_pattern_fingerprint(minute_data, data_end_date, pd.Timedelta(minutes=15)),
-            'medium': get_pattern_fingerprint(minute_data, data_end_date, pd.Timedelta(minutes=30))
-        }
+        # Calculate start date for historical analysis
+        start_date = target_timestamp.date() - pd.Timedelta(days=120)
         
-        if not all(current_patterns.values()):
-            print("Warning: Could not calculate current patterns")
+        # Sort minute data by timestamp
+        minute_data = minute_data.sort_values('timestamp')
+        
+        # Get current pattern including previous 3 hours
+        current_pattern = minute_data[
+            (minute_data['timestamp'].dt.date == target_timestamp.date()) &
+            (minute_data['timestamp'].dt.hour.isin([
+                target_hour,
+                target_hour - 1,
+                target_hour - 2,
+                target_hour - 3
+            ]))
+        ]['Solar Rad - W/m^2'].values
+        
+        if len(current_pattern) < 2:
+            print(f"Not enough current data points: {len(current_pattern)}")
             return None
             
-        # Calculate valid date range
-        start_date = data_end_date - pd.Timedelta(days=lookback_days)
-        historical_data = minute_data[
-            (minute_data['timestamp'] >= start_date) & 
-            (minute_data['timestamp'] < data_end_date)
-        ].copy()
-        
         print(f"\nPattern Analysis Parameters:")
-        print(f"Analyzing from {start_date} to {data_end_date}")
-        print(f"Target hour: {data_end_date.hour:02d}:00")
+        print(f"Analyzing patterns for hour {target_hour:02d}:00")
+        print(f"From {start_date} to {target_timestamp.date()}")
+        print(f"\nCurrent pattern ({len(current_pattern)} points):")
+        print(current_pattern)
         
-        if len(historical_data) == 0:
-            print("Warning: No historical data found in specified date range")
+        # Get historical data
+        similar_patterns = []
+        
+        # Get all unique dates in the historical data
+        historical_dates = minute_data[
+            (minute_data['timestamp'].dt.date >= start_date) &
+            (minute_data['timestamp'].dt.date < target_timestamp.date())
+        ]['timestamp'].dt.date.unique()
+        
+        for date in historical_dates:
+            # Get pattern for this date (including previous 3 hours)
+            historical_pattern = minute_data[
+                (minute_data['timestamp'].dt.date == date) &
+                (minute_data['timestamp'].dt.hour.isin([
+                    target_hour,
+                    target_hour - 1,
+                    target_hour - 2,
+                    target_hour - 3
+                ]))
+            ]['Solar Rad - W/m^2'].values
+            
+            if len(historical_pattern) >= 2:  # Need at least 2 points for a pattern
+                similarity = calculate_pattern_similarity(current_pattern, historical_pattern)
+                
+                # Get next hour's values for this date
+                next_hour = (target_hour + 1) % 24
+                next_hour_data = minute_data[
+                    (minute_data['timestamp'].dt.date == date) &
+                    (minute_data['timestamp'].dt.hour == next_hour)
+                ]['Solar Rad - W/m^2'].values
+                
+                if len(next_hour_data) > 0:
+                    similar_patterns.append({
+                        'date': date,
+                        'hour': target_hour,
+                        'similarity': similarity,
+                        'next_hour_values': next_hour_data,
+                        'pattern': historical_pattern
+                    })
+        
+        if not similar_patterns:
+            print("No similar patterns found")
             return None
             
-        similar_sequences = []
-        max_similarity = 0.0
+        # Sort patterns by similarity
+        similar_patterns.sort(key=lambda x: x['similarity'], reverse=True)
+        top_patterns = similar_patterns[:3]
         
-        # Group by date for faster processing
-        for date, day_data in historical_data.groupby(historical_data['timestamp'].dt.date):
-            if date == data_end_date.date():
-                continue
-                
-            for hour_offset in [-1, 0, 1]:
-                target_time = pd.Timestamp.combine(
-                    date, 
-                    pd.Timestamp(f"{data_end_date.hour:02d}:00").time()
-                ) + pd.Timedelta(hours=hour_offset)
-                
-                if target_time < day_data['timestamp'].min() or target_time > day_data['timestamp'].max():
-                    continue
-                    
-                historical_patterns = {
-                    'short': get_pattern_fingerprint(day_data, target_time, pd.Timedelta(minutes=15)),
-                    'medium': get_pattern_fingerprint(day_data, target_time, pd.Timedelta(minutes=30))
-                }
-                
-                if not all(historical_patterns.values()):
-                    continue
-                    
-                similarity_scores = calculate_horizon_similarities(current_patterns, historical_patterns)
-                avg_similarity = np.mean(list(similarity_scores.values()))
-                max_similarity = max(max_similarity, avg_similarity)
-                
-                if avg_similarity >= 0.3:
-                    next_hour = target_time + pd.Timedelta(hours=1)
-                    next_hour_data = day_data[
-                        (day_data['timestamp'] >= next_hour) & 
-                        (day_data['timestamp'] < next_hour + pd.Timedelta(hours=1))
-                    ]
-                    
-                    if not next_hour_data.empty:
-                        similar_sequences.append({
-                            'date': date,
-                            'similarity': avg_similarity,
-                            'similarity_scores': similarity_scores,
-                            'next_hour_values': next_hour_data['Solar Rad - W/m^2'].values,
-                            'pattern_evolution': analyze_pattern_evolution(
-                                day_data, target_time, next_hour
-                            )
-                        })
+        # Print top patterns with more detail
+        print("\nTop Similar Historical Patterns:")
+        for idx, pattern in enumerate(top_patterns, 1):
+            print(f"\n{idx}. Date: {pattern['date']}")
+            print(f"   Hour: {pattern['hour']:02d}:00")
+            print(f"   Similarity: {pattern['similarity']:.3f}")
+            print(f"   Next hour average: {np.mean(pattern['next_hour_values']):.1f} W/m²")
+            print(f"   Pattern values: {pattern['pattern']}")
         
-        # Sort sequences by similarity and get top 3
-        similar_sequences.sort(key=lambda x: x['similarity'], reverse=True)
-        top_sequences = similar_sequences[:3]
+        # Calculate typical range from all similar patterns
+        all_next_values = np.concatenate([p['next_hour_values'] for p in similar_patterns])
+        value_range = (np.percentile(all_next_values, 25), np.percentile(all_next_values, 75))
         
-        # Print only top 3 most similar patterns
-        print("\nTop 3 Most Similar Patterns:")
-        for idx, seq in enumerate(top_sequences, 1):
-            print(f"\n{idx}. Date: {seq['date']}")
-            print(f"   Hour: {(data_end_date + pd.Timedelta(hours=1)).hour:02d}:00")
-            print(f"   Similarity: {seq['similarity']:.3f}")
-            print(f"   Next hour average: {np.mean(seq['next_hour_values']):.1f} W/m²")
-        
-        # Analyze results using all sequences but highlight best match
-        pattern_analysis = analyze_similar_sequences(similar_sequences)
-        
-        print("\nExtended Pattern Analysis Results:")
-        print(f"Total similar sequences found: {len(similar_sequences)}")
-        print(f"Best similarity found: {max_similarity:.3f}")
-        print(f"Pattern confidence: {pattern_analysis['confidence']}")
-        print(f"Expected trend: {pattern_analysis['trend']}")
-        if pattern_analysis['range'] != (0, 0):
-            print(f"Typical range: {pattern_analysis['range'][0]:.1f} - {pattern_analysis['range'][1]:.1f} W/m²")
-        
-        # Use the highest similarity pattern for prediction
-        if top_sequences:
-            best_match = top_sequences[0]
-            print(f"\nUsing best match from {best_match['date']} (similarity: {best_match['similarity']:.3f})")
-            pattern_analysis['best_match'] = best_match
-            
-        return pattern_analysis
+        return {
+            'patterns': top_patterns,
+            'confidence': 'high' if len(similar_patterns) >= 5 else 'low',
+            'trend': analyze_trend(current_pattern),
+            'range': value_range,
+            'best_match': top_patterns[0] if top_patterns else None
+        }
         
     except Exception as e:
         print(f"Error in analyze_extended_patterns: {str(e)}")
@@ -2000,21 +2099,25 @@ def get_pattern_fingerprint(data, timestamp, window):
             (data['timestamp'] <= timestamp)
         ].copy()
         
-        if len(window_data) < 2:
+        # For 5-minute data, we need at least 2 readings
+        min_readings = 2
+        if len(window_data) < min_readings:
+            print(f"Not enough data points in window: {len(window_data)} (need at least {min_readings})")
+            print(f"Window: {start_time} to {timestamp}")
             return None
             
         # Ensure data is sorted by timestamp
         window_data = window_data.sort_values('timestamp')
         
-        # Calculate pattern metrics
-        fingerprint = {
+        # Calculate basic metrics without printing debug info
+        radiation_metrics = {
             'radiation_changes': window_data['Solar Rad - W/m^2'].diff().dropna().values,
             'clear_sky_ratios': (
                 window_data['Solar Rad - W/m^2'] / 
                 window_data['clear_sky_radiation'].clip(lower=1)
             ).values,
             'humidity_trend': window_data['Average Humidity'].diff().dropna().values,
-            'uv_pattern': window_data['UV Index'].values,
+            'uv_trend': window_data['UV Index'].values,
             'pressure_changes': window_data['Average Barometer'].diff().dropna().values,
             'temp_humidity_spread': (
                 window_data['Average Temperature'] - 
@@ -2022,19 +2125,33 @@ def get_pattern_fingerprint(data, timestamp, window):
             ).values
         }
         
-        # Only return fingerprint if we have valid data
-        if all(len(arr) > 0 for arr in fingerprint.values()):
-            fingerprint['trends'] = {
-                'radiation_trend': calc_trend_metrics(window_data['Solar Rad - W/m^2']),
-                'humidity_trend': calc_trend_metrics(window_data['Average Humidity']),
-                'uv_trend': calc_trend_metrics(window_data['UV Index']),
-                'pressure_trend': calc_trend_metrics(window_data['Average Barometer'])
-            }
-            return fingerprint
-        return None
+        # Calculate trends without printing debug info
+        trends = {}
+        for metric in ['Solar Rad - W/m^2', 'Average Humidity', 'UV Index', 'Average Barometer']:
+            if len(window_data[metric]) >= 2:
+                x = np.arange(len(window_data[metric]))
+                slope, intercept = np.polyfit(x, window_data[metric], 1)
+                trends[metric] = {
+                    'slope': slope,
+                    'intercept': intercept,
+                    'direction': 'increasing' if slope > 0 else 'decreasing'
+                }
+            else:
+                trends[metric] = {
+                    'slope': 0,
+                    'intercept': 0,
+                    'direction': 'stable'
+                }
+        
+        # Add trends to fingerprint
+        radiation_metrics['trends'] = trends
+        
+        return radiation_metrics
         
     except Exception as e:
         print(f"Error in get_pattern_fingerprint: {str(e)}")
+        print(f"Window: {start_time} to {timestamp}")
+        traceback.print_exc()
         return None
 
 def calc_trend_metrics(series):
@@ -2289,8 +2406,8 @@ def calculate_clear_sky_radiation(hour, latitude, longitude, date):
         hour_angle_rad = np.radians(hour_angle)
         
         # Calculate solar altitude
-        sin_altitude = (np.sin(lat_rad) * np.sin(declination_rad) + 
-                       np.cos(lat_rad) * np.cos(declination_rad) * 
+        sin_altitude = (np.sin(lat_rad) * np.sin(declination_rad)) + \
+                       (np.cos(lat_rad) * np.cos(declination_rad) * \
                        np.cos(hour_angle_rad))
         solar_altitude = np.arcsin(sin_altitude)
         
@@ -2388,45 +2505,56 @@ class CloudFeatures:
 def predict_next_hour(model, data, minute_data, current_hour, target_date):
     """Predict next hour with extended pattern analysis"""
     try:
-        # Get base prediction
-        base_prediction = predict_with_correction(model, data, current_hour, target_date)
+        # Get the exact hour value for current hour
+        current_data = data[
+            (data['timestamp'].dt.date == target_date) & 
+            (data['timestamp'].dt.hour == current_hour)
+        ].copy()
         
-        # Get last timestamp
-        last_timestamp = minute_data['timestamp'].max()
-        
-        # Analyze extended patterns
-        pattern_analysis = analyze_extended_patterns(minute_data, last_timestamp)
-        
-        if pattern_analysis and pattern_analysis['confidence'] != 'low':
-            # Adjust prediction based on pattern analysis
-            value_range = pattern_analysis['range']
+        if current_data.empty:
+            print(f"No data found for hour {current_hour:02d}:00")
+            return None
             
-            if pattern_analysis['confidence'] == 'high':
-                # Use 70% pattern, 30% model
-                adjusted_prediction = (
-                    np.mean(value_range) * 0.7 +
-                    base_prediction * 0.3
-                )
-            else:  # medium confidence
-                # Use 50% pattern, 50% model
-                adjusted_prediction = (
-                    np.mean(value_range) * 0.5 +
-                    base_prediction * 0.5
-                )
-                
-            print(f"\nPrediction Analysis:")
-            print(f"Base prediction: {base_prediction:.2f} W/m²")
-            print(f"Pattern-based range: {value_range[0]:.2f} - {value_range[1]:.2f} W/m²")
-            print(f"Confidence: {pattern_analysis['confidence']}")
-            print(f"Expected trend: {pattern_analysis['trend']}")
-            print(f"Final prediction: {adjusted_prediction:.2f} W/m²")
-            
-            return adjusted_prediction
+        # Get previous value
+        prev_value = current_data['Solar Rad - W/m^2'].iloc[0]
         
-        return base_prediction
+        # Get pattern analysis for next hour once
+        next_hour = (current_hour + 1) % 24
+        pattern_analysis = analyze_extended_patterns(
+            minute_data,
+            pd.Timestamp.combine(target_date, pd.Timestamp(f"{next_hour:02d}:00").time()),
+            target_hour=next_hour
+        )
+        
+        if pattern_analysis:
+            pattern_prediction = np.mean([p['next_hour_values'].mean() for p in pattern_analysis['patterns']])
+            
+            # Calculate clear sky radiation for next hour
+            clear_sky = calculate_clear_sky_radiation(
+                next_hour,
+                DAVAO_LATITUDE,
+                DAVAO_LONGITUDE,
+                target_date
+            )
+            
+            # Validate and adjust prediction
+            prediction = validate_predictions(pattern_prediction, next_hour)
+            
+            # Ensure reasonable change from previous value
+            max_increase = prev_value * 2.0  # Maximum 100% increase
+            max_decrease = prev_value * 0.3  # Maximum 70% decrease
+            prediction = min(max(prediction, max_decrease), max_increase)
+            
+            # Cap at clear sky radiation
+            prediction = min(prediction, clear_sky * 1.1)
+            
+            return prediction
+            
+        return 0.0
         
     except Exception as e:
         print(f"Error in predict_next_hour: {str(e)}")
+        traceback.print_exc()
         return None
 
 def save_detailed_results(results_df, plot_path, csv_path, current_actual, next_hour_prediction):
@@ -2513,8 +2641,8 @@ def calculate_horizon_similarities(current, historical):
             )
             
             uv_sim = calculate_sequence_similarity(
-                current[horizon]['uv_pattern'],
-                historical[horizon]['uv_pattern']
+                current[horizon]['uv_trend'],
+                historical[horizon]['uv_trend']
             )
             
             # Calculate trend similarities
@@ -2581,7 +2709,7 @@ def calculate_sequence_metrics(sequence):
             metrics['short_term'] = {
                 'radiation_changes': short_term['Solar Rad - W/m^2'].diff().dropna().tolist(),
                 'radiation_ratios': (short_term['Solar Rad - W/m^2'] / 
-                                   short_term['clear_sky_radiation']).tolist(),
+                                       short_term['clear_sky_radiation']).tolist(),
                 'humidity_trend': short_term['Average Humidity'].diff().mean(),
                 'uv_trend': short_term['UV Index'].diff().mean()
             }
@@ -2592,7 +2720,7 @@ def calculate_sequence_metrics(sequence):
             metrics['medium_term'] = {
                 'radiation_changes': medium_term['Solar Rad - W/m^2'].diff().dropna().tolist(),
                 'radiation_ratios': (medium_term['Solar Rad - W/m^2'] / 
-                                   medium_term['clear_sky_radiation']).tolist(),
+                                       medium_term['clear_sky_radiation']).tolist(),
                 'humidity_trend': medium_term['Average Humidity'].diff().mean(),
                 'uv_trend': medium_term['UV Index'].diff().mean()
             }
@@ -2602,7 +2730,7 @@ def calculate_sequence_metrics(sequence):
             metrics['long_term'] = {
                 'radiation_changes': sequence['Solar Rad - W/m^2'].diff().dropna().tolist(),
                 'radiation_ratios': (sequence['Solar Rad - W/m^2'] / 
-                                   sequence['clear_sky_radiation']).tolist(),
+                                       sequence['clear_sky_radiation']).tolist(),
                 'humidity_trend': sequence['Average Humidity'].diff().mean(),
                 'uv_trend': sequence['UV Index'].diff().mean()
             }
@@ -2716,6 +2844,179 @@ def create_detailed_forecast(similar_sequences, last_value):
         print(f"Error in create_detailed_forecast: {str(e)}")
         return None
 
+def predict_window_hours(model, data, minute_data, current_hour, target_date, window_size=3):
+    """Predict 1 to 3 hours ahead and behind"""
+    try:
+        predictions = []
+        hours = []
+        actuals = []
+        
+        # Calculate start and end hours for the window
+        start_hour = max(0, current_hour - window_size)
+        end_hour = min(23, current_hour + 1)  # Only predict up to next hour
+        
+        print(f"\nPredicting window from {start_hour:02d}:00 to {end_hour:02d}:00")
+        print(f"Current hour: {current_hour:02d}:00")
+        
+        # Get today's data with correct actual values
+        todays_data = data[
+            (data['timestamp'].dt.date == target_date)
+        ].copy()
+        
+        # Create a dictionary of actual values for quick lookup
+        actual_values = {}
+        for hour in range(24):
+            hour_data = todays_data[todays_data['timestamp'].dt.hour == hour]
+            if not hour_data.empty:
+                actual_values[hour] = hour_data['Solar Rad - W/m^2'].iloc[0]
+                print(f"Found {hour:02d}:00 value: {actual_values[hour]:.2f}")
+        
+        # Get predictions for each hour in the window
+        for hour in range(start_hour, end_hour + 1):
+            # Early morning hours (before 5:00) should be 0
+            if hour < 5:
+                prediction = 0.0
+            else:
+                # Get pattern analysis for previous hour to get next hour prediction
+                prev_hour = hour - 1
+                prev_timestamp = pd.Timestamp.combine(
+                    target_date,
+                    pd.Timestamp(f"{prev_hour:02d}:00").time()
+                )
+                
+                # Get pattern analysis for previous hour
+                pattern_analysis = analyze_extended_patterns(
+                    minute_data,
+                    prev_timestamp,
+                    target_hour=prev_hour
+                )
+                
+                if pattern_analysis and pattern_analysis['patterns']:
+                    # Use next hour average from previous hour's patterns
+                    next_hour_values = [p['next_hour_values'].mean() for p in pattern_analysis['patterns']]
+                    pattern_prediction = np.mean(next_hour_values)
+                    prediction = validate_predictions(pattern_prediction, hour)
+                    
+                    # Only apply the prediction if it's greater than 0
+                    if prediction > 0:
+                        print(f"\nPredicting hour {hour:02d}:00 - Pattern prediction from previous hour: {prediction:.2f} W/m²")
+                        formatted_values = [f"{value:.1f}" for value in next_hour_values]
+                        print(f"Based on next hour averages: {formatted_values} W/m²")
+                    else:
+                        prediction = np.mean(next_hour_values)  # Use raw average if validation zeroes it
+                else:
+                    prediction = 0.0
+            
+            hours.append(hour)
+            predictions.append(prediction)
+            actuals.append(actual_values.get(hour))
+            
+            # Print comparison for current hour
+            if hour == current_hour:
+                print(f"\nCurrent hour {hour:02d}:00:")
+                print(f"Predicted: {prediction:.2f} W/m²")
+                print(f"Actual: {actual_values.get(hour, 'N/A')} W/m²")
+        
+        # Create DataFrame with results
+        results_df = pd.DataFrame({
+            'Hour': hours,
+            'Timestamp': [f"{target_date} {hour:02d}:00" for hour in hours],
+            'Predicted': predictions,
+            'Actual': actuals
+        })
+        
+        # Get next hour prediction with enhanced analysis
+        next_hour = (current_hour + 1) % 24
+        next_hour_prediction = predict_next_hour(model, data, minute_data, current_hour, target_date)
+        
+        # Update the next hour prediction in results_df
+        if next_hour in results_df['Hour'].values:
+            results_df.loc[results_df['Hour'] == next_hour, 'Predicted'] = next_hour_prediction
+            print(f"\nUpdated next hour ({next_hour:02d}:00) prediction: {next_hour_prediction:.2f} W/m²")
+        
+        # Print the final DataFrame for verification
+        print("\nFinal predictions and actuals:")
+        print(results_df.to_string())
+        
+        # Save results to CSV
+        csv_path = 'figures/window_predictions.csv'
+        results_df.to_csv(csv_path, index=False)
+        print(f"\nSaved predictions to {csv_path}")
+        
+        # Create and save plot
+        plt.figure(figsize=(12, 6))
+        
+        # Plot predictions
+        plt.plot(results_df['Hour'], results_df['Predicted'], 
+                marker='o', linestyle='-', linewidth=2, label='Predicted',
+                color='blue')
+        
+        # Plot actual values where available (only past and current hours)
+        actual_mask = results_df['Hour'] <= current_hour
+        if actual_mask.any():
+            plt.plot(results_df.loc[actual_mask, 'Hour'], 
+                    results_df.loc[actual_mask, 'Actual'],
+                    marker='s', linestyle='--', linewidth=2, label='Actual',
+                    color='green')
+        
+        # Highlight current hour
+        current_hour_data = results_df[results_df['Hour'] == current_hour]
+        plt.scatter(current_hour_data['Hour'], current_hour_data['Actual'],
+                   color='red', s=100, zorder=5, label='Current Hour')
+        
+        # Highlight next hour prediction
+        next_hour_data = results_df[results_df['Hour'] == next_hour]
+        if not next_hour_data.empty:
+            plt.scatter(next_hour_data['Hour'], next_hour_data['Predicted'],
+                      color='purple', s=100, zorder=5, label='Next Hour',
+                      marker='*')
+        
+        plt.title(f'Solar Radiation Predictions Window for {target_date}')
+        plt.xlabel('Hour of Day')
+        plt.ylabel('Solar Radiation (W/m²)')
+        plt.grid(True)
+        plt.xticks(range(start_hour, end_hour + 1))
+        plt.ylim(bottom=0)
+        plt.legend()
+        
+        # Add value annotations
+        for idx, row in results_df.iterrows():
+            if row['Hour'] == next_hour:
+                # Special annotation for next hour prediction
+                plt.annotate(f"{row['Predicted']:.0f} W/m²\n(Next Hour)", 
+                           (row['Hour'], row['Predicted']),
+                           textcoords="offset points", 
+                           xytext=(0,15), 
+                           ha='center',
+                           color='purple',
+                           fontweight='bold')
+            else:
+                plt.annotate(f"{row['Predicted']:.0f}", 
+                           (row['Hour'], row['Predicted']),
+                           textcoords="offset points", 
+                           xytext=(0,10), 
+                           ha='center')
+                # Only show actual values for past and current hours
+                if pd.notna(row['Actual']) and row['Hour'] <= current_hour:
+                    plt.annotate(f"{row['Actual']:.0f}", 
+                               (row['Hour'], row['Actual']),
+                               textcoords="offset points", 
+                               xytext=(0,-15), 
+                               ha='center',
+                               color='green')
+        
+        plt.tight_layout()
+        plt.savefig('figures/window_predictions.png')
+        plt.close()
+        
+        return results_df
+        
+    except Exception as e:
+        print(f"Error in predict_window_hours: {str(e)}")
+        traceback.print_exc()
+        return None
+
+# Modify the main function to use the new prediction function
 def main():
     try:
         print("Starting enhanced solar radiation prediction pipeline...")
@@ -2725,21 +3026,32 @@ def main():
             raise FileNotFoundError("dataset.csv not found")
         
         print("\nLoading and preprocessing data...")
-        data, last_date, feature_averages = preprocess_data('dataset.csv')
-        if data is None:
+        hourly_data, minute_data, feature_averages = preprocess_data('dataset.csv')
+        if hourly_data is None or minute_data is None:
             raise ValueError("Failed to preprocess data")
-            
-        # Load 5-minute interval data
-        print("\nLoading 5-minute interval data...")
-        minute_data = extract_minute_data('dataset.csv')
-        if minute_data is None:
-            raise ValueError("Failed to load 5-minute interval data")
-            
+        
+        # Use hourly_data for model training
+        data = hourly_data
+        
         # Get the last timestamp from the dataset
         last_timestamp = data['timestamp'].max()
         
-        # Filter minute data up to last timestamp
+        # Process minute data
         minute_data = minute_data[minute_data['timestamp'] <= last_timestamp].copy()
+        
+        # Process features for minute data
+        minute_data['clear_sky_radiation'] = minute_data.apply(
+            lambda row: calculate_clear_sky_radiation(
+                row['hour'] + row['minute']/60,
+                DAVAO_LATITUDE,
+                DAVAO_LONGITUDE,
+                row['date']
+            ),
+            axis=1
+        )
+        
+        # Calculate other features for minute data
+        process_features(minute_data)
         
         if data.empty or minute_data.empty:
             raise ValueError("No valid data found")
@@ -2749,16 +3061,27 @@ def main():
         
         print(f"\nAnalyzing patterns for {target_date} {current_hour:02d}:00")
         
-        # Validate data range
+        # Print data info
         print("\nData Range Validation:")
         print(f"Start date: {data['timestamp'].min()}")
         print(f"End date: {last_timestamp}")
-        print(f"Total records: {len(data)}")
+        print(f"Total hourly records: {len(data)}")
+        print(f"Total minute records: {len(minute_data)}")
+        print(f"Minutes per hour: {len(minute_data[minute_data['timestamp'].dt.date == target_date])}")
+        
+        # Verify minute data for current hour
+        current_hour_data = minute_data[
+            (minute_data['timestamp'].dt.date == target_date) &
+            (minute_data['timestamp'].dt.hour == current_hour)
+        ]
+        print(f"\nCurrent hour minute data:")
+        print(current_hour_data[['timestamp', 'Solar Rad - W/m^2']].to_string())
         
         # Perform extended historical pattern analysis
         historical_patterns = analyze_extended_patterns(
-            minute_data,  # Pass minute-level data
-            last_timestamp  # Pass the last timestamp
+            minute_data,          # Pass minute-level data
+            last_timestamp,       # Pass the last timestamp
+            target_hour=current_hour  # Pass current hour as target hour
         )
         
         if historical_patterns is None:
@@ -2791,40 +3114,27 @@ def main():
             current_data = data[data['timestamp'] == last_timestamp].iloc[0]
             current_actual = current_data['Solar Rad - W/m^2']
             
-            # Make next hour prediction with enhanced pattern analysis
-            print(f"\nMaking detailed prediction for next hour...")
-            next_hour_prediction = predict_next_hour(
-                model, 
+            # Replace the single prediction with window prediction
+            print("\nMaking window predictions...")
+            results_df = predict_window_hours(
+                model,
                 data,
-                minute_data,  # Pass minute-level data
-                current_hour, 
-                target_date
+                minute_data,
+                current_hour,
+                target_date,
+                window_size=3  # Predict 3 hours before and after current hour
             )
             
-            if next_hour_prediction is not None:
-                # Create results DataFrame with basic information
-                results_df = pd.DataFrame([{
-                    'Hour': current_hour + 1,
-                    'Timestamp': f"{target_date} {current_hour+1:02d}:00",
-                    'Actual Values': current_actual,
-                    'Next Hour Prediction': next_hour_prediction
-                }])
-                
-                # Save results
-                save_results(
-                    results_df,
-                    'figures/prediction_plot.png',
-                    'figures/predictions.csv'
-                )
-                
+            if results_df is not None:
                 print("\nPrediction Results:")
-                print(f"Current Hour ({current_hour}:00): {current_actual:.2f} W/m²")
-                print(f"Next Hour ({current_hour+1}:00) Prediction: {next_hour_prediction:.2f} W/m²")
-                print(f"Pattern Confidence: {historical_patterns.get('confidence', 'low') if historical_patterns else 'low'}")
-                
+                print(f"Current Hour ({current_hour:02d}:00): {current_actual:.2f} W/m²")
+                print("\nWindow Predictions:")
+                for _, row in results_df.iterrows():
+                    actual_str = f"(Actual: {row['Actual']:.2f})" if pd.notna(row['Actual']) else "(No actual data)"
+                    print(f"Hour {row['Hour']:02d}:00 - Predicted: {row['Predicted']:.2f} W/m² {actual_str}")
             else:
-                print("\nError: Next hour prediction failed")
-                
+                print("\nError: Window predictions failed")
+            
         else:
             print("\nError: Model training failed")
             
@@ -2833,6 +3143,80 @@ def main():
         traceback.print_exc()
     finally:
         plt.close('all')
+
+def calculate_pattern_similarity(pattern1, pattern2):
+    """Calculate similarity between two patterns"""
+    try:
+        # Ensure patterns have same length
+        min_len = min(len(pattern1), len(pattern2))
+        pattern1 = pattern1[:min_len]
+        pattern2 = pattern2[:min_len]
+        
+        if min_len < 2:
+            return 0.0
+            
+        # Convert to numpy arrays and normalize
+        p1 = np.array(pattern1, dtype=float)
+        p2 = np.array(pattern2, dtype=float)
+        
+        # Normalize patterns to 0-1 range
+        p1_norm = (p1 - np.min(p1)) / (np.max(p1) - np.min(p1) + 1e-8)
+        p2_norm = (p2 - np.min(p2)) / (np.max(p2) - np.min(p2) + 1e-8)
+        
+        # Calculate similarity using multiple metrics
+        euclidean_sim = 1 / (1 + np.sqrt(np.mean((p1_norm - p2_norm) ** 2)))
+        corr = np.corrcoef(p1_norm, p2_norm)[0, 1]
+        shape_sim = (corr + 1) / 2
+        range_ratio = min(np.ptp(p1), np.ptp(p2)) / (max(np.ptp(p1), np.ptp(p2)) + 1e-8)
+        
+        # Calculate trend similarity
+        trend1 = np.polyfit(np.arange(len(p1)), p1, 1)[0]
+        trend2 = np.polyfit(np.arange(len(p2)), p2, 1)[0]
+        trend_sim = 1 - abs(trend1 - trend2) / (abs(trend1) + abs(trend2) + 1e-8)
+        
+        # Combine similarities with weights
+        similarity = (
+            euclidean_sim * 0.3 +
+            shape_sim * 0.3 +
+            range_ratio * 0.2 +
+            trend_sim * 0.2
+        )
+        
+        # Penalize length differences
+        len_penalty = min(len(pattern1), len(pattern2)) / max(len(pattern1), len(pattern2))
+        similarity *= len_penalty
+        
+        return float(similarity)
+        
+    except Exception as e:
+        print(f"Error in calculate_pattern_similarity: {str(e)}")
+        traceback.print_exc()
+        return 0.0
+
+def analyze_trend(values):
+    """Analyze trend in a sequence of values"""
+    try:
+        if len(values) < 2:
+            return 'stable'
+            
+        # Calculate changes
+        changes = np.diff(values)
+        
+        # Calculate trend metrics
+        mean_change = np.mean(changes)
+        std_change = np.std(changes)
+        
+        # Determine trend direction and strength
+        if abs(mean_change) < std_change:
+            return 'stable'
+        elif mean_change > 0:
+            return 'increasing'
+        else:
+            return 'decreasing'
+            
+    except Exception as e:
+        print(f"Error in analyze_trend: {str(e)}")
+        return 'stable'
 
 if __name__ == "__main__":
     main()
