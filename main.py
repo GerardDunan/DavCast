@@ -22,6 +22,8 @@ import copy
 import requests
 from datetime import datetime
 import traceback
+import pickle
+import json
 warnings.filterwarnings('ignore')
 
 # Create figures directory if it doesn't exist
@@ -52,6 +54,116 @@ DAVAO_LONGITUDE = 125.6087
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
+
+class PredictionErrorLearner:
+    def __init__(self):
+        self.error_history = {}
+        self.adjustment_factors = {}
+        self.recent_errors = []
+        self.learning_rate = 0.2
+        self.pattern_adjustments = {}
+        
+    def record_error(self, hour, predicted, actual, conditions, error_history=None):
+        error = actual - predicted
+        error_pct = error / actual if actual != 0 else 0
+        
+        if hour not in self.error_history:
+            self.error_history[hour] = []
+            
+        self.error_history[hour].append({
+            'error': error,
+            'error_pct': error_pct,
+            'conditions': conditions,
+            'predicted': predicted,
+            'actual': actual,
+            'timestamp': pd.Timestamp.now()
+        })
+        
+        self.recent_errors.append({
+            'error_pct': error_pct,
+            'timestamp': pd.Timestamp.now(),
+            'hour': hour
+        })
+        
+        if len(self.recent_errors) > 20:
+            self.recent_errors.pop(0)
+            
+        self._update_adjustment_factors(hour, error_pct, conditions)
+        self._update_pattern_adjustments(hour, predicted, actual, conditions)
+        
+    def get_adjustment(self, hour, conditions):
+        key = f"{hour}"
+        base_adjustment = self.adjustment_factors.get(key, 1.0)
+        
+        if len(self.recent_errors) >= 3:
+            weights = np.array([0.5, 0.3, 0.2])
+            recent_errors = [e['error_pct'] for e in self.recent_errors[-3:]]
+            recent_trend = np.average(recent_errors, weights=weights)
+            base_adjustment *= (1 + recent_trend * 0.3)
+            
+        if key in self.pattern_adjustments:
+            patterns = self.pattern_adjustments[key]
+            if patterns['consecutive_under'] >= 2:
+                base_adjustment *= 1.2
+            elif patterns['consecutive_over'] >= 2:
+                base_adjustment *= 0.8
+                
+        return base_adjustment
+
+    def _update_pattern_adjustments(self, hour, predicted, actual, conditions):
+        key = f"{hour}"
+        if key not in self.pattern_adjustments:
+            self.pattern_adjustments[key] = {
+                'under_predictions': 0,
+                'over_predictions': 0,
+                'consecutive_under': 0,
+                'consecutive_over': 0
+            }
+            
+        if actual > predicted:
+            self.pattern_adjustments[key]['consecutive_under'] += 1
+            self.pattern_adjustments[key]['consecutive_over'] = 0
+            self.pattern_adjustments[key]['under_predictions'] += 1
+        else:
+            self.pattern_adjustments[key]['consecutive_over'] += 1
+            self.pattern_adjustments[key]['consecutive_under'] = 0
+            self.pattern_adjustments[key]['over_predictions'] += 1
+            
+    def _update_adjustment_factors(self, hour, error_pct, conditions):
+        key = f"{hour}"
+        if key not in self.adjustment_factors:
+            self.adjustment_factors[key] = 1.0
+            
+        current_factor = self.adjustment_factors[key]
+        new_factor = current_factor * (1 + error_pct * self.learning_rate)
+        new_factor = max(0.4, min(2.5, new_factor))
+        self.adjustment_factors[key] = current_factor * 0.6 + new_factor * 0.4
+
+    def get_hour_adjustments(self, hour):
+        """Get all adjustment factors for a specific hour"""
+        key = f"{hour}"
+        adjustments = {
+            'base': self.adjustment_factors.get(key, 1.0),
+            'pattern': 1.0,
+            'trend': 1.0
+        }
+        
+        # Add pattern-based adjustments
+        if key in self.pattern_adjustments:
+            patterns = self.pattern_adjustments[key]
+            if patterns['consecutive_under'] >= 2:
+                adjustments['pattern'] = 1.2
+            elif patterns['consecutive_over'] >= 2:
+                adjustments['pattern'] = 0.8
+        
+        # Add trend-based adjustments
+        if len(self.recent_errors) >= 3:
+            weights = np.array([0.5, 0.3, 0.2])
+            recent_errors = [e['error_pct'] for e in self.recent_errors[-3:]]
+            recent_trend = np.average(recent_errors, weights=weights)
+            adjustments['trend'] = 1 + (recent_trend * 0.3)
+        
+        return adjustments
 
 class EarlyStopping:
     def __init__(self, patience=7, min_delta=0, verbose=False):
@@ -219,8 +331,6 @@ def analyze_features(data):
         
         # Combine both metrics
         feature_importance['correlation'] = [correlations[feat] for feat in feature_importance['feature']]
-        
-        # Calculate combined score
         feature_importance['combined_score'] = (
             feature_importance['importance'] * 0.6 + 
             feature_importance['correlation'] * 0.4
@@ -352,13 +462,15 @@ def calculate_all_features(df):
     # Calculate history features
     df['prev_hour'] = df.groupby('date')['Solar Rad - W/m^2'].shift(1)
     df['rolling_mean_3h'] = df.groupby('date')['Solar Rad - W/m^2'].transform(
-        lambda x: x.rolling(window=3, min_periods=1).mean()
-    )
+        lambda x: x.rolling(window=3, min_periods=1).mean())
     df['prev_day_same_hour'] = df.groupby('hour')['Solar Rad - W/m^2'].shift(1)
     
     # Calculate environmental features
     df['cloud_impact'] = 1 - (df['Solar Rad - W/m^2'] / df['clear_sky_radiation'].clip(lower=1))
     df['solar_trend'] = df.groupby('date')['Solar Rad - W/m^2'].diff()
+    df['clear_sky_ratio'] = df['Solar Rad - W/m^2'] / df['clear_sky_radiation'].clip(lower=1)
+    df['humidity_impact'] = 1 - (df['Average Humidity'] / 100)
+    df['temp_clear_sky_interaction'] = df['Average Temperature'] * df['clear_sky_radiation'] / 1000
     
     return df
 
@@ -384,8 +496,7 @@ class ImprovedSolarPredictor(nn.Module):
             nn.Linear(self.ramp_features, hidden_dim // 2),
             nn.ReLU(),
             nn.BatchNorm1d(hidden_dim // 2),
-            nn.Dropout(0.2)
-        )
+            nn.Dropout(0.2))
         
         # Historical features network
         self.history_net = nn.Sequential(
@@ -394,6 +505,7 @@ class ImprovedSolarPredictor(nn.Module):
             nn.BatchNorm1d(hidden_dim // 2),
             nn.Dropout(0.2))
         
+        
         # Environmental features network
         self.env_net = nn.Sequential(
             nn.Linear(self.env_features, hidden_dim // 2),
@@ -401,11 +513,13 @@ class ImprovedSolarPredictor(nn.Module):
             nn.BatchNorm1d(hidden_dim // 2),
             nn.Dropout(0.2))
         
+        
         # Time features network
         self.time_net = nn.Sequential(
             nn.Linear(self.time_features, hidden_dim // 4),
             nn.ReLU(),
             nn.BatchNorm1d(hidden_dim // 4))
+        
         
         # Combination network
         combined_dim = (hidden_dim // 2) * 3 + (hidden_dim // 4)  # All features combined
@@ -491,33 +605,31 @@ class CustomLoss(nn.Module):
             morning_penalty = torch.where(
                 morning_ramp.unsqueeze(1) & (pred_clipped < target),
                 torch.abs(target - pred_clipped) * 8.0,
-                torch.zeros_like(pred_clipped)
-            )
+                torch.zeros_like(pred_clipped))
+            
             
             # Peak hours penalties
             peak_hours = (hour >= 10) & (hour <= 14)
             peak_penalty = torch.where(
                 peak_hours.unsqueeze(1),
                 torch.abs(target - pred_clipped) * 5.0,
-                torch.zeros_like(pred_clipped)
-            )
+                torch.zeros_like(pred_clipped))
+            
             
             # Night hours penalties
             night_hours = (hour < 6) | (hour >= 18)
             night_penalty = torch.where(
                 night_hours.unsqueeze(1),
                 pred_clipped * 10.0,
-                torch.zeros_like(pred_clipped)
-            )
+                torch.zeros_like(pred_clipped))
             
             # Rapid changes penalty
             diff_penalty = torch.abs(torch.diff(pred_clipped, dim=0, prepend=pred_clipped[:1]))
             rapid_change_penalty = torch.where(
                 diff_penalty > 100,
                 diff_penalty * 0.1,
-                torch.zeros_like(diff_penalty)
-            )
-            
+                torch.zeros_like(diff_penalty))
+
             # Combine all penalties with gradient clipping
             total_loss = (
                 torch.clamp(base_loss.mean(), max=1e6) +
@@ -667,6 +779,7 @@ def predict_hourly_radiation(model, features, scaler_X, scaler_y, date, base_fea
     """Make predictions for all hours in a day"""
     predictions = []
     timestamps = []
+    predictor = AutomatedPredictor()  # Initialize the predictor
     
     for hour in range(24):
         # Create timestamp
@@ -677,6 +790,25 @@ def predict_hourly_radiation(model, features, scaler_X, scaler_y, date, base_fea
         
         # Validate prediction
         prediction = validate_predictions(prediction, hour)
+        
+        # Get actual value if available
+        actual_value = features['Solar Rad - W/m^2'][hour] if hour < len(features) else None
+        
+        # Get current conditions
+        current_conditions = {
+            'temperature': features['Average Temperature'][hour] if hour < len(features) else None,
+            'humidity': features['Average Humidity'][hour] if hour < len(features) else None,
+            'uv': features['UV Index'][hour] if hour < len(features) else None
+        }
+        
+        # Record prediction for learning analysis
+        if actual_value is not None:
+            predictor.record_prediction(
+                hour=hour,
+                predicted=prediction,
+                actual=actual_value,
+                conditions=current_conditions
+            )
         
         predictions.append(prediction)
         timestamps.append(timestamp)
@@ -742,45 +874,60 @@ def analyze_feature_distributions(data):
     plt.close()
 
 def predict_for_hour(model, hour, features, scaler_X, scaler_y, base_features):
-    """Make prediction for a specific hour"""
-    # Create feature vector
-    feature_vector = []
-    
-    # Add base features
-    for feature in base_features:
-        feature_vector.append(features[feature][hour])
-    
-    # Add engineered features
-    hour_sin = np.sin(2 * np.pi * hour/24)
-    hour_cos = np.cos(2 * np.pi * hour/24)
-    uv_squared = features['UV Index'][hour] ** 2
-    uv_temp_interaction = features['UV Index'][hour] * features['Average Temperature'][hour]
-    humidity_temp_interaction = features['Average Humidity'][hour] * features['Average Temperature'][hour]
-    
-    feature_vector.extend([
-        hour_sin,
-        hour_cos,
-        uv_squared,
-        uv_temp_interaction,
-        humidity_temp_interaction
-    ])
-    
-    # Convert to numpy array and reshape
-    X = np.array([feature_vector])
-    
-    # Scale features
-    X_scaled = scaler_X.transform(X)
-    
-    # Convert to tensor and reshape for RNN
-    X_tensor = torch.FloatTensor(X_scaled)
-    
-    # Make prediction
-    model.eval()
-    with torch.no_grad():
-        prediction = model(X_tensor, torch.FloatTensor([[hour_sin, hour_cos]]))
-        prediction = scaler_y.inverse_transform(prediction.numpy().reshape(-1, 1))
-    
-    return prediction[0][0]
+    """Make prediction for a specific hour with weighted pattern averaging"""
+    try:
+        # Get current value from features
+        current_value = features['Solar Rad - W/m^2'][hour]
+        
+        # Create timestamp for current hour
+        current_date = features.index[hour].date()
+        timestamp = pd.Timestamp.combine(current_date, pd.Timestamp(f"{hour:02d}:00").time())
+        
+        # Get pattern analysis
+        pattern_analysis = analyze_extended_patterns(
+            features,  # Pass full features instead of minute_data
+            timestamp,
+            target_hour=hour,
+            current_value=current_value
+        )
+        
+        if pattern_analysis and pattern_analysis['patterns']:
+            # Calculate weights based on similarity scores
+            similarities = [p['similarity'] for p in pattern_analysis['patterns']]
+            weights = np.array(similarities) / sum(similarities)
+            
+            # Get pattern values
+            pattern_values = [p['next_hour_values'].mean() for p in pattern_analysis['patterns']]
+            weighted_pred = np.sum(weights * pattern_values)
+            
+            # Calculate standard deviation of predictions
+            pred_std = np.std(pattern_values)
+            
+            # If high variance in predictions, be more conservative
+            if pred_std / weighted_pred > 0.3:  # High relative variance
+                # Use median instead of weighted mean
+                prediction = np.median(pattern_values)
+                print(f"High variance detected ({pred_std:.2f}), using median: {prediction:.2f}")
+            else:
+                prediction = weighted_pred
+                
+            # Additional validation
+            if abs(prediction - current_value) > current_value * 0.5:
+                print(f"Large change detected: {abs(prediction - current_value):.2f}")
+                # Be more conservative with large changes
+                prediction = current_value + (prediction - current_value) * 0.5
+                
+            return prediction
+            
+        elif pattern_analysis and pattern_analysis.get('fallback'):
+            return pattern_analysis['fallback']
+            
+        return current_value  # Return current value if no prediction possible
+            
+    except Exception as e:
+        print(f"Error in predict_for_hour: {str(e)}")
+        traceback.print_exc()
+        return None
 
 def feature_selection(data):
     """Select most important features based on mutual information scores"""
@@ -1328,51 +1475,59 @@ def extract_minute_data(data_path):
         traceback.print_exc()
         return None
 
-def save_results(results_df, figure_path, csv_path):
-    """Save results with improved plotting and data handling"""
+def save_results(results_df, plot_path, csv_path):
+    """Save results with visualization"""
     try:
-        # Ensure figures directory exists
-        if not os.path.exists('figures'):
-            os.makedirs('figures')
+        # Save to CSV
+        results_df.to_csv(csv_path, index=False)
+        print(f"\nSaved predictions to {csv_path}")
         
-        # Create the plot
+        # Create plot
         plt.figure(figsize=(12, 6))
         
-        # Plot actual values with better formatting
-        plt.plot(results_df['Hour'], results_df['Actual Values'], 
-                marker='o', linestyle='-', linewidth=2, 
-                label='Actual Values', color='blue')
+        # Plot predictions
+        plt.plot(results_df['Hour'], results_df['Predicted Solar Radiation (W/m²)'], 
+                marker='o', linestyle='-', linewidth=2, label='Predicted',
+                color='blue')
         
-        # Plot next hour prediction with larger marker
-        next_hour_mask = results_df['Next Hour Prediction'].notna()
-        if next_hour_mask.any():
-            plt.plot(results_df.loc[next_hour_mask, 'Hour'], 
-                    results_df.loc[next_hour_mask, 'Next Hour Prediction'],
-                    marker='*', markersize=20, color='red', linestyle='none',
-                    label='Next Hour Prediction')
+        # Plot actual values where available
+        actual_mask = results_df['Actual'].notna()
+        if actual_mask.any():
+            plt.plot(results_df.loc[actual_mask, 'Hour'], 
+                    results_df.loc[actual_mask, 'Actual'],
+                    marker='s', linestyle='--', linewidth=2, label='Actual',
+                    color='green')
         
         plt.title('Solar Radiation Predictions vs Actual Values')
         plt.xlabel('Hour of Day')
         plt.ylabel('Solar Radiation (W/m²)')
         plt.grid(True)
         plt.xticks(range(24))
-        plt.ylim(bottom=0, top=1200)
+        plt.ylim(bottom=0)
         plt.legend()
+        
+        # Add value annotations
+        for idx, row in results_df.iterrows():
+            plt.annotate(f"{row['Predicted']:.0f}", 
+                        (row['Hour'], row['Predicted']),
+                        textcoords="offset points", 
+                        xytext=(0,10), 
+                        ha='center')
+            if pd.notna(row['Actual']):
+                plt.annotate(f"{row['Actual']:.0f}", 
+                            (row['Hour'], row['Actual']),
+                            textcoords="offset points", 
+                            xytext=(0,-15), 
+                            ha='center',
+                            color='green')
+        
         plt.tight_layout()
-        
-        # Save plot
-        plt.savefig(figure_path, dpi=300, bbox_inches='tight')
+        plt.savefig(plot_path)
         plt.close()
+        print(f"Saved plot to {plot_path}")
         
-        # Save CSV
-        results_df.to_csv(csv_path, index=False, float_format='%.2f')
-        
-        print(f"Successfully saved results to {csv_path}")
-        print(f"Successfully saved plot to {figure_path}")
-            
     except Exception as e:
-        print(f"Error saving results: {str(e)}")
-        traceback.print_exc()
+        print(f"Error in save_results: {str(e)}")
 
 def analyze_recent_patterns(minute_data, last_timestamp, lookback_minutes=30):
     """Enhanced pattern detection focusing on rapid changes"""
@@ -1381,7 +1536,7 @@ def analyze_recent_patterns(minute_data, last_timestamp, lookback_minutes=30):
         start_time = last_timestamp - pd.Timedelta(minutes=lookback_minutes)
         recent_data = minute_data[
             (minute_data['timestamp'] >= start_time) & 
-            (minute_data['timestamp'] <= last_timestamp)
+            (minute_data['timestamp'] <= last_timestamp)        
         ]
         
         if recent_data.empty:
@@ -1566,7 +1721,7 @@ def adjust_prediction(pred, similar_cases_data, current_patterns):
     
     return adjusted_pred
 
-def find_similar_historical_patterns(data, target_hour, target_date, lookback_days=120):
+def find_similar_historical_patterns(data, target_hour, target_date, lookback_days=365):
     try:
         start_date = target_date - pd.Timedelta(days=lookback_days)
         
@@ -1621,6 +1776,7 @@ def find_similar_historical_patterns(data, target_hour, target_date, lookback_da
                 (1 - abs(current_weather['UV Index'] - weather_at_hour['UV Index']) / 20) * 0.3 +
                 (1 - abs(current_weather['cloud_impact'] - weather_at_hour['cloud_impact'])) * 0.2
             )
+            
             
             # Enhanced clear sky ratio comparison
             current_clear_sky = max(1, current_weather.get('clear_sky_radiation', 1))
@@ -1979,110 +2135,131 @@ def adjust_prediction_with_risk(pred, risk_factors, hour):
         
     return adjusted_pred
 
-def analyze_extended_patterns(minute_data, timestamp, target_hour):
-    """Analyze patterns using 3-hour windows"""
+def analyze_extended_patterns(self, data, timestamp, target_hour, current_value):
+    """Analyze patterns with enhanced filtering"""
     try:
-        # Use the target hour's timestamp
-        target_timestamp = pd.Timestamp.combine(
-            timestamp.date(),
-            pd.Timestamp(f"{target_hour:02d}:00").time()
-        )
+        # Initialize start date for historical analysis
+        start_date = timestamp.date() - pd.Timedelta(days=365)
         
-        # Calculate start date for historical analysis
-        start_date = target_timestamp.date() - pd.Timedelta(days=120)
-        
-        # Sort minute data by timestamp
-        minute_data = minute_data.sort_values('timestamp')
-        
-        # Get current pattern including previous 3 hours
-        current_pattern = minute_data[
-            (minute_data['timestamp'].dt.date == target_timestamp.date()) &
-            (minute_data['timestamp'].dt.hour.isin([
-                target_hour,
-                target_hour - 1,
-                target_hour - 2,
-                target_hour - 3
-            ]))
+        # Get today's pattern up to current hour
+        today_pattern = data[
+            (data['timestamp'].dt.date == timestamp.date()) &
+            (data['timestamp'].dt.hour <= target_hour)
         ]['Solar Rad - W/m^2'].values
         
-        if len(current_pattern) < 2:
-            print(f"Not enough current data points: {len(current_pattern)}")
+        # Get recent trend (last 3 hours)
+        recent_pattern = data[
+            (data['timestamp'].dt.date == timestamp.date()) &
+            (data['timestamp'].dt.hour >= max(0, target_hour - 3)) &
+            (data['timestamp'].dt.hour <= target_hour)
+        ]['Solar Rad - W/m^2'].values
+        
+        if len(recent_pattern) < 2:
+            print(f"Not enough recent data points: {len(recent_pattern)}")
             return None
-            
-        print(f"\nPattern Analysis Parameters:")
-        print(f"Analyzing patterns for hour {target_hour:02d}:00")
-        print(f"From {start_date} to {target_timestamp.date()}")
-        print(f"\nCurrent pattern ({len(current_pattern)} points):")
-        print(current_pattern)
         
-        # Get historical data
-        similar_patterns = []
+        # Calculate recent trend
+        recent_trend = np.polyfit(np.arange(len(recent_pattern)), recent_pattern, 1)[0]
+        print(f"Recent trend: {recent_trend:.2f} W/m²/hour")
         
-        # Get all unique dates in the historical data
-        historical_dates = minute_data[
-            (minute_data['timestamp'].dt.date >= start_date) &
-            (minute_data['timestamp'].dt.date < target_timestamp.date())
+        # Get historical patterns with exact hour matching
+        all_patterns = []
+        historical_dates = data[
+            (data['timestamp'].dt.date >= start_date) &
+            (data['timestamp'].dt.date < timestamp.date())
         ]['timestamp'].dt.date.unique()
         
+        # Track pattern statistics for validation
+        pattern_stats = {
+            'values': [],
+            'trends': [],
+            'ratios': []  # Store ratios between consecutive hours
+        }
+        
         for date in historical_dates:
-            # Get pattern for this date (including previous 3 hours)
-            historical_pattern = minute_data[
-                (minute_data['timestamp'].dt.date == date) &
-                (minute_data['timestamp'].dt.hour.isin([
-                    target_hour,
-                    target_hour - 1,
-                    target_hour - 2,
-                    target_hour - 3
-                ]))
+            # Get historical day pattern
+            day_pattern = data[
+                (data['timestamp'].dt.date == date) &
+                (data['timestamp'].dt.hour <= target_hour + 1)  # Include next hour
             ]['Solar Rad - W/m^2'].values
             
-            if len(historical_pattern) >= 2:  # Need at least 2 points for a pattern
-                similarity = calculate_pattern_similarity(current_pattern, historical_pattern)
+            if len(day_pattern) >= 2:
+                # Calculate hour-to-hour ratios
+                ratios = day_pattern[1:] / (day_pattern[:-1] + 1e-8)
+                pattern_stats['ratios'].extend(ratios)
                 
-                # Get next hour's values for this date
-                next_hour = (target_hour + 1) % 24
-                next_hour_data = minute_data[
-                    (minute_data['timestamp'].dt.date == date) &
-                    (minute_data['timestamp'].dt.hour == next_hour)
-                ]['Solar Rad - W/m^2'].values
+                # Store values for this hour and next
+                if len(day_pattern) > target_hour:
+                    pattern_stats['values'].append(day_pattern[target_hour])
+                    if len(day_pattern) > target_hour + 1:
+                        pattern_stats['values'].append(day_pattern[target_hour + 1])
                 
-                if len(next_hour_data) > 0:
-                    similar_patterns.append({
-                        'date': date,
-                        'hour': target_hour,
-                        'similarity': similarity,
-                        'next_hour_values': next_hour_data,
-                        'pattern': historical_pattern
-                    })
+                # Calculate trend
+                if len(day_pattern) >= 3:
+                    trend = np.polyfit(np.arange(len(day_pattern)), day_pattern, 1)[0]
+                    pattern_stats['trends'].append(trend)
+                    
+                    # Add pattern to all_patterns if trend is similar
+                    if np.sign(trend) == np.sign(recent_trend):
+                        similarity = self._calculate_pattern_similarity(recent_pattern, day_pattern[-len(recent_pattern):])
+                        next_hour = (target_hour + 1) % 24
+                        next_hour_data = data[
+                            (data['timestamp'].dt.date == date) &
+                            (data['timestamp'].dt.hour == next_hour)
+                        ]['Solar Rad - W/m^2'].values
+                        
+                        if len(next_hour_data) > 0:
+                            all_patterns.append({
+                                'date': date,
+                                'similarity': similarity,
+                                'next_hour_values': next_hour_data,
+                                'trend': trend
+                            })
+        
+        # Calculate statistical bounds
+        if pattern_stats['values']:
+            value_bounds = {
+                'mean': np.mean(pattern_stats['values']),
+                'std': np.std(pattern_stats['values']),
+                'ratio_mean': np.mean(pattern_stats['ratios']),
+                'ratio_std': np.std(pattern_stats['ratios']),
+                'trend_mean': np.mean(pattern_stats['trends']) if pattern_stats['trends'] else 0
+            }
+        else:
+            # Fallback bounds
+            value_bounds = {
+                'mean': current_value,
+                'std': current_value * 0.2,
+                'ratio_mean': 1.0,
+                'ratio_std': 0.2,
+                'trend_mean': recent_trend
+            }
+        
+        # Filter patterns more strictly
+        similar_patterns = []
+        for pattern in all_patterns:
+            next_value = pattern['next_hour_values'].mean()
+            value_diff = abs(next_value - current_value)
+            relative_diff = value_diff / (current_value + 1e-8)
+            
+            if (pattern['similarity'] > 0.7 and relative_diff < 0.4):
+                similar_patterns.append(pattern)
         
         if not similar_patterns:
-            print("No similar patterns found")
-            return None
-            
-        # Sort patterns by similarity
+            # Use trend-based fallback with current value
+            trend_prediction = max(0, current_value + recent_trend)
+            clear_sky = calculate_clear_sky_radiation(
+                target_hour,
+                DAVAO_LATITUDE,
+                DAVAO_LONGITUDE,
+                timestamp.date()
+            )
+            fallback = min(trend_prediction, clear_sky * 0.7)
+            return {'patterns': [], 'fallback': fallback, 'stats': value_bounds}
+        
+        # Sort by similarity
         similar_patterns.sort(key=lambda x: x['similarity'], reverse=True)
-        top_patterns = similar_patterns[:3]
-        
-        # Print top patterns with more detail
-        print("\nTop Similar Historical Patterns:")
-        for idx, pattern in enumerate(top_patterns, 1):
-            print(f"\n{idx}. Date: {pattern['date']}")
-            print(f"   Hour: {pattern['hour']:02d}:00")
-            print(f"   Similarity: {pattern['similarity']:.3f}")
-            print(f"   Next hour average: {np.mean(pattern['next_hour_values']):.1f} W/m²")
-            print(f"   Pattern values: {pattern['pattern']}")
-        
-        # Calculate typical range from all similar patterns
-        all_next_values = np.concatenate([p['next_hour_values'] for p in similar_patterns])
-        value_range = (np.percentile(all_next_values, 25), np.percentile(all_next_values, 75))
-        
-        return {
-            'patterns': top_patterns,
-            'confidence': 'high' if len(similar_patterns) >= 5 else 'low',
-            'trend': analyze_trend(current_pattern),
-            'range': value_range,
-            'best_match': top_patterns[0] if top_patterns else None
-        }
+        return {'patterns': similar_patterns[:3], 'fallback': None, 'stats': value_bounds}
         
     except Exception as e:
         print(f"Error in analyze_extended_patterns: {str(e)}")
@@ -2102,7 +2279,7 @@ def get_pattern_fingerprint(data, timestamp, window):
         # For 5-minute data, we need at least 2 readings
         min_readings = 2
         if len(window_data) < min_readings:
-            print(f"Not enough data points in window: {len(window_data)} (need at least {min_readings})")
+            print(f"Not enough data points in window: {len(window_data)} (need at least {min_readings}")
             print(f"Window: {start_time} to {timestamp}")
             return None
             
@@ -2503,59 +2680,142 @@ class CloudFeatures:
             }
 
 def predict_next_hour(model, data, minute_data, current_hour, target_date):
-    """Predict next hour with extended pattern analysis"""
+    """Predict next hour using only historical patterns without current day data"""
     try:
-        # Get the exact hour value for current hour
-        current_data = data[
-            (data['timestamp'].dt.date == target_date) & 
-            (data['timestamp'].dt.hour == current_hour)
-        ].copy()
+        # Get historical data excluding current day
+        historical_data = data[data['timestamp'].dt.date < target_date].copy()
         
-        if current_data.empty:
-            print(f"No data found for hour {current_hour:02d}:00")
-            return None
-            
-        # Get previous value
-        prev_value = current_data['Solar Rad - W/m^2'].iloc[0]
-        
-        # Get pattern analysis for next hour once
+        # Get the hour we want to predict
         next_hour = (current_hour + 1) % 24
-        pattern_analysis = analyze_extended_patterns(
-            minute_data,
-            pd.Timestamp.combine(target_date, pd.Timestamp(f"{next_hour:02d}:00").time()),
-            target_hour=next_hour
-        )
         
-        if pattern_analysis:
-            pattern_prediction = np.mean([p['next_hour_values'].mean() for p in pattern_analysis['patterns']])
+        # Find similar days based on:
+        # 1. Clear sky pattern (time of year)
+        # 2. Weather conditions (temperature, humidity, pressure patterns)
+        # 3. Daily progression up to current hour
+        similar_days = []
+        
+        for date in historical_data['timestamp'].dt.date.unique():
+            day_data = historical_data[historical_data['timestamp'].dt.date == date]
             
-            # Calculate clear sky radiation for next hour
-            clear_sky = calculate_clear_sky_radiation(
-                next_hour,
-                DAVAO_LATITUDE,
-                DAVAO_LONGITUDE,
-                target_date
+            if len(day_data) < 24:  # Need full day data
+                continue
+                
+            # Calculate similarity scores
+            
+            # 1. Clear sky similarity
+            clear_sky_sim = calculate_clear_sky_similarity(date, target_date)
+            
+            # 2. Weather pattern similarity (up to current hour)
+            weather_sim = calculate_weather_similarity(
+                day_data[day_data['timestamp'].dt.hour <= current_hour],
+                data[data['timestamp'].dt.date == target_date]
             )
             
-            # Validate and adjust prediction
-            prediction = validate_predictions(pattern_prediction, next_hour)
+            # 3. Daily progression similarity
+            progression_sim = calculate_progression_similarity(
+                day_data[day_data['timestamp'].dt.hour <= current_hour],
+                data[data['timestamp'].dt.date == target_date]
+            )
             
-            # Ensure reasonable change from previous value
-            max_increase = prev_value * 2.0  # Maximum 100% increase
-            max_decrease = prev_value * 0.3  # Maximum 70% decrease
-            prediction = min(max(prediction, max_decrease), max_increase)
+            # Combined similarity score
+            similarity = (
+                clear_sky_sim * 0.3 +
+                weather_sim * 0.4 +
+                progression_sim * 0.3
+            )
             
-            # Cap at clear sky radiation
-            prediction = min(prediction, clear_sky * 1.1)
+            # Get next hour value from historical day
+            next_hour_value = day_data[
+                day_data['timestamp'].dt.hour == next_hour
+            ]['Solar Rad - W/m^2'].iloc[0]
             
-            return prediction
-            
-        return 0.0
+            similar_days.append({
+                'date': date,
+                'similarity': similarity,
+                'next_value': next_hour_value,
+                'weather_sim': weather_sim,
+                'progression_sim': progression_sim
+            })
+        
+        # Sort by similarity
+        similar_days.sort(key=lambda x: x['similarity'], reverse=True)
+        
+        # Take top 5 most similar days
+        top_days = similar_days[:5]
+        
+        # Calculate prediction using weighted average
+        weights = np.array([day['similarity'] for day in top_days])
+        weights = weights / np.sum(weights)
+        
+        values = np.array([day['next_value'] for day in top_days])
+        prediction = np.sum(weights * values)
+        
+        # Get clear sky radiation for validation
+        clear_sky = calculate_clear_sky_radiation(
+            next_hour,
+            DAVAO_LATITUDE,
+            DAVAO_LONGITUDE,
+            target_date
+        )
+        
+        # Validate prediction
+        prediction = min(prediction, clear_sky * 0.85)
+        
+        # Print similar days for analysis
+        print(f"\nTop similar days for hour {next_hour:02d}:00 prediction:")
+        for day in top_days:
+            print(f"Date: {day['date']}, Value: {day['next_value']:.2f}, "
+                  f"Similarity: {day['similarity']:.3f}")
+        
+        return prediction
         
     except Exception as e:
         print(f"Error in predict_next_hour: {str(e)}")
         traceback.print_exc()
         return None
+
+def calculate_clear_sky_similarity(date1, date2):
+    """Calculate similarity of clear sky patterns between two dates"""
+    # Calculate day of year difference
+    day1 = date1.timetuple().tm_yday
+    day2 = date2.timetuple().tm_yday
+    
+    # Consider days as circular (365 wraps to 1)
+    diff = min(abs(day1 - day2), 365 - abs(day1 - day2))
+    
+    # Convert to similarity score (0-1)
+    return 1 - (diff / 182.5)  # 182.5 is max possible difference
+
+def calculate_weather_similarity(data1, data2):
+    """Calculate similarity of weather conditions"""
+    # Compare temperature, humidity, pressure patterns
+    temp_diff = abs(data1['Average Temperature'].mean() - data2['Average Temperature'].mean())
+    humid_diff = abs(data1['Average Humidity'].mean() - data2['Average Humidity'].mean())
+    pressure_diff = abs(data1['Average Barometer'].mean() - data2['Average Barometer'].mean())
+    
+    # Normalize differences
+    temp_sim = 1 - min(temp_diff / 10, 1)  # 10 degree difference = 0 similarity
+    humid_sim = 1 - min(humid_diff / 30, 1)  # 30% difference = 0 similarity
+    pressure_sim = 1 - min(pressure_diff / 10, 1)  # 10 unit difference = 0 similarity
+    
+    return (temp_sim * 0.4 + humid_sim * 0.4 + pressure_sim * 0.2)
+
+def calculate_progression_similarity(data1, data2):
+    """Calculate similarity of solar radiation progression"""
+    # Get hourly progressions
+    prog1 = data1['Solar Rad - W/m^2'].values
+    prog2 = data2['Solar Rad - W/m^2'].values
+    
+    # Normalize both sequences
+    prog1_norm = (prog1 - np.min(prog1)) / (np.max(prog1) - np.min(prog1) + 1e-8)
+    prog2_norm = (prog2 - np.min(prog2)) / (np.max(prog2) - np.min(prog2) + 1e-8)
+    
+    # Calculate correlation and difference
+    correlation = np.corrcoef(prog1_norm, prog2_norm)[0, 1]
+    diff = np.mean(np.abs(prog1_norm - prog2_norm))
+    
+    # Combine into similarity score
+    return max(0, (correlation + 1) / 2 * (1 - diff))
 
 def save_detailed_results(results_df, plot_path, csv_path, current_actual, next_hour_prediction):
     """Save detailed prediction results and visualizations"""
@@ -2844,379 +3104,1360 @@ def create_detailed_forecast(similar_sequences, last_value):
         print(f"Error in create_detailed_forecast: {str(e)}")
         return None
 
-def predict_window_hours(model, data, minute_data, current_hour, target_date, window_size=3):
-    """Predict remaining hours of the day"""
+def predict_next_hour(self, data, target_date, current_hour):
+    """Enhanced prediction with dynamic learning"""
     try:
-        predictions = []
-        hours = []
-        actuals = []
-        
-        # Calculate start and end hours for the window
-        start_hour = max(0, current_hour - window_size)
-        end_hour = 23  # Changed to predict until end of day
-        
-        print(f"\nPredicting window from {start_hour:02d}:00 to {end_hour:02d}:00")
-        print(f"Current hour: {current_hour:02d}:00")
-        
-        # Get today's data with correct actual values
-        todays_data = data[
-            (data['timestamp'].dt.date == target_date)
-        ].copy()
-        
-        # Create a dictionary of actual values for quick lookup
-        actual_values = {}
-        for hour in range(24):
-            hour_data = todays_data[todays_data['timestamp'].dt.hour == hour]
-            if not hour_data.empty:
-                actual_values[hour] = hour_data['Solar Rad - W/m^2'].iloc[0]
-                print(f"Found {hour:02d}:00 value: {actual_values[hour]:.2f}")
-        
-        # Get predictions for each hour in the window
-        for hour in range(start_hour, end_hour + 1):
-            # Early morning and night hours should be 0
-            if hour < 5 or hour > 18:  # No solar radiation before 5 AM and after 6 PM
-                prediction = 0.0
-            else:
-                # Get pattern analysis for previous hour to get next hour prediction
-                prev_hour = hour - 1
-                prev_timestamp = pd.Timestamp.combine(
-                    target_date,
-                    pd.Timestamp(f"{prev_hour:02d}:00").time()
-                )
-                
-                # Get pattern analysis for previous hour
-                pattern_analysis = analyze_extended_patterns(
-                    minute_data,
-                    prev_timestamp,
-                    target_hour=prev_hour
-                )
-                
-                if pattern_analysis and pattern_analysis['patterns']:
-                    # Use next hour average from previous hour's patterns
-                    next_hour_values = [p['next_hour_values'].mean() for p in pattern_analysis['patterns']]
-                    pattern_prediction = np.mean(next_hour_values)
-                    prediction = validate_predictions(pattern_prediction, hour)
-                    
-                    # Only apply the prediction if it's greater than 0
-                    if prediction > 0:
-                        print(f"\nPredicting hour {hour:02d}:00 - Pattern prediction from previous hour: {prediction:.2f} W/m²")
-                        formatted_values = [f"{value:.1f}" for value in next_hour_values]
-                        print(f"Based on next hour averages: {formatted_values} W/m²")
-                    else:
-                        prediction = np.mean(next_hour_values)  # Use raw average if validation zeroes it
-                else:
-                    prediction = 0.0
-            
-            hours.append(hour)
-            predictions.append(prediction)
-            actuals.append(actual_values.get(hour))
-            
-            # Print comparison for current hour
-            if hour == current_hour:
-                print(f"\nCurrent hour {hour:02d}:00:")
-                print(f"Predicted: {prediction:.2f} W/m²")
-                print(f"Actual: {actual_values.get(hour, 'N/A')} W/m²")
-        
-        # Create DataFrame with results
-        results_df = pd.DataFrame({
-            'Hour': hours,
-            'Timestamp': [f"{target_date} {hour:02d}:00" for hour in hours],
-            'Predicted': predictions,
-            'Actual': actuals
-        })
-        
-        # Get next hour prediction with enhanced analysis
+        # Ensure current_hour is an integer
+        current_hour = int(current_hour)
         next_hour = (current_hour + 1) % 24
-        next_hour_prediction = predict_next_hour(model, data, minute_data, current_hour, target_date)
         
-        # Update the next hour prediction in results_df
-        if next_hour in results_df['Hour'].values:
-            results_df.loc[results_df['Hour'] == next_hour, 'Predicted'] = next_hour_prediction
-            print(f"\nUpdated next hour ({next_hour:02d}:00) prediction: {next_hour_prediction:.2f} W/m²")
+        # Get current day's data
+        current_day = data[data['timestamp'].dt.date == target_date]
+        if current_day.empty:
+            raise ValueError("No data available for target date")
         
-        # Print the final DataFrame for verification
-        print("\nFinal predictions and actuals:")
-        print(results_df.to_string())
+        # Get current value and conditions
+        current_data = current_day[
+            current_day['timestamp'].dt.hour == current_hour
+        ]
         
-        # Save results to CSV
-        csv_path = 'figures/window_predictions.csv'
-        results_df.to_csv(csv_path, index=False)
-        print(f"\nSaved predictions to {csv_path}")
+        if current_data.empty:
+            raise ValueError(f"No data available for hour {current_hour}")
+            
+        current_value = current_data['Solar Rad - W/m^2'].iloc[0]
+        conditions = {
+            'temperature': current_data['Average Temperature'].iloc[0],
+            'humidity': current_data['Average Humidity'].iloc[0],
+            'pressure': current_data['Average Barometer'].iloc[0],
+            'uv': current_data['UV Index'].iloc[0]
+        }
         
-        # Create and save plot
-        plt.figure(figsize=(12, 6))
+        # Find similar days with enhanced similarity criteria
+        similar_days = self._find_similar_days(data, target_date, current_hour, conditions)
         
-        # Plot predictions
-        plt.plot(results_df['Hour'], results_df['Predicted'], 
-                marker='o', linestyle='-', linewidth=2, label='Predicted',
-                color='blue')
+        # Calculate multiple prediction components
+        predictions = {
+            'pattern_based': self._get_pattern_prediction(similar_days, current_value),
+            'ratio_based': self._get_ratio_prediction(similar_days, current_value),
+            'trend_based': self._get_trend_prediction(current_day, current_hour),
+            'typical_value': self._get_typical_value(next_hour)
+        }
         
-        # Plot actual values where available (only past and current hours)
-        actual_mask = results_df['Hour'] <= current_hour
-        if actual_mask.any():
-            plt.plot(results_df.loc[actual_mask, 'Hour'], 
-                    results_df.loc[actual_mask, 'Actual'],
-                    marker='s', linestyle='--', linewidth=2, label='Actual',
-                    color='green')
+        # Get clear sky radiation
+        clear_sky = calculate_clear_sky_radiation(
+            next_hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, target_date
+        )
         
-        # Highlight current hour
-        current_hour_data = results_df[results_df['Hour'] == current_hour]
-        plt.scatter(current_hour_data['Hour'], current_hour_data['Actual'],
-                   color='red', s=100, zorder=5, label='Current Hour')
+        # Dynamic weighting based on recent performance
+        weights = self._calculate_prediction_weights()
         
-        # Highlight next hour prediction
-        next_hour_data = results_df[results_df['Hour'] == next_hour]
-        if not next_hour_data.empty:
-            plt.scatter(next_hour_data['Hour'], next_hour_data['Predicted'],
-                      color='purple', s=100, zorder=5, label='Next Hour',
-                      marker='*')
+        # Combine predictions with weights
+        prediction = (
+            predictions['pattern_based'] * weights['pattern'] +
+            predictions['ratio_based'] * weights['ratio'] +
+            predictions['trend_based'] * weights['trend'] +
+            predictions['typical_value'] * weights['typical']
+        )
         
-        plt.title(f'Solar Radiation Predictions Window for {target_date}')
-        plt.xlabel('Hour of Day')
-        plt.ylabel('Solar Radiation (W/m²)')
-        plt.grid(True)
-        plt.xticks(range(start_hour, end_hour + 1))
-        plt.ylim(bottom=0)
-        plt.legend()
+        # Apply error learning adjustment
+        adjustment = self.error_learner.get_adjustment(next_hour, conditions)
         
-        # Add value annotations
-        for idx, row in results_df.iterrows():
-            if row['Hour'] == next_hour:
-                # Special annotation for next hour prediction
-                plt.annotate(f"{row['Predicted']:.0f} W/m²\n(Next Hour)", 
-                           (row['Hour'], row['Predicted']),
-                           textcoords="offset points", 
-                           xytext=(0,15), 
-                           ha='center',
-                           color='purple',
-                           fontweight='bold')
-            else:
-                plt.annotate(f"{row['Predicted']:.0f}", 
-                           (row['Hour'], row['Predicted']),
-                           textcoords="offset points", 
-                           xytext=(0,10), 
-                           ha='center')
-                # Only show actual values for past and current hours
-                if pd.notna(row['Actual']) and row['Hour'] <= current_hour:
-                    plt.annotate(f"{row['Actual']:.0f}", 
-                               (row['Hour'], row['Actual']),
-                               textcoords="offset points", 
-                               xytext=(0,-15), 
-                               ha='center',
-                               color='green')
+        # Apply stronger correction if we've been consistently under/over predicting
+        if len(self.consecutive_errors) >= 2:
+            if all(error > 100 for error in self.consecutive_errors[-2:]):
+                # Consistent underprediction
+                adjustment *= 1.3
+            elif all(error < -100 for error in self.consecutive_errors[-2:]):
+                # Consistent overprediction
+                adjustment *= 0.7
         
-        plt.tight_layout()
-        plt.savefig('figures/window_predictions.png')
-        plt.close()
+        prediction = prediction * adjustment
         
-        return results_df
+        # Validate against clear sky and recent values
+        prediction = self._validate_prediction(prediction, clear_sky, current_value)
+        
+        # Print detailed analysis
+        print(f"\nPrediction Analysis for hour {next_hour:02d}:00")
+        print(f"Clear sky radiation: {clear_sky:.2f} W/m²")
+        print(f"Current value: {current_value:.2f} W/m²")
+        print(f"Pattern-based: {predictions['pattern_based']:.2f} W/m²")
+        print(f"Ratio-based: {predictions['ratio_based']:.2f} W/m²")
+        print(f"Trend-based: {predictions['trend_based']:.2f} W/m²")
+        print(f"Typical value: {predictions['typical_value']:.2f} W/m²")
+        print(f"Applied learning adjustment: {adjustment:.3f}")
+        print(f"Final prediction: {prediction:.2f} W/m²")
+        
+        # Store prediction for learning
+        self._store_prediction(current_value, prediction, next_hour, conditions)
+        
+        return prediction
         
     except Exception as e:
-        print(f"Error in predict_window_hours: {str(e)}")
+        print(f"Error in predict_next_hour: {str(e)}")
         traceback.print_exc()
         return None
 
-# Modify the main function to use the new prediction function
-def main():
+def _find_similar_days(self, data, target_date, current_hour, conditions):
+    """Find similar days with enhanced matching criteria"""
     try:
-        print("Starting enhanced solar radiation prediction pipeline...")
+        similar_days = []
         
-        # Load and validate input data
-        if not os.path.exists('dataset.csv'):
-            raise FileNotFoundError("dataset.csv not found")
+        # Get historical data excluding current day
+        historical_data = data[data['timestamp'].dt.date < target_date].copy()
         
-        print("\nLoading and preprocessing data...")
-        hourly_data, minute_data, feature_averages = preprocess_data('dataset.csv')
-        if hourly_data is None or minute_data is None:
-            raise ValueError("Failed to preprocess data")
-        
-        # Use hourly_data for model training
-        data = hourly_data
-        
-        # Get the last timestamp from the dataset
-        last_timestamp = data['timestamp'].max()
-        
-        # Process minute data
-        minute_data = minute_data[minute_data['timestamp'] <= last_timestamp].copy()
-        
-        # Process features for minute data
-        minute_data['clear_sky_radiation'] = minute_data.apply(
-            lambda row: calculate_clear_sky_radiation(
-                row['hour'] + row['minute']/60,
-                DAVAO_LATITUDE,
-                DAVAO_LONGITUDE,
-                row['date']
-            ),
-            axis=1
-        )
-        
-        # Calculate other features for minute data
-        process_features(minute_data)
-        
-        if data.empty or minute_data.empty:
-            raise ValueError("No valid data found")
+        for date in historical_data['timestamp'].dt.date.unique():
+            day_data = historical_data[historical_data['timestamp'].dt.date == date]
             
-        current_hour = last_timestamp.hour
-        target_date = last_timestamp.date()
-        
-        print(f"\nAnalyzing patterns for {target_date} {current_hour:02d}:00")
-        
-        # Print data info
-        print("\nData Range Validation:")
-        print(f"Start date: {data['timestamp'].min()}")
-        print(f"End date: {last_timestamp}")
-        print(f"Total hourly records: {len(data)}")
-        print(f"Total minute records: {len(minute_data)}")
-        print(f"Minutes per hour: {len(minute_data[minute_data['timestamp'].dt.date == target_date])}")
-        
-        # Verify minute data for current hour
-        current_hour_data = minute_data[
-            (minute_data['timestamp'].dt.date == target_date) &
-            (minute_data['timestamp'].dt.hour == current_hour)
-        ]
-        print(f"\nCurrent hour minute data:")
-        print(current_hour_data[['timestamp', 'Solar Rad - W/m^2']].to_string())
-        
-        # Perform extended historical pattern analysis
-        historical_patterns = analyze_extended_patterns(
-            minute_data,          # Pass minute-level data
-            last_timestamp,       # Pass the last timestamp
-            target_hour=current_hour  # Pass current hour as target hour
-        )
-        
-        if historical_patterns is None:
-            print("Warning: Could not analyze historical patterns")
+            if len(day_data) < 24:
+                continue
             
-        # Prepare features for model
-        print("\nPreparing features...")
-        X, y, feature_names = prepare_features(data)
-        if X is None or y is None:
-            raise ValueError("Feature preparation failed")
+            # Calculate similarity scores
+            weather_sim = self._calculate_weather_similarity(day_data, conditions)
+            pattern_sim = self._calculate_pattern_similarity(day_data, current_hour)
             
-        # Scale features
-        X_scaled = scaler_X.fit_transform(X)
-        y_scaled = scaler_y.fit_transform(y.reshape(-1, 1))
+            if weather_sim > 0.7 and pattern_sim > 0.7:  # Stricter similarity threshold
+                similar_days.append({
+                    'date': date,
+                    'data': day_data,
+                    'similarity': (weather_sim + pattern_sim) / 2
+                })
         
-        # Split data and train model
-        train_size = int(0.7 * len(X_scaled))
-        X_train = X_scaled[:train_size]
-        X_test = X_scaled[train_size:]
-        y_train = y_scaled[:train_size]
-        y_test = y_scaled[train_size:]
+        return sorted(similar_days, key=lambda x: x['similarity'], reverse=True)[:5]
         
-        print("\nTraining model...")
-        model, corrections, epochs = train_model(X_train, y_train, X_test, y_test, scaler_y)
-        
-        if model is not None:
-            print(f"\nModel trained successfully over {epochs} epochs")
+    except Exception as e:
+        print(f"Error in _find_similar_days: {str(e)}")
+        return []
+    
+    def _calculate_weather_similarity(self, day_data, conditions):
+        """Calculate weather condition similarity"""
+        try:
+            # Get average conditions for the day
+            day_conditions = {
+                'temperature': day_data['Average Temperature'].mean(),
+                'humidity': day_data['Average Humidity'].mean(),
+                'pressure': day_data['Average Barometer'].mean(),
+                'uv': day_data['UV Index'].mean()
+            }
             
-            # Get current hour's actual value
-            current_data = data[data['timestamp'] == last_timestamp].iloc[0]
-            current_actual = current_data['Solar Rad - W/m^2']
+            # Calculate similarity for each condition
+            temp_sim = 1 - min(abs(day_conditions['temperature'] - conditions['temperature']) / 10, 1)
+            humidity_sim = 1 - min(abs(day_conditions['humidity'] - conditions['humidity']) / 30, 1)
+            pressure_sim = 1 - min(abs(day_conditions['pressure'] - conditions['pressure']) / 10, 1)
+            uv_sim = 1 - min(abs(day_conditions['uv'] - conditions['uv']) / 5, 1)
             
-            # Replace the single prediction with window prediction
-            print("\nMaking window predictions...")
-            results_df = predict_window_hours(
-                model,
-                data,
-                minute_data,
-                current_hour,
-                target_date,
-                window_size=3  # Predict 3 hours before and after current hour
+            # Weighted combination
+            similarity = (
+                temp_sim * 0.3 +
+                humidity_sim * 0.3 +
+                pressure_sim * 0.2 +
+                uv_sim * 0.2
             )
             
-            if results_df is not None:
-                print("\nPrediction Results:")
-                print(f"Current Hour ({current_hour:02d}:00): {current_actual:.2f} W/m²")
-                print("\nWindow Predictions:")
-                for _, row in results_df.iterrows():
-                    actual_str = f"(Actual: {row['Actual']:.2f})" if pd.notna(row['Actual']) else "(No actual data)"
-                    print(f"Hour {row['Hour']:02d}:00 - Predicted: {row['Predicted']:.2f} W/m² {actual_str}")
-            else:
-                print("\nError: Window predictions failed")
+            return float(similarity)
             
-        else:
-            print("\nError: Model training failed")
-            
-    except Exception as e:
-        print(f"\nError in main function: {str(e)}")
-        traceback.print_exc()
-    finally:
-        plt.close('all')
-
-def calculate_pattern_similarity(pattern1, pattern2):
-    """Calculate similarity between two patterns"""
-    try:
-        # Ensure patterns have same length
-        min_len = min(len(pattern1), len(pattern2))
-        pattern1 = pattern1[:min_len]
-        pattern2 = pattern2[:min_len]
-        
-        if min_len < 2:
+        except Exception as e:
+            print(f"Error in _calculate_weather_similarity: {str(e)}")
             return 0.0
+    
+    def _calculate_pattern_similarity(self, day_data, current_hour):
+        """Calculate pattern similarity up to current hour"""
+        try:
+            # Get pattern up to current hour
+            pattern = day_data[
+                day_data['timestamp'].dt.hour <= current_hour
+            ]['Solar Rad - W/m^2'].values
             
-        # Convert to numpy arrays and normalize
-        p1 = np.array(pattern1, dtype=float)
-        p2 = np.array(pattern2, dtype=float)
-        
-        # Normalize patterns to 0-1 range
-        p1_norm = (p1 - np.min(p1)) / (np.max(p1) - np.min(p1) + 1e-8)
-        p2_norm = (p2 - np.min(p2)) / (np.max(p2) - np.min(p2) + 1e-8)
-        
-        # Calculate similarity using multiple metrics
-        euclidean_sim = 1 / (1 + np.sqrt(np.mean((p1_norm - p2_norm) ** 2)))
-        corr = np.corrcoef(p1_norm, p2_norm)[0, 1]
-        shape_sim = (corr + 1) / 2
-        range_ratio = min(np.ptp(p1), np.ptp(p2)) / (max(np.ptp(p1), np.ptp(p2)) + 1e-8)
-        
-        # Calculate trend similarity
-        trend1 = np.polyfit(np.arange(len(p1)), p1, 1)[0]
-        trend2 = np.polyfit(np.arange(len(p2)), p2, 1)[0]
-        trend_sim = 1 - abs(trend1 - trend2) / (abs(trend1) + abs(trend2) + 1e-8)
-        
-        # Combine similarities with weights
-        similarity = (
-            euclidean_sim * 0.3 +
-            shape_sim * 0.3 +
-            range_ratio * 0.2 +
-            trend_sim * 0.2
-        )
-        
-        # Penalize length differences
-        len_penalty = min(len(pattern1), len(pattern2)) / max(len(pattern1), len(pattern2))
-        similarity *= len_penalty
-        
-        return float(similarity)
-        
-    except Exception as e:
-        print(f"Error in calculate_pattern_similarity: {str(e)}")
-        traceback.print_exc()
-        return 0.0
+            if len(pattern) < 2:
+                return 0.0
+            
+            # Calculate key pattern features
+            mean_val = np.mean(pattern)
+            std_val = np.std(pattern)
+            trend = np.polyfit(np.arange(len(pattern)), pattern, 1)[0]
+            
+            # Calculate similarity metrics
+            mean_sim = 1 - min(abs(mean_val - pattern[-1]) / (pattern[-1] + 1e-8), 1)
+            std_sim = 1 - min(std_val / (mean_val + 1e-8), 1)
+            trend_sim = 1 - min(abs(trend) / 100, 1)
+            
+            # Weighted combination
+            similarity = (
+                mean_sim * 0.4 +
+                std_sim * 0.3 +
+                trend_sim * 0.3
+            )
+            
+            return float(similarity)
+            
+        except Exception as e:
+            print(f"Error in _calculate_pattern_similarity: {str(e)}")
+            return 0.0
+    
+    def _get_pattern_prediction(self, similar_days, current_value):
+        """Get prediction based on similar day patterns"""
+        try:
+            if not similar_days:
+                return current_value
+            
+            predictions = []
+            weights = []
+            
+            for day in similar_days:
+                day_data = day['data']
+                next_hour_data = day_data['Solar Rad - W/m^2'].values
+                if len(next_hour_data) > 0:
+                    predictions.append(next_hour_data[-1])
+                    weights.append(day['similarity'])
+            
+            if predictions:
+                weights = np.array(weights)
+                weights = weights / np.sum(weights)  # Normalize weights
+                return float(np.average(predictions, weights=weights))
+            
+            return current_value
+            
+        except Exception as e:
+            print(f"Error in _get_pattern_prediction: {str(e)}")
+            return current_value
+    
+    def _get_ratio_prediction(self, similar_days, current_value):
+        """Get prediction based on similar day ratios"""
+        try:
+            if not similar_days:
+                return current_value
+            
+            ratios = []
+            weights = []
+            
+            for day in similar_days:
+                day_data = day['data']
+                values = day_data['Solar Rad - W/m^2'].values
+                if len(values) >= 2:
+                    ratio = values[-1] / (values[-2] + 1e-8)
+                    ratios.append(ratio)
+                    weights.append(day['similarity'])
+            
+            if ratios:
+                weights = np.array(weights)
+                weights = weights / np.sum(weights)
+                avg_ratio = np.average(ratios, weights=weights)
+                return float(current_value * avg_ratio)
+            
+            return current_value
+            
+        except Exception as e:
+            print(f"Error in _get_ratio_prediction: {str(e)}")
+            return current_value
+    
+    def _get_trend_prediction(self, current_day, current_hour):
+        """Get prediction based on current day trend"""
+        try:
+            # Get data up to current hour
+            data = current_day[
+                current_day['timestamp'].dt.hour <= current_hour
+            ]['Solar Rad - W/m^2'].values
+            
+            if len(data) >= 2:
+                # Calculate trend
+                x = np.arange(len(data))
+                trend = np.polyfit(x, data, 1)[0]
+                
+                # Project next value
+                next_value = data[-1] + trend
+                
+                # Ensure non-negative
+                return max(0, float(next_value))
+            
+            return data[-1] if len(data) > 0 else 0
+            
+        except Exception as e:
+            print(f"Error in _get_trend_prediction: {str(e)}")
+            return 0
+    
+    def _get_typical_value(self, hour):
+        """Get typical value for given hour"""
+        try:
+            if hour in self.hourly_patterns:
+                values = [p['value'] for p in self.hourly_patterns[hour]]
+                if values:
+                    return float(np.mean(values))
+            return 0
+            
+        except Exception as e:
+            print(f"Error in _get_typical_value: {str(e)}")
+            return 0
 
-def analyze_trend(values):
-    """Analyze trend in a sequence of values"""
+def update_with_actual(self, date, hour, actual_value):
+    """Update learning with actual value and save history"""
     try:
-        if len(values) < 2:
-            return 'stable'
+        # Get the prediction we made for this hour
+        transition_key = f"{(hour-1)%24}-{hour}"
+        recent_predictions = self.transition_patterns.get(transition_key, [])
+        
+        if recent_predictions:
+            latest_prediction = recent_predictions[-1]
+            predicted_value = latest_prediction['to_value']
+            conditions = latest_prediction['conditions']
             
-        # Calculate changes
-        changes = np.diff(values)
-        
-        # Calculate trend metrics
-        mean_change = np.mean(changes)
-        std_change = np.std(changes)
-        
-        # Determine trend direction and strength
-        if abs(mean_change) < std_change:
-            return 'stable'
-        elif mean_change > 0:
-            return 'increasing'
+            # Calculate error
+            error = actual_value - predicted_value
+            
+            # Add to prediction history
+            self.prediction_history.append({
+                'date': date,
+                'hour': hour,
+                'predicted': predicted_value,
+                'actual': actual_value,
+                'error': error,
+                'error_percentage': (error/actual_value)*100 if actual_value != 0 else float('inf'),
+                'adjustment_factor': self.error_learner.get_adjustment(hour, conditions),
+                'conditions': str(conditions)
+            })
+            
+            # Update consecutive errors
+            self.consecutive_errors.append(error)
+            if len(self.consecutive_errors) > 10:
+                self.consecutive_errors.pop(0)
+            
+            # Update error learner with more context
+            self.error_learner.record_error(
+                hour, predicted_value, actual_value, conditions,
+                error_history=self.consecutive_errors
+            )
+            
+            # Print detailed learning update
+            print(f"\nLearning Update for Hour {hour:02d}:")
+            print(f"Predicted: {predicted_value:.2f} W/m²")
+            print(f"Actual: {actual_value:.2f} W/m²")
+            print(f"Error: {error:.2f} W/m²")
+            print(f"Error percentage: {(error/actual_value)*100:.1f}%")
+            print(f"New adjustment factor: {self.error_learner.get_adjustment(hour, conditions):.3f}")
+            
+            # Save state after each update
+            self.save_state()
+            
         else:
-            return 'decreasing'
+            print(f"No prediction found for hour {hour:02d}")
             
     except Exception as e:
-        print(f"Error in analyze_trend: {str(e)}")
-        return 'stable'
+        print(f"Error in update_with_actual: {str(e)}")
+        traceback.print_exc()
+
+class AutomatedPredictor:
+    def __init__(self, data_folder='predictions/'):
+        # Create all necessary folders
+        self.data_folder = data_folder
+        self.history_folder = os.path.join(data_folder, 'history')
+        self.models_folder = os.path.join(data_folder, 'models')
+        self.stats_folder = os.path.join(data_folder, 'learning_stats')  # Changed to learning_stats
+        
+        os.makedirs(self.data_folder, exist_ok=True)
+        os.makedirs(self.history_folder, exist_ok=True)
+        os.makedirs(self.models_folder, exist_ok=True)
+        os.makedirs(self.stats_folder, exist_ok=True)
+        
+        # Define file paths
+        self.patterns_file = os.path.join(self.models_folder, 'learned_patterns.pkl')
+        self.errors_file = os.path.join(self.history_folder, 'prediction_errors.csv')
+        self.stats_file = os.path.join(self.stats_folder, 'hourly_stats.json')
+        self.learning_state_file = os.path.join(self.models_folder, 'learning_state.pkl')
+        
+        # Initialize learning parameters
+        self.hourly_patterns = {}
+        self.seasonal_patterns = {}
+        self.transition_patterns = {}
+        self.weather_impacts = {}
+        self.error_learner = PredictionErrorLearner()
+        self.consecutive_errors = []
+        self.prediction_history = []
+        
+        # Load previous state
+        self.load_state()
+
+    def save_state(self):
+        """Save all learning state and history"""
+        try:
+            # Create a timestamp for this save
+            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Save patterns and learning state
+            learning_state = {
+                'hourly_patterns': self.hourly_patterns,
+                'seasonal_patterns': self.seasonal_patterns,
+                'transition_patterns': self.transition_patterns,
+                'weather_impacts': self.weather_impacts,
+                'consecutive_errors': self.consecutive_errors,
+                'error_learner_state': {
+                    'error_history': self.error_learner.error_history,
+                    'adjustment_factors': self.error_learner.adjustment_factors,
+                    'pattern_adjustments': self.error_learner.pattern_adjustments
+                },
+                'timestamp': timestamp
+            }
+            
+            # Save learning state with timestamp
+            state_file = os.path.join(self.models_folder, f'learning_state_{timestamp}.pkl')
+            with open(state_file, 'wb') as f:
+                pickle.dump(learning_state, f)
+            
+            # Save latest state reference
+            with open(self.learning_state_file, 'wb') as f:
+                pickle.dump(learning_state, f)
+            
+            # Save prediction history to CSV with timestamp
+            if self.prediction_history:
+                history_file = os.path.join(self.history_folder, f'prediction_history_{timestamp}.csv')
+                pd.DataFrame(self.prediction_history).to_csv(history_file, index=False)
+                # Also save to main history file
+                pd.DataFrame(self.prediction_history).to_csv(self.errors_file, index=False)
+            
+            # Save hourly statistics with timestamp
+            hourly_stats = self.get_hourly_stats()
+            stats_file = os.path.join(self.stats_folder, f'hourly_stats_{timestamp}.json')
+            with open(stats_file, 'w') as f:
+                json.dump(hourly_stats, f, indent=4)
+            # Also save to main stats file
+            with open(self.stats_file, 'w') as f:
+                json.dump(hourly_stats, f, indent=4)
+            
+            print(f"\nSaved learning state and history at {timestamp}")
+            print(f"State files saved in: {self.models_folder}")
+            print(f"History files saved in: {self.history_folder}")
+            print(f"Statistics saved in: {self.stats_folder}")
+            
+        except Exception as e:
+            print(f"Error saving state: {str(e)}")
+            traceback.print_exc()
+
+    def load_state(self):
+        """Load previous learning state and history"""
+        try:
+            if os.path.exists(self.learning_state_file):
+                with open(self.learning_state_file, 'rb') as f:
+                    state = pickle.load(f)
+                    self.hourly_patterns = state['hourly_patterns']
+                    self.seasonal_patterns = state['seasonal_patterns']
+                    self.transition_patterns = state['transition_patterns']
+                    self.weather_impacts = state['weather_impacts']
+                    self.consecutive_errors = state['consecutive_errors']
+                    
+                    # Restore error learner state
+                    error_state = state['error_learner_state']
+                    self.error_learner.error_history = error_state['error_history']
+                    self.error_learner.adjustment_factors = error_state['adjustment_factors']
+                    self.error_learner.pattern_adjustments = error_state['pattern_adjustments']
+                
+                # Load prediction history
+                if os.path.exists(self.errors_file):
+                    self.prediction_history = pd.read_csv(self.errors_file).to_dict('records')
+                
+                print("Loaded previous learning state")
+            else:
+                print("No previous learning state found - starting fresh")
+                
+        except Exception as e:
+            print(f"Error loading state: {str(e)}")
+            print("Starting with fresh learning state")
+
+    def update_with_actual(self, date, hour, actual_value):
+        """Update learning with actual value and trigger analysis"""
+        try:
+            updated = False
+            # Find the most recent prediction for this hour that hasn't been updated
+            for pred in reversed(self.prediction_history):
+                if pred.get('hour') == hour and pred.get('actual') is None:
+                    # Update prediction record with actual value
+                    pred['actual'] = actual_value
+                    pred['error'] = actual_value - pred['predicted']
+                    pred['error_percentage'] = (pred['error'] / actual_value * 100) if actual_value != 0 else 0
+                    
+                    # Update consecutive errors for learning
+                    self.consecutive_errors.append(pred['error'])
+                    if len(self.consecutive_errors) > 10:
+                        self.consecutive_errors.pop(0)
+                    
+                    # Update error learner with context
+                    self.error_learner.record_error(
+                        hour, 
+                        pred['predicted'], 
+                        actual_value, 
+                        pred['conditions'],
+                        error_history=self.consecutive_errors
+                    )
+                    
+                    # Print learning update
+                    print(f"\nLearning Update for Hour {hour:02d}:")
+                    print(f"Predicted: {pred['predicted']:.2f} W/m²")
+                    print(f"Actual: {actual_value:.2f} W/m²")
+                    print(f"Error: {pred['error']:.2f} W/m²")
+                    print(f"Error percentage: {pred['error_percentage']:.1f}%")
+                    print(f"New adjustment factor: {self.error_learner.get_adjustment(hour, pred['conditions']):.3f}")
+                    
+                    updated = True
+                    break
+            
+            if not updated:
+                print(f"No pending prediction found for hour {hour:02d}")
+            
+            # Save state after update
+            self.save_state()
+            
+        except Exception as e:
+            print(f"Error in update_with_actual: {str(e)}")
+            traceback.print_exc()
+
+    def learn_from_historical_data(self, data):
+        """Learn patterns from all historical data"""
+        print("\nLearning from historical data...")
+        
+        # Group data by date
+        dates = data['timestamp'].dt.date.unique()
+        total_dates = len(dates)
+        
+        for i, date in enumerate(dates):
+            day_data = data[data['timestamp'].dt.date == date]
+            
+            # Skip incomplete days
+            if len(day_data) < 24:
+                continue
+                
+            print(f"\rProcessing historical data: {i+1}/{total_dates} days", end='')
+            
+            # Learn hourly patterns
+            for hour in range(24):
+                hour_data = day_data[day_data['timestamp'].dt.hour == hour]
+                if hour_data.empty:
+                    continue
+                
+                value = hour_data['Solar Rad - W/m^2'].iloc[0]
+                weather_conditions = {
+                    'temperature': hour_data['Average Temperature'].iloc[0],
+                    'humidity': hour_data['Average Humidity'].iloc[0],
+                    'pressure': hour_data['Average Barometer'].iloc[0],
+                    'uv': hour_data['UV Index'].iloc[0]
+                }
+                
+                # Store hourly pattern
+                if hour not in self.hourly_patterns:
+                    self.hourly_patterns[hour] = []
+                self.hourly_patterns[hour].append({
+                    'value': value,
+                    'conditions': weather_conditions,
+                    'date': date
+                })
+                
+                # Learn hour-to-hour transitions
+                if hour < 23:
+                    next_hour = hour + 1
+                    next_data = day_data[day_data['timestamp'].dt.hour == next_hour]
+                    if not next_data.empty:
+                        next_value = next_data['Solar Rad - W/m^2'].iloc[0]
+                        transition_key = f"{hour}-{next_hour}"
+                        if transition_key not in self.transition_patterns:
+                            self.transition_patterns[transition_key] = []
+                        self.transition_patterns[transition_key].append({
+                            'from_value': value,
+                            'to_value': next_value,
+                            'conditions': weather_conditions,
+                            'date': date
+                        })
+            
+            # Learn seasonal patterns
+            season = self._get_season(date)
+            if season not in self.seasonal_patterns:
+                self.seasonal_patterns[season] = []
+            self.seasonal_patterns[season].append({
+                'date': date,
+                'pattern': day_data['Solar Rad - W/m^2'].values,
+                'weather': weather_conditions
+            })
+        
+        print("\nAnalyzing learned patterns...")
+        self._analyze_patterns()
+        self.save_state()
+
+    def _analyze_patterns(self):
+        """Analyze learned patterns to extract insights"""
+        # Analyze hourly patterns
+        hourly_stats = {}
+        for hour, patterns in self.hourly_patterns.items():
+            values = [p['value'] for p in patterns]
+            hourly_stats[hour] = {
+                'mean': np.mean(values),
+                'std': np.std(values),
+                'min': np.min(values),
+                'max': np.max(values)
+            }
+        
+        # Print statistics
+        print("\nLearned Pattern Statistics:")
+        for hour in range(24):
+            if hour in hourly_stats:
+                stats = hourly_stats[hour]
+                print(f"\nHour {hour:02d}:00")
+                print(f"Mean: {stats['mean']:.2f} W/m²")
+                print(f"Std: {stats['std']:.2f} W/m²")
+                print(f"Range: [{stats['min']:.2f}, {stats['max']:.2f}] W/m²")
+
+    def _get_season(self, date):
+        """Get season for a given date in the Philippines"""
+        month = date.month
+        # Wet season: June to November
+        # Dry season: December to May
+        if month >= 6 and month <= 11:
+            return 'wet'
+        else:
+            return 'dry'
+
+    def get_hourly_stats(self):
+        """Calculate statistics for hourly patterns"""
+        stats = {}
+        for hour, patterns in self.hourly_patterns.items():
+            values = [p['value'] for p in patterns]
+            if values:
+                stats[str(hour)] = {
+                    'mean': float(np.mean(values)),
+                    'std': float(np.std(values)),
+                    'min': float(np.min(values)),
+                    'max': float(np.max(values)),
+                    'count': len(values)
+                }
+        return stats
+
+    def predict_next_hour(self, data, target_date, current_hour):
+        """Make prediction for the next hour"""
+        try:
+            next_hour = (current_hour + 1) % 24
+            
+            # Get current day's data
+            current_day = data[data['timestamp'].dt.date == target_date]
+            if current_day.empty:
+                raise ValueError("No data available for target date")
+            
+            # Get current value and conditions
+            current_data = current_day[
+                current_day['timestamp'].dt.hour == current_hour
+            ]
+            
+            if current_data.empty:
+                raise ValueError(f"No data available for hour {current_hour}")
+                
+            current_value = current_data['Solar Rad - W/m^2'].iloc[0]
+            conditions = {
+                'temperature': current_data['Average Temperature'].iloc[0],
+                'humidity': current_data['Average Humidity'].iloc[0],
+                'pressure': current_data['Average Barometer'].iloc[0],
+                'uv': current_data['UV Index'].iloc[0]
+            }
+            
+            # Find similar days
+            similar_days = self._find_similar_days(data, target_date, current_hour, conditions)
+            
+            # Calculate multiple prediction components
+            predictions = {
+                'pattern_based': self._get_pattern_prediction(similar_days, current_value),
+                'ratio_based': self._get_ratio_prediction(similar_days, current_value),
+                'trend_based': self._get_trend_prediction(current_day, current_hour),
+                'typical_value': self._get_typical_value(next_hour)
+            }
+            
+            # Get clear sky radiation
+            clear_sky = calculate_clear_sky_radiation(
+                next_hour, DAVAO_LATITUDE, DAVAO_LONGITUDE, target_date
+            )
+            
+            # Dynamic weighting based on recent performance
+            weights = self._calculate_prediction_weights()
+            
+            # Combine predictions with weights
+            prediction = (
+                predictions['pattern_based'] * weights['pattern'] +
+                predictions['ratio_based'] * weights['ratio'] +
+                predictions['trend_based'] * weights['trend'] +
+                predictions['typical_value'] * weights['typical']
+            )
+            
+            # Apply error learning adjustment
+            adjustment = self.error_learner.get_adjustment(next_hour, conditions)
+            
+            # Apply stronger correction if we've been consistently under/over predicting
+            if len(self.consecutive_errors) >= 2:
+                if all(error > 100 for error in self.consecutive_errors[-2:]):
+                    # Consistent underprediction
+                    adjustment *= 1.3
+                elif all(error < -100 for error in self.consecutive_errors[-2:]):
+                    # Consistent overprediction
+                    adjustment *= 0.7
+            
+            prediction = prediction * adjustment
+            
+            # Validate against clear sky and recent values
+            prediction = self._validate_prediction(prediction, clear_sky, current_value)
+            
+            # Print detailed analysis
+            print(f"\nPrediction Analysis for hour {next_hour:02d}:00")
+            print(f"Clear sky radiation: {clear_sky:.2f} W/m²")
+            print(f"Current value: {current_value:.2f} W/m²")
+            print(f"Pattern-based: {predictions['pattern_based']:.2f} W/m²")
+            print(f"Ratio-based: {predictions['ratio_based']:.2f} W/m²")
+            print(f"Trend-based: {predictions['trend_based']:.2f} W/m²")
+            print(f"Typical value: {predictions['typical_value']:.2f} W/m²")
+            print(f"Applied learning adjustment: {adjustment:.3f}")
+            print(f"Final prediction: {prediction:.2f} W/m²")
+            
+            # Store prediction for learning
+            self.prediction_history.append({
+                'date': target_date,
+                'hour': next_hour,
+                'predicted': prediction,
+                'actual': None,  # Initialize as None
+                'error': None,   # Initialize as None
+                'error_percentage': None,  # Initialize as None
+                'conditions': conditions,
+                'weights': weights,
+                'adjustment': adjustment
+            })
+            
+            return prediction
+            
+        except Exception as e:
+            print(f"Error in predict_next_hour: {str(e)}")
+            traceback.print_exc()
+            return None
+
+    def _find_similar_days(self, data, target_date, current_hour, conditions):
+        """Find similar days with enhanced matching criteria"""
+        try:
+            similar_days = []
+            
+            # Get historical data excluding current day
+            historical_data = data[data['timestamp'].dt.date < target_date].copy()
+            
+            for date in historical_data['timestamp'].dt.date.unique():
+                day_data = historical_data[historical_data['timestamp'].dt.date == date]
+                
+                if len(day_data) < 24:
+                    continue
+                
+                # Calculate similarity scores
+                weather_sim = self._calculate_weather_similarity(day_data, conditions)
+                pattern_sim = self._calculate_pattern_similarity(day_data, current_hour)
+                
+                if weather_sim > 0.7 and pattern_sim > 0.7:  # Stricter similarity threshold
+                    similar_days.append({
+                        'date': date,
+                        'data': day_data,
+                        'similarity': (weather_sim + pattern_sim) / 2
+                    })
+            
+            return sorted(similar_days, key=lambda x: x['similarity'], reverse=True)[:5]
+            
+        except Exception as e:
+            print(f"Error in _find_similar_days: {str(e)}")
+            return []
+        
+    def _calculate_weather_similarity(self, day_data, conditions):
+        """Calculate weather condition similarity"""
+        try:
+            # Get average conditions for the day
+            day_conditions = {
+                'temperature': day_data['Average Temperature'].mean(),
+                'humidity': day_data['Average Humidity'].mean(),
+                'pressure': day_data['Average Barometer'].mean(),
+                'uv': day_data['UV Index'].mean()
+            }
+            
+            # Calculate similarity for each condition
+            temp_sim = 1 - min(abs(day_conditions['temperature'] - conditions['temperature']) / 10, 1)
+            humidity_sim = 1 - min(abs(day_conditions['humidity'] - conditions['humidity']) / 30, 1)
+            pressure_sim = 1 - min(abs(day_conditions['pressure'] - conditions['pressure']) / 10, 1)
+            uv_sim = 1 - min(abs(day_conditions['uv'] - conditions['uv']) / 5, 1)
+            
+            # Weighted combination
+            similarity = (
+                temp_sim * 0.3 +
+                humidity_sim * 0.3 +
+                pressure_sim * 0.2 +
+                uv_sim * 0.2
+            )
+            
+            return float(similarity)
+            
+        except Exception as e:
+            print(f"Error in _calculate_weather_similarity: {str(e)}")
+            return 0.0
+    
+    def _calculate_pattern_similarity(self, day_data, current_hour):
+        """Calculate pattern similarity up to current hour"""
+        try:
+            # Get pattern up to current hour
+            pattern = day_data[
+                day_data['timestamp'].dt.hour <= current_hour
+            ]['Solar Rad - W/m^2'].values
+            
+            if len(pattern) < 2:
+                return 0.0
+            
+            # Calculate key pattern features
+            mean_val = np.mean(pattern)
+            std_val = np.std(pattern)
+            trend = np.polyfit(np.arange(len(pattern)), pattern, 1)[0]
+            
+            # Calculate similarity metrics
+            mean_sim = 1 - min(abs(mean_val - pattern[-1]) / (pattern[-1] + 1e-8), 1)
+            std_sim = 1 - min(std_val / (mean_val + 1e-8), 1)
+            trend_sim = 1 - min(abs(trend) / 100, 1)
+            
+            # Weighted combination
+            similarity = (
+                mean_sim * 0.4 +
+                std_sim * 0.3 +
+                trend_sim * 0.3
+            )
+            
+            return float(similarity)
+            
+        except Exception as e:
+            print(f"Error in _calculate_pattern_similarity: {str(e)}")
+            return 0.0
+    
+    def _get_pattern_prediction(self, similar_days, current_value):
+        """Get prediction based on similar day patterns"""
+        try:
+            if not similar_days:
+                return current_value
+            
+            predictions = []
+            weights = []
+            
+            for day in similar_days:
+                day_data = day['data']
+                next_hour_data = day_data['Solar Rad - W/m^2'].values
+                if len(next_hour_data) > 0:
+                    predictions.append(next_hour_data[-1])
+                    weights.append(day['similarity'])
+            
+            if predictions:
+                weights = np.array(weights)
+                weights = weights / np.sum(weights)  # Normalize weights
+                return float(np.average(predictions, weights=weights))
+            
+            return current_value
+            
+        except Exception as e:
+            print(f"Error in _get_pattern_prediction: {str(e)}")
+            return current_value
+    
+    def _get_ratio_prediction(self, similar_days, current_value):
+        """Get prediction based on similar day ratios"""
+        try:
+            if not similar_days:
+                return current_value
+            
+            ratios = []
+            weights = []
+            
+            for day in similar_days:
+                day_data = day['data']
+                values = day_data['Solar Rad - W/m^2'].values
+                if len(values) >= 2:
+                    ratio = values[-1] / (values[-2] + 1e-8)
+                    ratios.append(ratio)
+                    weights.append(day['similarity'])
+            
+            if ratios:
+                weights = np.array(weights)
+                weights = weights / np.sum(weights)
+                avg_ratio = np.average(ratios, weights=weights)
+                return float(current_value * avg_ratio)
+            
+            return current_value
+            
+        except Exception as e:
+            print(f"Error in _get_ratio_prediction: {str(e)}")
+            return current_value
+    
+    def _get_trend_prediction(self, current_day, current_hour):
+        """Get prediction based on current day trend"""
+        try:
+            # Get data up to current hour
+            data = current_day[
+                current_day['timestamp'].dt.hour <= current_hour
+            ]['Solar Rad - W/m^2'].values
+            
+            if len(data) >= 2:
+                # Calculate trend
+                x = np.arange(len(data))
+                trend = np.polyfit(x, data, 1)[0]
+                
+                # Project next value
+                next_value = data[-1] + trend
+                
+                # Ensure non-negative
+                return max(0, float(next_value))
+            
+            return data[-1] if len(data) > 0 else 0
+            
+        except Exception as e:
+            print(f"Error in _get_trend_prediction: {str(e)}")
+            return 0
+    
+    def _get_typical_value(self, hour):
+        """Get typical value for given hour"""
+        try:
+            if hour in self.hourly_patterns:
+                values = [p['value'] for p in self.hourly_patterns[hour]]
+                if values:
+                    return float(np.mean(values))
+            return 0
+            
+        except Exception as e:
+            print(f"Error in _get_typical_value: {str(e)}")
+            return 0
+
+    def _calculate_prediction_weights(self):
+        """Calculate dynamic weights with learning-based adjustments"""
+        if not self.consecutive_errors:
+            return {'pattern': 0.3, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.2}
+        
+        # Calculate error statistics
+        recent_errors = np.array(self.consecutive_errors[-5:])
+        error_std = np.std(recent_errors) if len(recent_errors) > 1 else 0
+        
+        # Base weights based on error patterns
+        if error_std < 50:  # Stable predictions
+            weights = {'pattern': 0.4, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.1}
+        elif error_std < 100:  # Moderate variability
+            weights = {'pattern': 0.3, 'ratio': 0.3, 'trend': 0.3, 'typical': 0.1}
+        else:  # High variability
+            weights = {'pattern': 0.2, 'ratio': 0.2, 'trend': 0.4, 'typical': 0.2}
+        
+        # Apply learning-based adjustments
+        if self.prediction_history:
+            df = pd.DataFrame(self.prediction_history)
+            if len(df) >= 100:
+                recent_error = df['error'].tail(100).abs().mean()
+                if recent_error > 50:  # High error rate
+                    weights['pattern'] *= 0.9
+                    weights['trend'] *= 1.1
+        
+        return weights
+
+    def _validate_prediction(self, prediction, clear_sky, current_value):
+        """Validate and adjust prediction"""
+        try:
+            # Ensure prediction is within reasonable bounds
+            prediction = max(0, min(prediction, clear_sky * 0.85))
+            
+            # Limit maximum change from current value
+            max_increase = current_value * 2.0  # Maximum 100% increase
+            max_decrease = current_value * 0.3  # Maximum 70% decrease
+            prediction = min(max(prediction, max_decrease), max_increase)
+            
+            # Additional validation based on time of day
+            hour = pd.Timestamp.now().hour
+            if hour < 6 or hour >= 18:  # Night hours
+                prediction = 0.0
+            elif hour < 8:  # Early morning
+                prediction = min(prediction, clear_sky * 0.4)  # Max 40% of clear sky
+            elif hour > 16:  # Late afternoon
+                prediction = min(prediction, clear_sky * 0.3)  # Max 30% of clear sky
+            
+            return prediction
+            
+        except Exception as e:
+            print(f"Error in _validate_prediction: {str(e)}")
+            return current_value  # Return current value as fallback
+
+    def _store_prediction(self, current_value, prediction, next_hour, conditions):
+        """Store prediction for learning"""
+        try:
+            transition_key = f"{next_hour-1}-{next_hour}"
+            if transition_key not in self.transition_patterns:
+                self.transition_patterns[transition_key] = []
+                
+            # Store prediction with timestamp and conditions
+            self.transition_patterns[transition_key].append({
+                'from_value': current_value,
+                'to_value': prediction,
+                'conditions': conditions,
+                'timestamp': pd.Timestamp.now(),
+                'error': None  # Will be updated when actual value is available
+            })
+            
+            # Also store in prediction history
+            self.prediction_history.append({
+                'hour': next_hour,
+                'current_value': current_value,
+                'predicted_value': prediction,
+                'conditions': str(conditions),
+                'timestamp': pd.Timestamp.now()
+            })
+            
+        except Exception as e:
+            print(f"Error in _store_prediction: {str(e)}")
+            traceback.print_exc()
+
+    def analyze_learning_performance(self, window_size=100):
+        """Analyze and visualize learning performance over time"""
+        try:
+            if not self.prediction_history:
+                print("No prediction history available for analysis")
+                return
+                
+            # Convert history to DataFrame
+            history_df = pd.DataFrame(self.prediction_history)
+            history_df['date'] = pd.to_datetime(history_df['date'])
+            
+            # Calculate rolling metrics
+            history_df['rolling_mae'] = history_df['error'].abs().rolling(window_size).mean()
+            history_df['rolling_mape'] = history_df['error_percentage'].abs().rolling(window_size).mean()
+            history_df['improvement'] = history_df['rolling_mae'].diff().rolling(window_size).mean()
+            
+            # Create performance visualization
+            plt.figure(figsize=(15, 10))
+            
+            # Plot 1: Prediction Accuracy Over Time
+            plt.subplot(2, 2, 1)
+            plt.plot(history_df['date'], history_df['rolling_mae'], 'b-', label='Rolling MAE')
+            plt.title('Learning Progress - Error Reduction')
+            plt.xlabel('Date')
+            plt.ylabel('Mean Absolute Error (W/m²)')
+            plt.legend()
+            
+            # Plot 2: Error Distribution Changes
+            plt.subplot(2, 2, 2)
+            recent_errors = history_df['error'].tail(window_size)
+            old_errors = history_df['error'].head(window_size)
+            plt.hist([old_errors, recent_errors], label=['Initial Errors', 'Recent Errors'], 
+                    alpha=0.7, bins=30)
+            plt.title('Error Distribution Improvement')
+            plt.xlabel('Prediction Error (W/m²)')
+            plt.ylabel('Frequency')
+            plt.legend()
+            
+            # Plot 3: Hourly Performance Improvement
+            plt.subplot(2, 2, 3)
+            hourly_improvement = history_df.groupby('hour')['error'].agg(['mean', 'std']).round(2)
+            hourly_improvement.plot(kind='bar', yerr='std', capsize=5)
+            plt.title('Hourly Prediction Performance')
+            plt.xlabel('Hour of Day')
+            plt.ylabel('Mean Error (W/m²)')
+            
+            # Plot 4: Learning Rate
+            plt.subplot(2, 2, 4)
+            plt.plot(history_df['date'], history_df['improvement'], 'g-')
+            plt.axhline(y=0, color='r', linestyle='--')
+            plt.title('Learning Rate (Negative is Better)')
+            plt.xlabel('Date')
+            plt.ylabel('Error Change Rate')
+            
+            plt.tight_layout()
+            
+            # Save the visualization
+            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            plot_path = os.path.join(self.stats_folder, f'learning_analysis_{timestamp}.png')
+            plt.savefig(plot_path)
+            plt.close()
+            
+            # Generate detailed learning report
+            self._generate_learning_report(history_df, hourly_improvement)
+            
+        except Exception as e:
+            print(f"Error in analyze_learning_performance: {str(e)}")
+            traceback.print_exc()
+
+    def _generate_learning_report(self, history_df, hourly_stats):
+        """Generate detailed learning report"""
+        try:
+            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            report_path = os.path.join(self.stats_folder, f'learning_report_{timestamp}.txt')
+            
+            with open(report_path, 'w') as f:
+                f.write("=== Solar Radiation Prediction Learning Report ===\n\n")
+                
+                # Overall Performance Metrics
+                f.write("Overall Performance:\n")
+                f.write(f"Total Predictions: {len(history_df)}\n")
+                f.write(f"Average Error: {history_df['error'].mean():.2f} W/m²\n")
+                f.write(f"Error Standard Deviation: {history_df['error'].std():.2f} W/m²\n")
+                f.write(f"Mean Absolute Percentage Error: {history_df['error_percentage'].abs().mean():.2f}%\n\n")
+                
+                # Recent Performance (last 100 predictions)
+                recent = history_df.tail(100)
+                f.write("Recent Performance (Last 100 Predictions):\n")
+                f.write(f"Average Error: {recent['error'].mean():.2f} W/m²\n")
+                f.write(f"Error Standard Deviation: {recent['error'].std():.2f} W/m²\n")
+                f.write(f"MAPE: {recent['error_percentage'].abs().mean():.2f}%\n\n")
+                
+                # Hourly Analysis
+                f.write("Hourly Performance:\n")
+                for hour, stats in hourly_stats.iterrows():
+                    f.write(f"Hour {hour:02d}:00\n")
+                    f.write(f"  Mean Error: {stats['mean']:.2f} W/m²\n")
+                    f.write(f"  Error Std: {stats['std']:.2f} W/m²\n")
+                
+                # Learning Adjustments
+                f.write("\nCurrent Learning Parameters:\n")
+                for hour in range(24):
+                    adjustments = self.error_learner.get_hour_adjustments(hour)
+                    f.write(f"\nHour {hour:02d}:00 Adjustments:\n")
+                    for condition, factor in adjustments.items():
+                        f.write(f"  {condition}: {factor:.3f}\n")
+                
+                # Recommendations
+                f.write("\nSystem Recommendations:\n")
+                self._generate_recommendations(history_df, f)
+                
+            print(f"\nLearning analysis saved to {report_path}")
+            
+        except Exception as e:
+            print(f"Error in _generate_learning_report: {str(e)}")
+            traceback.print_exc()
+
+    def _generate_recommendations(self, history_df, f):
+        """Generate system recommendations based on learning analysis"""
+        try:
+            # Analyze error patterns
+            error_patterns = self._analyze_error_patterns(history_df)
+            
+            # Write recommendations
+            f.write("\nBased on error analysis:\n")
+            
+            # Check for systematic bias
+            if abs(history_df['error'].mean()) > 50:
+                bias_direction = "high" if history_df['error'].mean() < 0 else "low"
+                f.write(f"- System shows systematic bias towards {bias_direction} predictions\n")
+                f.write(f"  Recommendation: Adjust base prediction weights\n")
+            
+            # Check for hour-specific issues
+            problematic_hours = error_patterns['problematic_hours']
+            if problematic_hours:
+                f.write("\nHours needing attention:\n")
+                for hour, error_rate in problematic_hours:
+                    f.write(f"- Hour {hour:02d}:00 (Error rate: {error_rate:.2f}%)\n")
+                    f.write("  Recommendation: Review and adjust hourly patterns\n")
+            
+            # Weather condition impacts
+            if error_patterns['weather_impacts']:
+                f.write("\nWeather condition impacts:\n")
+                for condition, impact in error_patterns['weather_impacts'].items():
+                    f.write(f"- {condition}: {impact:.2f}% average error\n")
+                    if abs(impact) > 20:
+                        f.write("  Recommendation: Adjust weather similarity calculations\n")
+            
+            # Learning rate analysis
+            recent_improvement = error_patterns['learning_rate']
+            if recent_improvement > -1:  # Not improving fast enough
+                f.write("\nLearning rate recommendations:\n")
+                f.write("- Consider increasing learning rate for faster adaptation\n")
+                f.write("- Review similarity thresholds for pattern matching\n")
+            
+        except Exception as e:
+            print(f"Error in _generate_recommendations: {str(e)}")
+            f.write("\nError generating recommendations\n")
+
+    def _analyze_error_patterns(self, history_df):
+        """Analyze error patterns in prediction history"""
+        try:
+            patterns = {
+                'problematic_hours': [],
+                'weather_impacts': {},
+                'learning_rate': 0.0
+            }
+            
+            # Analyze hourly performance
+            hourly_errors = history_df.groupby('hour')['error_percentage'].agg(['mean', 'std'])
+            for hour, stats in hourly_errors.iterrows():
+                if abs(stats['mean']) > 15:  # More than 15% average error
+                    patterns['problematic_hours'].append((hour, abs(stats['mean'])))
+            
+            # Analyze weather impacts if weather data is available
+            if 'weather_condition' in history_df.columns:
+                weather_impacts = history_df.groupby('weather_condition')['error_percentage'].mean()
+                patterns['weather_impacts'] = weather_impacts.to_dict()
+            
+            # Calculate learning rate (improvement over time)
+            if len(history_df) > 100:
+                recent_errors = history_df['error'].tail(100).abs().mean()
+                old_errors = history_df['error'].head(100).abs().mean()
+                patterns['learning_rate'] = (recent_errors - old_errors) / old_errors * 100
+            
+            return patterns
+            
+        except Exception as e:
+            print(f"Error in _analyze_error_patterns: {str(e)}")
+            return {'problematic_hours': [], 'weather_impacts': {}, 'learning_rate': 0.0}
+
+    def record_prediction(self, hour, predicted, actual, conditions):
+        """Record prediction results for learning analysis"""
+        try:
+            # Initialize prediction record with None for actual value
+            prediction_record = {
+                'date': pd.Timestamp.now(),
+                'hour': hour,
+                'predicted': predicted,
+                'actual': None,  # Initialize as None, will be updated later
+                'error': None,   # Initialize as None, will be updated later
+                'error_percentage': None,  # Initialize as None, will be updated later
+                'conditions': conditions
+            }
+            
+            # If actual value is provided immediately, update the record
+            if actual is not None:
+                prediction_record['actual'] = actual
+                prediction_record['error'] = actual - predicted
+                prediction_record['error_percentage'] = (prediction_record['error'] / actual * 100) if actual != 0 else 0
+            
+            self.prediction_history.append(prediction_record)
+            
+            # Trigger learning analysis every 24 predictions
+            if len(self.prediction_history) % 24 == 0:
+                self.analyze_learning_performance()
+                
+        except Exception as e:
+            print(f"Error in record_prediction: {str(e)}")
+
+    def predict_day(self, date, features):
+        """Predict solar radiation for all hours in a day"""
+        try:
+            predictions = []
+            timestamps = []
+            
+            for hour in range(24):
+                # Create timestamp
+                timestamp = pd.Timestamp.combine(date, pd.Timestamp(f"{hour:02d}:00").time())
+                
+                # Get current conditions
+                current_conditions = {
+                    'temperature': features['Average Temperature'][hour] if hour < len(features) else None,
+                    'humidity': features['Average Humidity'][hour] if hour < len(features) else None,
+                    'uv': features['UV Index'][hour] if hour < len(features) else None
+                }
+                
+                # Make prediction for this hour
+                prediction = self.predict_next_hour(features[:hour+1], hour, current_conditions)
+                
+                predictions.append(prediction)
+                timestamps.append(timestamp)
+            
+            # Create DataFrame with predictions
+            results_df = pd.DataFrame({
+                'Timestamp': timestamps,
+                'Hour': [t.hour for t in timestamps],
+                'Predicted Solar Radiation (W/m²)': predictions
+            })
+            
+            # Save predictions to CSV
+            results_df.to_csv(os.path.join(self.stats_folder, 'daily_predictions.csv'), index=False)
+            
+            # Create prediction plot
+            plt.figure(figsize=(12, 6))
+            plt.plot(results_df['Hour'], results_df['Predicted Solar Radiation (W/m²)'], 
+                     marker='o', linestyle='-', linewidth=2)
+            plt.title(f'Predicted Solar Radiation for {date.strftime("%Y-%m-%d")}')
+            plt.xlabel('Hour of Day')
+            plt.ylabel('Solar Radiation (W/m²)')
+            plt.grid(True)
+            plt.xticks(range(24))
+            plt.ylim(bottom=0)
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.stats_folder, 'daily_predictions.png'))
+            plt.close()
+            
+            return results_df
+            
+        except Exception as e:
+            print(f"Error in predict_day: {str(e)}")
+            traceback.print_exc()
+            return None
+
+def main():
+    try:
+        print("Starting automated solar radiation prediction system...")
+        
+        # Initialize predictor with error tracking
+        predictor = AutomatedPredictor()
+
+        # Load and preprocess data
+        hourly_data, minute_data, feature_averages = preprocess_data('dataset.csv')
+        if hourly_data is None or minute_data is None:
+            raise ValueError("Failed to load and preprocess data")
+            
+        print("\nLearning from historical data...")
+        predictor.learn_from_historical_data(hourly_data)
+        
+        # Get all unique dates
+        dates = hourly_data['timestamp'].dt.date.unique()
+        total_predictions = 0
+        total_error = 0
+        
+        print("\nTesting predictions on historical data...")
+        for date in dates:
+            day_data = hourly_data[hourly_data['timestamp'].dt.date == date]
+            
+            # For each hour of the day
+            for hour in range(23):  # Up to 23 to predict next hour
+                current_data = day_data[day_data['timestamp'].dt.hour == hour]
+                if current_data.empty:
+                    continue
+                
+                # Get current conditions
+                conditions = {
+                    'temperature': current_data['Average Temperature'].iloc[0],
+                    'humidity': current_data['Average Humidity'].iloc[0],
+                    'pressure': current_data['Average Barometer'].iloc[0],
+                    'uv': current_data['UV Index'].iloc[0]
+                }
+                
+                # Make prediction for next hour
+                prediction = predictor.predict_next_hour(hourly_data, date, int(hour))
+                
+                # Get actual value for next hour
+                next_hour_data = day_data[day_data['timestamp'].dt.hour == hour + 1]
+                if not next_hour_data.empty and prediction is not None:
+                    actual = next_hour_data['Solar Rad - W/m^2'].iloc[0]
+                    error = abs(actual - prediction)
+                    total_error += error
+                    total_predictions += 1
+                    
+                    # Record prediction for learning analysis
+                    predictor.record_prediction(
+                        hour=hour,
+                        predicted=prediction,
+                        actual=actual,
+                        conditions=conditions
+                    )
+                    
+                    # Update learning with actual value
+                    predictor.update_with_actual(date, hour, actual)
+                    
+                    print(f"\nDate: {date}, Hour {hour:02d}:00 -> {hour+1:02d}:00")
+                    print(f"Predicted: {prediction:.2f} W/m²")
+                    print(f"Actual: {actual:.2f} W/m²")
+                    print(f"Error: {error:.2f} W/m²")
+        
+        # Print overall performance
+        if total_predictions > 0:
+            avg_error = total_error / total_predictions
+            print(f"\nOverall Performance:")
+            print(f"Total predictions: {total_predictions}")
+            print(f"Average error: {avg_error:.2f} W/m²")
+        
+        # Generate final learning analysis
+        predictor.analyze_learning_performance()
+        
+        # Make predictions for current/next day
+        current_date = pd.Timestamp.now().date()
+        print(f"\nMaking predictions for {current_date}...")
+        predictions_df = predictor.predict_day(current_date, feature_averages)
+        
+        # Save final state
+        predictor.save_state()
+            
+    except Exception as e:
+        print(f"Error in main: {str(e)}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
