@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 import os
-import datetime
 import warnings
 from datetime import datetime
 import traceback
@@ -490,45 +489,40 @@ class AutomatedPredictor:
             updated = False
             # Find the most recent prediction for this hour that hasn't been updated
             for pred in reversed(self.prediction_history):
-                if (pred.get('date') == date and 
+                if (pred.get('date') == str(date) and 
                     pred.get('hour') == hour and 
                     pred.get('actual') is None):
                     # Update prediction record with actual value
-                    pred['actual'] = actual_value
-                    pred['error'] = actual_value - pred['predicted']
-                    pred['error_percentage'] = (pred['error'] / actual_value * 100) if actual_value != 0 else 0
+                    pred['actual'] = float(actual_value)
+                    pred['error'] = float(actual_value - pred['predicted'])
+                    pred['error_percentage'] = float((pred['error'] / actual_value * 100) if actual_value != 0 else 0)
                     
-                    # Update consecutive errors for learning
-                    self.consecutive_errors.append(pred['error'])
-                    if len(self.consecutive_errors) > 10:
-                        self.consecutive_errors.pop(0)
-                    
-                    # Update error learner with context
-                    self.error_learner.record_error(
-                        hour, 
-                        pred['predicted'], 
-                        actual_value, 
-                        pred['conditions'],
-                        error_history=self.consecutive_errors
-                    )
-                    
-                    # Print detailed learning update
-                    print(f"\nLearning Update for Hour {hour:02d}:")
-                    print(f"Date: {date}")  # Add date to output
+                    # Print update details for debugging
+                    print(f"\nUpdating prediction record:")
+                    print(f"Date: {date}, Hour: {hour}")
                     print(f"Predicted: {pred['predicted']:.2f} W/m²")
                     print(f"Actual: {actual_value:.2f} W/m²")
                     print(f"Error: {pred['error']:.2f} W/m²")
                     print(f"Error percentage: {pred['error_percentage']:.1f}%")
-                    print(f"New adjustment factor: {self.error_learner.get_adjustment(hour, pred['conditions']):.3f}")
                     
                     updated = True
+                    
+                    # Save updated prediction history
+                    self._save_prediction_history()
                     break
             
             if not updated:
-                print(f"No pending prediction found for date {date}, hour {hour:02d}")
+                print(f"Warning: No pending prediction found for date {date}, hour {hour}")
+                print(f"Current prediction history size: {len(self.prediction_history)}")
+                if self.prediction_history:
+                    print("Last prediction record:")
+                    last_pred = self.prediction_history[-1]
+                    print(f"Date: {last_pred['date']}, Hour: {last_pred['hour']}")
             
-            # Evaluate model performance after update
-            self.evaluate_and_save_model()
+            # Trigger learning analysis every 24 predictions or when significant errors occur
+            if updated and (len(self.prediction_history) % 24 == 0 or abs(pred['error_percentage']) > 20):
+                print("\nTriggering learning analysis...")
+                self.analyze_learning_performance()
             
             # Save state after update
             self.save_state()
@@ -725,69 +719,74 @@ class AutomatedPredictor:
                 
             current_value = current_data['Solar Rad - W/m^2'].iloc[0]
             conditions = {
-                'temperature': current_data['Average Temperature'].iloc[0],
-                'humidity': current_data['Average Humidity'].iloc[0],
-                'pressure': current_data['Average Barometer'].iloc[0],
-                'uv': current_data['UV Index'].iloc[0]
+                'temperature': float(current_data['Average Temperature'].iloc[0]),
+                'humidity': float(current_data['Average Humidity'].iloc[0]),
+                'pressure': float(current_data['Average Barometer'].iloc[0]),
+                'uv': float(current_data['UV Index'].iloc[0])
             }
             
-            # Find similar days
+            # Find similar days first
             similar_days = self._find_similar_days(data, target_date, current_hour, conditions)
-            
-            # Calculate multiple prediction components
-            predictions = {
-                'pattern_based': self._get_pattern_prediction(similar_days, current_value),
-                'ratio_based': self._get_ratio_prediction(similar_days, current_value),
-                'trend_based': self._get_trend_prediction(current_day, current_hour),
-                'typical_value': self._get_typical_value(next_hour)
-            }
             
             # Get clear sky radiation
             clear_sky = calculate_clear_sky_radiation(
                 next_hour, ADDU_LATITUDE, ADDU_LONGITUDE, target_date
             )
             
-            # Dynamic weighting based on recent performance
+            # Calculate prediction components
+            pattern_pred = self._get_pattern_prediction(similar_days, current_value)
+            ratio_pred = self._get_ratio_prediction(similar_days, current_value)
+            trend_pred = self._get_trend_prediction(current_day, current_hour)
+            typical_pred = self._get_typical_value(next_hour)
+            
+            # Get weights for combining predictions
             weights = self._calculate_prediction_weights()
             
             # Combine predictions with weights
             prediction = (
-                predictions['pattern_based'] * weights['pattern'] +
-                predictions['ratio_based'] * weights['ratio'] +
-                predictions['trend_based'] * weights['trend'] +
-                predictions['typical_value'] * weights['typical']
+                pattern_pred * weights['pattern'] +
+                ratio_pred * weights['ratio'] +
+                trend_pred * weights['trend'] +
+                typical_pred * weights['typical']
             )
             
             # Apply error learning adjustment
             adjustment = self.error_learner.get_adjustment(next_hour, conditions)
             prediction = prediction * adjustment
             
-            # Validate against clear sky and recent values
-            prediction = self._validate_prediction(prediction, clear_sky, current_value)
+            # Validate prediction using the next hour from data
+            prediction = self._validate_prediction(prediction, clear_sky, current_value, next_hour)
             
             # Print detailed analysis
             print(f"\nPrediction Analysis for hour {next_hour:02d}:00")
             print(f"Clear sky radiation: {clear_sky:.2f} W/m²")
             print(f"Current value: {current_value:.2f} W/m²")
-            print(f"Pattern-based: {predictions['pattern_based']:.2f} W/m²")
-            print(f"Ratio-based: {predictions['ratio_based']:.2f} W/m²")
-            print(f"Trend-based: {predictions['trend_based']:.2f} W/m²")
-            print(f"Typical value: {predictions['typical_value']:.2f} W/m²")
+            print(f"Pattern-based: {pattern_pred:.2f} W/m²")
+            print(f"Ratio-based: {ratio_pred:.2f} W/m²")
+            print(f"Trend-based: {trend_pred:.2f} W/m²")
+            print(f"Typical value: {typical_pred:.2f} W/m²")
             print(f"Applied learning adjustment: {adjustment:.3f}")
             print(f"Final prediction: {prediction:.2f} W/m²")
             
-            # Store prediction for learning
-            self.prediction_history.append({
-                'date': target_date,
-                'hour': next_hour,
-                'predicted': prediction,
-                'actual': None,  # Initialize as None
-                'error': None,   # Initialize as None
-                'error_percentage': None,  # Initialize as None
-                'conditions': conditions,
-                'weights': weights,
-                'adjustment': adjustment
-            })
+            # Store prediction with all necessary information
+            prediction_record = {
+                'date': str(target_date),  # Convert date to string for CSV storage
+                'hour': int(next_hour),
+                'predicted': float(prediction),
+                'actual': None,  # Will be updated later
+                'error': None,
+                'error_percentage': None,
+                'conditions': str(conditions),  # Convert dict to string for CSV storage
+                'weights': str(weights),  # Convert dict to string for CSV storage
+                'adjustment': float(adjustment),
+                'current_value': float(current_value)
+            }
+            
+            # Append to prediction history
+            self.prediction_history.append(prediction_record)
+            
+            # Save prediction history to CSV after each prediction
+            self._save_prediction_history()
             
             return prediction
             
@@ -795,6 +794,22 @@ class AutomatedPredictor:
             print(f"Error in predict_next_hour: {str(e)}")
             traceback.print_exc()
             return None
+
+    def _save_prediction_history(self):
+        """Save prediction history to CSV"""
+        try:
+            if self.prediction_history:
+                timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+                history_file = os.path.join(self.history_folder, f'prediction_history_{timestamp}.csv')
+                
+                # Convert to DataFrame and save
+                history_df = pd.DataFrame(self.prediction_history)
+                history_df.to_csv(history_file, index=False)
+                print(f"\nSaved prediction history to: {history_file}")
+                
+        except Exception as e:
+            print(f"Error saving prediction history: {str(e)}")
+            traceback.print_exc()
 
     def _find_similar_days(self, data, target_date, current_hour, conditions):
         """Find similar days with enhanced matching criteria"""
@@ -1004,46 +1019,40 @@ class AutomatedPredictor:
         
         return weights
 
-    def _validate_prediction(self, prediction, clear_sky, current_value):
-        """Validate and adjust prediction"""
+    def _validate_prediction(self, prediction, clear_sky, current_value, hour):
+        """Validate and adjust prediction with provided hour"""
         try:
-            # Get current hour
-            hour = pd.Timestamp.now().hour
-            
-            # Force zero radiation during night hours (18:00-05:00)
-            if hour >= 18 or hour <= 5:  # Changed from hour < 6 to hour <= 5
+            # Use provided hour instead of system time
+            if hour >= 18 or hour <= 5:
                 return 0.0
             
             # Early morning transition (06:00-07:59)
             if hour < 8:
-                # Gradual increase from zero
                 if hour == 6:
-                    return min(prediction, clear_sky * 0.15)  # Max 15% of clear sky
+                    return min(max(prediction, current_value * 0.5), clear_sky * 0.3)
                 elif hour == 7:
-                    return min(prediction, clear_sky * 0.3)  # Max 30% of clear sky
+                    return min(max(prediction, current_value * 0.7), clear_sky * 0.5)
             
             # Late afternoon transition (16:00-17:59)
             if hour >= 16:
-                # Gradual decrease to zero
                 if hour == 17:
-                    return min(prediction, clear_sky * 0.1)  # Max 10% of clear sky
+                    return min(prediction, clear_sky * 0.2)
                 elif hour == 16:
-                    return min(prediction, clear_sky * 0.25)  # Max 25% of clear sky
+                    return min(prediction, clear_sky * 0.4)
             
             # Normal daytime hours (08:00-15:59)
-            # Ensure prediction is within reasonable bounds
-            prediction = max(0, min(prediction, clear_sky * 0.85))
+            prediction = max(0, min(prediction, clear_sky * 0.95))
             
             # Limit maximum change from current value
-            max_increase = current_value * 2.0  # Maximum 100% increase
-            max_decrease = current_value * 0.3  # Maximum 70% decrease
+            max_increase = current_value * 2.5 if current_value > 0 else clear_sky * 0.5
+            max_decrease = current_value * 0.4 if current_value > 0 else 0
             prediction = min(max(prediction, max_decrease), max_increase)
             
             return prediction
             
         except Exception as e:
             print(f"Error in _validate_prediction: {str(e)}")
-            return current_value  # Return current value as fallback
+            return current_value
 
     def _store_prediction(self, current_value, prediction, next_hour, conditions):
         """Store prediction for learning"""
@@ -1090,13 +1099,15 @@ class AutomatedPredictor:
             history_df['rolling_mape'] = history_df['error_percentage'].abs().rolling(window_size).mean()
             history_df['improvement'] = history_df['rolling_mae'].diff().rolling(window_size).mean()
             
+            # Ensure stats folder exists
+            os.makedirs(self.stats_folder, exist_ok=True)
+            
             # Clear any existing plots
             plt.close('all')
             
             # Create figure with better memory management
-            fig = plt.figure(figsize=(20, 15), dpi=100)  # Reduced DPI
-            # Use a built-in style instead of seaborn
-            plt.style.use('default')  # or try 'classic', 'bmh', 'ggplot'
+            fig = plt.figure(figsize=(20, 15), dpi=100)
+            plt.style.use('default')
             
             # Plot 1: Prediction Accuracy Over Time
             ax1 = fig.add_subplot(221)
@@ -1160,24 +1171,27 @@ class AutomatedPredictor:
             # Adjust layout and save
             plt.tight_layout(pad=3.0)
             timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-            plot_path = os.path.join(self.stats_folder, f'learning_analysis_{timestamp}.png')
+            plot_path = os.path.join(os.path.abspath(self.stats_folder), f'learning_analysis_{timestamp}.png')
             
-            # Save with reduced memory usage
+            # Save with reduced memory usage and print the path
             plt.savefig(plot_path, bbox_inches='tight', dpi=100)
-            plt.close(fig)  # Explicitly close the figure
+            plt.close(fig)
+            print(f"\nLearning analysis plot saved to: {plot_path}")
             
-            # Generate detailed learning report
-            self._generate_learning_report(history_df, hourly_improvement)
+            # Generate detailed learning report with absolute path
+            report_path = os.path.join(os.path.abspath(self.stats_folder), f'learning_report_{timestamp}.txt')
+            self._generate_learning_report(history_df, hourly_improvement, report_path)
+            print(f"Learning report saved to: {report_path}")
             
         except Exception as e:
             print(f"Error in analyze_learning_performance: {str(e)}")
             traceback.print_exc()
 
-    def _generate_learning_report(self, history_df, hourly_stats):
+    def _generate_learning_report(self, history_df, hourly_stats, report_path):
         """Generate detailed learning report"""
         try:
-            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-            report_path = os.path.join(self.stats_folder, f'learning_report_{timestamp}.txt')
+            # Ensure parent directory exists
+            os.makedirs(os.path.dirname(report_path), exist_ok=True)
             
             with open(report_path, 'w') as f:
                 f.write("=== Solar Radiation Prediction Learning Report ===\n\n")
@@ -1215,8 +1229,6 @@ class AutomatedPredictor:
                 f.write("\nSystem Recommendations:\n")
                 self._generate_recommendations(history_df, f)
                 
-            print(f"\nLearning analysis saved to {report_path}")
-            
         except Exception as e:
             print(f"Error in _generate_learning_report: {str(e)}")
             traceback.print_exc()
@@ -1655,58 +1667,49 @@ def main():
         hourly_data, minute_data, feature_averages = preprocess_data('dataset.csv')
         if hourly_data is None or minute_data is None:
             raise ValueError("Failed to load and preprocess data")
-            
+        
+        print(f"\nLoaded data shape: {hourly_data.shape}")
+        print(f"Date range: {hourly_data['timestamp'].min()} to {hourly_data['timestamp'].max()}")
+        
         print("\nLearning from historical data...")
         predictor.learn_from_historical_data(hourly_data)
         
         # Get all unique dates
-        dates = hourly_data['timestamp'].dt.date.unique()
+        dates = sorted(hourly_data['timestamp'].dt.date.unique())
+        print(f"\nProcessing {len(dates)} unique dates")
+        
         total_predictions = 0
         total_error = 0
         
         print("\nTesting predictions on historical data...")
-        for date in dates:
+        for date_idx, date in enumerate(dates):
+            print(f"\nProcessing date {date} ({date_idx + 1}/{len(dates)})")
             day_data = hourly_data[hourly_data['timestamp'].dt.date == date]
             
             for hour in range(23):  # Up to 23 to predict next hour
                 current_data = day_data[day_data['timestamp'].dt.hour == hour]
-                if current_data.empty:
-                    continue
+                next_data = day_data[day_data['timestamp'].dt.hour == hour + 1]
                 
-                # Get current conditions
-                conditions = {
-                    'temperature': current_data['Average Temperature'].iloc[0],
-                    'humidity': current_data['Average Humidity'].iloc[0],
-                    'pressure': current_data['Average Barometer'].iloc[0],
-                    'uv': current_data['UV Index'].iloc[0]
-                }
+                if current_data.empty or next_data.empty:
+                    print(f"Skipping hour {hour} - insufficient data")
+                    continue
                 
                 # Make prediction for next hour
                 prediction = predictor.predict_next_hour(hourly_data, date, hour)
                 
-                # Get actual value for next hour
-                next_hour_data = day_data[day_data['timestamp'].dt.hour == hour + 1]
-                if not next_hour_data.empty and prediction is not None:
-                    actual = next_hour_data['Solar Rad - W/m^2'].iloc[0]
+                if prediction is not None:
+                    actual = next_data['Solar Rad - W/m^2'].iloc[0]
                     error = abs(actual - prediction)
                     total_error += error
                     total_predictions += 1
                     
-                    # Record prediction for learning analysis
-                    predictor.record_prediction(
-                        hour=hour,
-                        predicted=prediction,
-                        actual=actual,
-                        conditions=conditions
-                    )
-                    
                     # Update learning with actual value
-                    predictor.update_with_actual(date, hour + 1, actual)  # Use hour + 1
-                    
-                    print(f"\nDate: {date}, Hour {hour:02d}:00 -> {hour+1:02d}:00")
-                    print(f"Predicted: {prediction:.2f} W/m²")
-                    print(f"Actual: {actual:.2f} W/m²")
-                    print(f"Error: {error:.2f} W/m²")
+                    predictor.update_with_actual(date, hour + 1, actual)
+            
+            # Print progress every 10 dates
+            if (date_idx + 1) % 10 == 0:
+                print(f"\nProcessed {date_idx + 1} dates")
+                print(f"Current prediction history size: {len(predictor.prediction_history)}")
         
         # Print overall performance
         if total_predictions > 0:
@@ -1714,17 +1717,15 @@ def main():
             print(f"\nOverall Performance:")
             print(f"Total predictions: {total_predictions}")
             print(f"Average error: {avg_error:.2f} W/m²")
+            print(f"Final prediction history size: {len(predictor.prediction_history)}")
         
         # Generate final learning analysis
+        print("\nGenerating final learning analysis...")
         predictor.analyze_learning_performance()
         
-        # Make predictions for current/next day
-        current_date = pd.Timestamp.now().date()
-        print(f"\nMaking predictions for {current_date}...")
-        predictions_df = predictor.predict_day(current_date, feature_averages)
-        
-        # Save final state
-        predictor.save_state()
+        # Print paths to analysis files
+        print("\nAnalysis files can be found in:")
+        print(f"Stats folder: {os.path.abspath(predictor.stats_folder)}")
             
     except Exception as e:
         print(f"Error in main: {str(e)}")
