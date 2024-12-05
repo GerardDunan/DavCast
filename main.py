@@ -9,7 +9,6 @@ from datetime import datetime
 import traceback
 import pickle
 import json
-import gzip
 warnings.filterwarnings('ignore')
 
 # Constants
@@ -102,28 +101,6 @@ class WeatherConditionAnalyzer:
             impact_factors['humidity'] = min((humidity - self.condition_thresholds['humidity']['high']) / 20, 1)
             
         return impact_factors
-
-class ManualAdjustmentHandler:
-    def __init__(self):
-        self.adjustments = {}
-        self.adjustment_history = []
-
-    def add_adjustment(self, hour, factor, reason, duration_hours=24):
-        self.adjustments[hour] = {
-            'factor': factor,
-            'reason': reason,
-            'start_time': pd.Timestamp.now(),
-            'duration_hours': duration_hours
-        }
-
-    def get_adjustment(self, hour):
-        if hour in self.adjustments:
-            adj = self.adjustments[hour]
-            if (pd.Timestamp.now() - adj['start_time']).total_seconds() / 3600 > adj['duration_hours']:
-                del self.adjustments[hour]
-                return 1.0
-            return adj['factor']
-        return 1.0
 
 def preprocess_data(data_path):
     """Preprocess data with enhanced feature engineering"""
@@ -602,41 +579,65 @@ class AutomatedPredictor:
         self.adaptive_learning = AdaptiveLearningController()
         self.ensemble_predictor = EnsemblePredictor()
         self.weather_analyzer = WeatherConditionAnalyzer()
-        self.manual_adjustments = ManualAdjustmentHandler()
         self.error_analyzer = ErrorPatternAnalyzer()
         self.success_tracker = SuccessTracker()
         self.fallback_predictor = FallbackPredictor()
 
+    def _cleanup_old_learning_states(self, max_states=5):
+        """Remove old learning states when limit is reached"""
+        try:
+            # Get all learning state files
+            learning_states = [f for f in os.listdir(self.models_folder) 
+                             if f.startswith('learning_state_') and f.endswith('.pkl')]
+            
+            # If number of files exceeds max_states, remove oldest ones
+            if len(learning_states) > max_states:
+                # Sort files by timestamp (oldest first)
+                learning_states.sort()
+                # Remove oldest files
+                files_to_remove = learning_states[:-max_states]  # Keep only the latest max_states files
+                
+                for file in files_to_remove:
+                    file_path = os.path.join(self.models_folder, file)
+                    try:
+                        os.remove(file_path)
+                        print(f"Removed old learning state: {file}")
+                    except Exception as e:
+                        print(f"Error removing file {file}: {str(e)}")
+                        
+        except Exception as e:
+            print(f"Error in cleanup_old_learning_states: {str(e)}")
+            traceback.print_exc()
+
     def save_state(self):
-        """Save all learning state and history with compression and retention policies"""
+        """Save learning state and history"""
         try:
             timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
             
-            # 1. Compress learning state
+            # 1. Save learning state
             learning_state = {
-                'hourly_patterns': self._compress_patterns(self.hourly_patterns),
-                'seasonal_patterns': self._compress_patterns(self.seasonal_patterns),
-                'transition_patterns': self._compress_patterns(self.transition_patterns),
+                'hourly_patterns': self.hourly_patterns,
+                'seasonal_patterns': self.seasonal_patterns,
+                'transition_patterns': self.transition_patterns,
                 'weather_impacts': self.weather_impacts,
                 'consecutive_errors': self.consecutive_errors[-10:],  # Keep only last 10
                 'error_learner_state': {
-                    'error_history': self._compress_error_history(
-                        self.error_learner.error_history),
+                    'error_history': self.error_learner.error_history,
                     'adjustment_factors': self.error_learner.adjustment_factors,
                     'pattern_adjustments': self.error_learner.pattern_adjustments
                 },
                 'timestamp': timestamp
             }
             
-            # 2. Save compressed state
-            state_file = os.path.join(self.models_folder, f'learning_state_{timestamp}.pkl.gz')
-            with gzip.open(state_file, 'wb') as f:
+            # Save state using regular pickle
+            state_file = os.path.join(self.models_folder, f'learning_state_{timestamp}.pkl')
+            with open(state_file, 'wb') as f:
                 pickle.dump(learning_state, f)
             
-            # 3. Maintain only last 7 days of history
-            self._cleanup_old_files(self.models_folder, 'learning_state_', days=7)
+            # Cleanup old learning states
+            self._cleanup_old_learning_states(max_states=5)  # Keep only 5 most recent states
             
-            # 4. Save prediction history with aggregation
+            # 2. Save prediction history as CSV
             if self.prediction_history:
                 history_df = pd.DataFrame(self.prediction_history)
                 # Aggregate by hour and save last 30 days
@@ -644,24 +645,19 @@ class AutomatedPredictor:
                 cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=30)
                 history_df = history_df[history_df['date'] >= cutoff_date]
                 
-                # Save compressed CSV
                 history_file = os.path.join(
                     self.history_folder, 
-                    f'prediction_history_{timestamp}.csv.gz'
+                    f'prediction_history_{timestamp}.csv'
                 )
-                history_df.to_csv(history_file, compression='gzip', index=False)
+                history_df.to_csv(history_file, index=False)
             
-            # 5. Save hourly statistics (keep only essential metrics)
+            # 3. Save hourly statistics
             hourly_stats = self._get_compressed_stats()
             stats_file = os.path.join(self.stats_folder, f'hourly_stats_{timestamp}.json')
             with open(stats_file, 'w') as f:
                 json.dump(hourly_stats, f)
             
-            # 6. Cleanup old files
-            self._cleanup_old_files(self.history_folder, 'prediction_history_', days=30)
-            self._cleanup_old_files(self.stats_folder, 'hourly_stats_', days=7)
-            
-            print(f"\nSaved compressed learning state and history at {timestamp}")
+            print(f"\nSaved learning state and history at {timestamp}")
             
         except Exception as e:
             print(f"Error saving state: {str(e)}")
@@ -739,7 +735,7 @@ class AutomatedPredictor:
         """Load previous learning state and history"""
         try:
             if os.path.exists(self.learning_state_file):
-                with gzip.open(self.learning_state_file, 'rb') as f:
+                with open(self.learning_state_file, 'rb') as f:
                     state = pickle.load(f)
                     self.hourly_patterns = state['hourly_patterns']
                     self.seasonal_patterns = state['seasonal_patterns']
@@ -825,7 +821,6 @@ class AutomatedPredictor:
                 current_mae = np.mean(np.abs(recent_predictions['error']))
                 self.model_performance['current_mae'] = current_mae
                 
-                # Check if this is the best model so far
                 if current_mae < self.model_performance.get('best_mae', float('inf')):
                     print(f"\nNew best model detected! (MAE: {current_mae:.2f} W/m² vs previous: {self.model_performance.get('best_mae', float('inf')):.2f} W/m²)")
                     self.model_performance['best_mae'] = current_mae
@@ -846,15 +841,15 @@ class AutomatedPredictor:
                         'timestamp': pd.Timestamp.now()
                     }
                     
-                    # Save with compression
-                    best_model_path = os.path.join(self.models_folder, 'best_model.pkl.gz')
-                    with gzip.open(best_model_path, 'wb') as f:
+                    # Save using regular pickle
+                    best_model_path = os.path.join(self.models_folder, 'best_model.pkl')
+                    with open(best_model_path, 'wb') as f:
                         pickle.dump(best_state, f)
                     
-                    # Also save a timestamped version
+                    # Save timestamped version
                     timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-                    archive_path = os.path.join(self.models_folder, f'best_model_{timestamp}.pkl.gz')
-                    with gzip.open(archive_path, 'wb') as f:
+                    archive_path = os.path.join(self.models_folder, f'best_model_{timestamp}.pkl')
+                    with open(archive_path, 'wb') as f:
                         pickle.dump(best_state, f)
                     
                     print(f"Saved new best model to: {best_model_path}")
@@ -877,10 +872,10 @@ class AutomatedPredictor:
     def load_best_model(self):
         """Load the best performing model if available"""
         try:
-            best_model_path = os.path.join(self.models_folder, 'best_model.pkl.gz')
+            best_model_path = os.path.join(self.models_folder, 'best_model.pkl')
             if os.path.exists(best_model_path):
                 print("\nLoading best model...")
-                with gzip.open(best_model_path, 'rb') as f:
+                with open(best_model_path, 'rb') as f:
                     best_state = pickle.load(f)
                     
                 # Restore model state
@@ -1095,11 +1090,6 @@ class AutomatedPredictor:
                 learning_rate = self.adaptive_learning.update_learning_rate(recent_error)
                 print(f"Current learning rate: {learning_rate:.3f}")
             
-            # Get manual adjustments if any
-            manual_adj = self.manual_adjustments.get_adjustment(next_hour)
-            if manual_adj != 1.0:
-                print(f"Manual adjustment factor: {manual_adj:.3f}")
-            
             # Choose prediction method based on confidence
             if main_confidence < 0.7:
                 print("\nLow confidence in main prediction, using ensemble...")
@@ -1108,7 +1098,7 @@ class AutomatedPredictor:
                 prediction = predictions['main_model']
             
             # Apply adjustments
-            prediction *= weather_adjustment * manual_adj
+            prediction *= weather_adjustment
             
             # Validate prediction
             prediction = self._validate_prediction_with_outlier_detection(
@@ -1127,7 +1117,6 @@ class AutomatedPredictor:
                 'fallback_pred': float(predictions['fallback']),
                 'confidence': float(main_confidence),
                 'weather_adjustment': float(weather_adjustment),
-                'manual_adjustment': float(manual_adj),
                 'learning_rate': self.adaptive_learning.current_learning_rate,
                 'actual': None,
                 'error': None,
