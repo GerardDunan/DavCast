@@ -262,12 +262,43 @@ class PredictionErrorLearner:
     def __init__(self):
         self.error_history = {}
         self.adjustment_factors = {}
-        self.recent_errors = []
-        self.learning_rate = 0.2
-        self.pattern_adjustments = {}
-        self.min_adjustment = 0.5  # Changed from 0.4
-        self.max_adjustment = 2.0  # Changed from 2.5
+        self.hourly_errors = {hour: [] for hour in range(24)}
+        self.learning_rate = 0.01  # 1% per percentage point of error
+        self.min_adjustment = 0.7
+        self.max_adjustment = 1.3
+        self.error_window_size = 10
+        self.recent_errors = []  # Add this line to initialize recent_errors
+        self.pattern_adjustments = {}  # Keep this as it's used in get_adjustment
         
+    def _update_adjustment_factors(self, hour, error_pct, conditions):
+        """Update adjustment factors with smoother transitions"""
+        key = f"{hour}"
+        if key not in self.adjustment_factors:
+            self.adjustment_factors[key] = {'factor': 1.0, 'errors': []}
+            
+        # Add error to history
+        self.hourly_errors[hour].append(error_pct)
+        if len(self.hourly_errors[hour]) > self.error_window_size:
+            self.hourly_errors[hour].pop(0)
+            
+        # Calculate new adjustment based on recent errors
+        recent_errors = self.hourly_errors[hour][-self.error_window_size:]
+        avg_error = np.mean(recent_errors) if recent_errors else 0
+        
+        # Calculate new factor with controlled adjustment
+        current_factor = self.adjustment_factors[key]['factor']
+        new_factor = current_factor * (1 + avg_error * self.learning_rate)
+        new_factor = max(self.min_adjustment, min(self.max_adjustment, new_factor))
+        
+        # Smooth transition (80/20 blend)
+        self.adjustment_factors[key]['factor'] = current_factor * 0.8 + new_factor * 0.2
+        
+        print(f"\nHour {hour} adjustment update:")
+        print(f"Average error: {avg_error:.2f}%")
+        print(f"Previous factor: {current_factor:.3f}")
+        print(f"New factor: {new_factor:.3f}")
+        print(f"Smoothed factor: {self.adjustment_factors[key]['factor']:.3f}")
+
     def record_error(self, hour, predicted, actual, conditions, error_history=None):
         error = actual - predicted
         error_pct = error / actual if actual != 0 else 0
@@ -606,6 +637,18 @@ class AutomatedPredictor:
         self.error_analyzer = ErrorPatternAnalyzer()
         self.success_tracker = SuccessTracker()
         self.fallback_predictor = FallbackPredictor()
+        
+        # Add method performance tracking
+        self.method_performance = {
+            'pattern': {'weight': 0.3, 'errors': [], 'window_size': 100},
+            'ratio': {'weight': 0.3, 'errors': [], 'window_size': 100},
+            'trend': {'weight': 0.2, 'errors': [], 'window_size': 100},
+            'typical': {'weight': 0.2, 'errors': [], 'window_size': 100}
+        }
+        
+        # Add hourly error tracking
+        self.hourly_errors = {hour: [] for hour in range(24)}
+        self.error_window_size = 100
 
     def _cleanup_old_learning_states(self, max_states=5):
         """Remove old learning states when limit is reached"""
@@ -793,18 +836,23 @@ class AutomatedPredictor:
                 if (pred.get('date') == str(date) and 
                     pred.get('hour') == hour and 
                     pred.get('actual') is None):
-                    # Update prediction record with actual value
+                    
+                    # Update prediction record
                     pred['actual'] = float(actual_value)
                     pred['error'] = float(actual_value - pred['predicted'])
                     pred['error_percentage'] = float((pred['error'] / actual_value * 100) 
                                                    if actual_value != 0 else 0)
                     
-                    # Update consecutive errors list
-                    self.consecutive_errors.append(pred['error_percentage'])
-                    if len(self.consecutive_errors) > self.max_consecutive_errors:
-                        self.consecutive_errors.pop(0)
+                    # Update method performance
+                    method_predictions = {
+                        'pattern': pred['main_prediction'],
+                        'ratio': pred['moving_avg'],
+                        'trend': pred['clear_sky_pred'],
+                        'typical': pred['pattern_pred']
+                    }
+                    self._update_method_performance(method_predictions, actual_value)
                     
-                    # Update error learner with more context
+                    # Update error learner
                     self.error_learner.record_error(
                         hour=hour,
                         predicted=pred['predicted'],
@@ -813,8 +861,13 @@ class AutomatedPredictor:
                                                          else pred['conditions']
                     )
                     
-                    print(f"\nUpdated consecutive errors:")
-                    print(f"Last {len(self.consecutive_errors)} errors: {[f'{e:.1f}%' for e in self.consecutive_errors]}")
+                    # Update hourly errors
+                    self.hourly_errors[hour].append(pred['error_percentage'])
+                    if len(self.hourly_errors[hour]) > self.error_window_size:
+                        self.hourly_errors[hour].pop(0)
+                    
+                    print(f"\nUpdated hour {hour} performance:")
+                    print(f"Recent errors: {[f'{e:.1f}%' for e in self.hourly_errors[hour][-5:]]}")
                     
                     updated = True
                     self._save_prediction_history()
@@ -1473,8 +1526,8 @@ class AutomatedPredictor:
             
             similarity = (
                 mean_sim * 0.4 +
-                std_sim * 0.3 +
-                trend_sim * 0.3
+                std_sim *0.3 +
+                trend_sim *0.3
             )
             
             return float(similarity)
@@ -1610,39 +1663,49 @@ class AutomatedPredictor:
             return 0
 
     def _calculate_prediction_weights(self):
-        """Calculate dynamic weights based on recent performance"""
+        """Get current weights from method performance"""
+        return {method: float(perf['weight'])  # Convert np.float64 to Python float
+                for method, perf in self.method_performance.items()}
+
+    def _update_method_performance(self, predictions, actual):
+        """Update performance metrics for each prediction method"""
         try:
-            if not self.consecutive_errors:
-                return {'pattern': 0.3, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.2}
+            for method, perf in self.method_performance.items():
+                if method in predictions:
+                    error = float(abs(predictions[method] - actual))  # Convert to float
+                    perf['errors'].append(error)
+                    if len(perf['errors']) > perf['window_size']:
+                        perf['errors'].pop(0)
+                        
+            # Update weights based on inverse error
+            total_inverse_error = 0.0  # Use Python float
+            new_weights = {}
             
-            # Calculate error statistics
-            recent_errors = np.array(self.consecutive_errors[-5:])  # Last 5 errors
-            avg_error = np.mean(np.abs(recent_errors))
-            error_std = np.std(recent_errors)
+            for method, perf in self.method_performance.items():
+                if perf['errors']:
+                    avg_error = float(np.mean(perf['errors'][-10:]))  # Convert to float
+                    inverse_error = float(1 / (avg_error + 1e-8))  # Convert to float
+                    total_inverse_error += inverse_error
+                    new_weights[method] = inverse_error
             
-            # Adjust weights based on error patterns
-            if avg_error < 10:  # Very accurate predictions
-                weights = {'pattern': 0.4, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.1}
-            elif avg_error < 20:  # Moderately accurate
-                weights = {'pattern': 0.3, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.2}
-            else:  # Less accurate
-                weights = {'pattern': 0.2, 'ratio': 0.2, 'trend': 0.3, 'typical': 0.3}
-            
-            # Adjust for variability
-            if error_std > 15:  # High variability
-                weights['trend'] += 0.1
-                weights['pattern'] -= 0.1
-            
-            print(f"\nCalculated weights based on recent performance:")
-            print(f"Average error: {avg_error:.1f}%")
-            print(f"Error std: {error_std:.1f}%")
-            print(f"Weights: {weights}")
-            
-            return weights
-            
+            # Normalize and smooth weights
+            if total_inverse_error > 0:
+                for method in self.method_performance:
+                    if method in new_weights:
+                        normalized_weight = float(new_weights[method] / total_inverse_error)
+                        current_weight = float(self.method_performance[method]['weight'])
+                        # 70/30 blend of old and new weights
+                        self.method_performance[method]['weight'] = float(
+                            current_weight * 0.7 + normalized_weight * 0.3
+                        )
+                        
+            print("\nUpdated method weights:")
+            for method, perf in self.method_performance.items():
+                print(f"{method}: {perf['weight']:.3f}")
+                
         except Exception as e:
-            print(f"Error in _calculate_prediction_weights: {str(e)}")
-            return {'pattern': 0.3, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.2}
+            print(f"Error in _update_method_performance: {str(e)}")
+            traceback.print_exc()
 
     def _validate_prediction(self, prediction, clear_sky, current_value, hour):
         """Validate and adjust prediction with provided hour"""
