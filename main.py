@@ -1,3 +1,4 @@
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -9,6 +10,9 @@ from datetime import datetime
 import traceback
 import pickle
 import json
+import argparse
+from pathlib import Path
+from typing import Optional, Dict, Any
 warnings.filterwarnings('ignore')
 
 # Constants
@@ -200,6 +204,15 @@ def calculate_clear_sky_radiation(hour, latitude, longitude, date):
         latitude = float(latitude)
         longitude = float(longitude)
         
+        # Ensure date is a proper datetime.date object
+        if isinstance(date, str):
+            date = pd.to_datetime(date).date()
+        elif isinstance(date, pd.Timestamp):
+            date = date.date()
+        elif pd.isna(date):
+            print(f"Warning: Invalid date provided: {date}")
+            return 0.0
+            
         # Convert latitude and longitude to radians
         lat_rad = np.radians(latitude)
         
@@ -593,7 +606,7 @@ class AutomatedPredictor:
         self.data_folder = data_folder
         self.history_folder = os.path.join(data_folder, 'history')
         self.models_folder = os.path.join(data_folder, 'models')
-        self.stats_folder = os.path.join(data_folder, 'learning_stats')  # Changed to learning_stats
+        self.stats_folder = os.path.join(data_folder, 'learning_stats')
         
         os.makedirs(self.data_folder, exist_ok=True)
         os.makedirs(self.history_folder, exist_ok=True)
@@ -614,9 +627,12 @@ class AutomatedPredictor:
         self.error_learner = PredictionErrorLearner()
         self.consecutive_errors = []
         self.prediction_history = []
-        self.max_consecutive_errors = 10  # Keep last 10 errors
+        self.max_consecutive_errors = 10
         
-        # Load previous state
+        # Initialize model state
+        self._is_trained = False  # Move this BEFORE loading the model
+        
+        # Load previous state and best model
         self.load_state()
         
         # Add model versioning
@@ -963,36 +979,51 @@ class AutomatedPredictor:
                     best_state = pickle.load(f)
                     
                 # Restore model state
-                self.hourly_patterns = best_state['hourly_patterns']
-                self.seasonal_patterns = best_state['seasonal_patterns']
-                self.transition_patterns = best_state['transition_patterns']
-                self.weather_impacts = best_state['weather_impacts']
+                self.hourly_patterns = best_state.get('hourly_patterns', {})
+                self.seasonal_patterns = best_state.get('seasonal_patterns', {})
+                self.transition_patterns = best_state.get('transition_patterns', {})
+                self.weather_impacts = best_state.get('weather_impacts', {})
                 
                 # Restore error learner state
-                error_learner_state = best_state['error_learner_state']
-                self.error_learner.error_history = error_learner_state['error_history']
-                self.error_learner.adjustment_factors = error_learner_state['adjustment_factors']
-                self.error_learner.pattern_adjustments = error_learner_state['pattern_adjustments']
+                error_learner_state = best_state.get('error_learner_state', {})
+                if error_learner_state:
+                    self.error_learner.error_history = error_learner_state.get('error_history', [])
+                    self.error_learner.adjustment_factors = error_learner_state.get('adjustment_factors', {})
+                    self.error_learner.pattern_adjustments = error_learner_state.get('pattern_adjustments', {})
                 
                 # Restore performance metrics
-                self.model_performance = best_state['model_performance']
-                
-                print(f"Loaded best model from {best_model_path}")
-                print(f"Best model MAE: {self.model_performance['best_mae']:.2f} W/m²")
-                print(f"Best model timestamp: {self.model_performance['best_timestamp']}")
-                
-            else:
-                print("No best model found - starting fresh")
-                self.model_performance = {
+                self.model_performance = best_state.get('model_performance', {
                     'best_mae': float('inf'),
                     'best_timestamp': None,
                     'current_mae': float('inf'),
                     'evaluation_window': 100
-                }
+                })
+                
+                # Verify model state is complete and valid
+                pattern_count = sum(len(patterns) for patterns in self.hourly_patterns.values())
+                if pattern_count > 0:
+                    print(f"Found {pattern_count} valid patterns across {len(self.hourly_patterns)} hours")
+                    self._is_trained = True  # Set the flag here
+                    print(f"Loaded best model from {best_model_path}")
+                    print(f"Best model MAE: {self.model_performance['best_mae']:.2f} W/m²")
+                    print(f"Best model timestamp: {self.model_performance['best_timestamp']}")
+                    print("Model state verified and ready for predictions")
+                    return True
+                    
+                print("Loaded model state is incomplete - will need training")
+                self._is_trained = False
+                return False
+                
+            else:
+                print("No best model found - starting fresh")
+                self._is_trained = False
+                return False
                 
         except Exception as e:
             print(f"Error loading best model: {str(e)}")
             traceback.print_exc()
+            self._is_trained = False
+            return False
 
     def learn_from_historical_data(self, data):
         """Learn patterns from all historical data"""
@@ -1118,7 +1149,37 @@ class AutomatedPredictor:
             current_hour = int(current_hour)
             next_hour = (current_hour + 1) % 24
             
-            # Get current day's data and conditions
+            # Check if next hour is during nighttime (00:00-05:00 or 18:00-23:00)
+            if next_hour <= 5 or next_hour >= 18:
+                # Return zero prediction with metadata for nighttime hours
+                prediction_record = {
+                    'date': str(target_date),
+                    'hour': int(next_hour),
+                    'predicted': 0.0,
+                    'main_prediction': 0.0,
+                    'moving_avg': 0.0,
+                    'clear_sky_pred': 0.0,
+                    'pattern_pred': 0.0,
+                    'fallback_pred': 0.0,
+                    'weather_adjustment': 1.0,
+                    'learning_adjustment': 1.0,
+                    'actual': None,
+                    'error': None,
+                    'error_percentage': None,
+                    'conditions': str({'hour': next_hour, 'is_night': True}),
+                    'weights': {
+                        'pattern': 0.3,
+                        'ratio': 0.3,
+                        'trend': 0.2,
+                        'typical': 0.2
+                    }
+                }
+                
+                self.prediction_history.append(prediction_record)
+                print(f"\nNighttime hour {next_hour:02d}:00 - Setting prediction to 0 W/m²")
+                return 0.0
+            
+            # Rest of the existing prediction logic for daytime hours
             current_day = data[data['timestamp'].dt.date == target_date]
             if current_day.empty:
                 raise ValueError("No data available for target date")
@@ -1638,7 +1699,6 @@ class AutomatedPredictor:
                 trend = np.polyfit(x, data, 1)[0]
                 next_value = data[-1] + trend
                 return max(0, float(next_value))
-            
             return float(data[-1]) if len(data) > 0 else 0
                 
         except Exception as e:
@@ -2363,6 +2423,117 @@ class AutomatedPredictor:
             traceback.print_exc()
             return None
 
+    def train(self, data_path: str) -> bool:
+        """Train the model with historical data"""
+        try:
+            print("\nStarting model training...")
+            
+            # Load and preprocess data
+            hourly_data, minute_data, feature_averages = preprocess_data(data_path)
+            if hourly_data is None or minute_data is None:
+                raise ValueError("Failed to load and preprocess data")
+                
+            print(f"\nLoaded data shape: {hourly_data.shape}")
+            print(f"Date range: {hourly_data['timestamp'].min()} to {hourly_data['timestamp'].max()}")
+            
+            # Learn from historical data
+            print("\nLearning from historical data...")
+            self.learn_from_historical_data(hourly_data)
+            
+            # Verify training was successful
+            if not self.hourly_patterns or not any(len(patterns) > 0 for patterns in self.hourly_patterns.values()):
+                raise ValueError("Training failed to generate valid patterns")
+            
+            # Save trained model state
+            self.save_state()
+            
+            # Set trained flag
+            self._is_trained = True
+            
+            print("\nModel training completed successfully")
+            print(f"Model files saved in: {os.path.abspath(self.models_folder)}")
+            print(f"Training statistics saved in: {os.path.abspath(self.stats_folder)}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error during training: {str(e)}")
+            traceback.print_exc()
+            self._is_trained = False
+            return False
+
+    def predict_next(self, data_path: str, target_hour: Optional[int] = None) -> Dict[str, Any]:
+        """Make prediction for the next hour"""
+        try:
+            # Verify model state
+            if not hasattr(self, '_is_trained') or not self._is_trained:
+                raise ValueError("Model not trained")
+                
+            # Verify patterns exist and are valid
+            pattern_count = sum(len(patterns) for patterns in self.hourly_patterns.values())
+            if pattern_count == 0:
+                self._is_trained = False
+                raise ValueError("Model state invalid - no valid patterns found")
+                
+            # Load and preprocess latest data
+            hourly_data, _, _ = preprocess_data(data_path)
+            if hourly_data is None:
+                raise ValueError("Failed to load and preprocess data")
+                
+            # Get latest timestamp and conditions
+            latest_data = hourly_data.iloc[-1]
+            current_hour = latest_data['timestamp'].hour
+            current_date = latest_data['timestamp'].date()
+            
+            print(f"\nMaking prediction using data from:")
+            print(f"Date: {current_date}")
+            print(f"Current Hour: {current_hour:02d}:00")
+            print(f"Available patterns: {pattern_count}")
+            
+            # Get current conditions
+            conditions = {
+                'temperature': float(latest_data['Average Temperature']),
+                'humidity': float(latest_data['Average Humidity']),
+                'pressure': float(latest_data['Average Barometer']),
+                'uv': float(latest_data['UV Index'])
+            }
+            
+            print(f"Conditions: Temperature={conditions['temperature']:.1f}°C, Humidity={conditions['humidity']:.1f}%")
+            
+            # Make prediction for next hour
+            prediction = self.predict_next_hour(hourly_data, current_date, current_hour)
+            if prediction is None:
+                raise ValueError("Failed to generate prediction")
+                
+            # Calculate clear sky radiation
+            clear_sky = calculate_clear_sky_radiation(
+                current_hour, 
+                ADDU_LATITUDE, 
+                ADDU_LONGITUDE, 
+                current_date
+            )
+            
+            # Format results
+            result = {
+                'timestamp': latest_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                'current_hour': current_hour,
+                'target_hour': (current_hour + 1) % 24,
+                'predicted_value': float(prediction),
+                'conditions': conditions,
+                'confidence': self._calculate_prediction_confidence(
+                    prediction, 
+                    latest_data['Solar Rad - W/m^2'],
+                    clear_sky
+                )
+            }
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error making prediction: {str(e)}")
+            traceback.print_exc()
+            return {}
+
 def save_results(results_df, plot_path, csv_path):
     """Save results with visualization"""
     try:
@@ -2433,80 +2604,88 @@ def save_results(results_df, plot_path, csv_path):
         print(f"Error in save_results: {str(e)}")
         traceback.print_exc()
 
-def main():
-    try:
-        print("Starting automated solar radiation prediction system...")
-        
-        # Initialize predictor with error tracking
-        predictor = AutomatedPredictor()
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Solar Radiation Prediction System',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    parser.add_argument(
+        '--mode',
+        type=str,
+        choices=['train', 'predict'],
+        required=True,
+        help='Operation mode: train the model or make predictions'
+    )
+    
+    parser.add_argument(
+        '--data',
+        type=str,
+        required=True,
+        help='Path to the dataset CSV file'
+    )
+    
+    parser.add_argument(
+        '--output',
+        type=str,
+        default='predictions',
+        help='Output directory for predictions and model files'
+    )
+    
+    return parser.parse_args()
 
-        # Load and preprocess data
-        hourly_data, minute_data, feature_averages = preprocess_data('dataset.csv')
-        if hourly_data is None or minute_data is None:
-            raise ValueError("Failed to load and preprocess data")
+def main():
+    """Main execution function"""
+    try:
+        # Parse command line arguments
+        args = parse_arguments()
         
-        print(f"\nLoaded data shape: {hourly_data.shape}")
-        print(f"Date range: {hourly_data['timestamp'].min()} to {hourly_data['timestamp'].max()}")
+        # Create output directories
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        print("\nLearning from historical data...")
-        predictor.learn_from_historical_data(hourly_data)
+        # Initialize predictor
+        predictor = AutomatedPredictor(data_folder=str(output_dir))
         
-        # Get all unique dates
-        dates = sorted(hourly_data['timestamp'].dt.date.unique())
-        print(f"\nProcessing {len(dates)} unique dates")
-        
-        total_predictions = 0
-        total_error = 0
-        
-        print("\nTesting predictions on historical data...")
-        for date_idx, date in enumerate(dates):
-            print(f"\nProcessing date {date} ({date_idx + 1}/{len(dates)})")
-            day_data = hourly_data[hourly_data['timestamp'].dt.date == date]
+        if args.mode == 'train':
+            # Train mode
+            if not predictor.train(args.data):
+                raise RuntimeError("Training failed")
+            print("\nTraining completed successfully")
+                
+        elif args.mode == 'predict':
+            # Try prediction first
+            result = predictor.predict_next(args.data)
             
-            for hour in range(23):  # Up to 23 to predict next hour
-                current_data = day_data[day_data['timestamp'].dt.hour == hour]
-                next_data = day_data[day_data['timestamp'].dt.hour == hour + 1]
+            # If prediction fails, try training
+            if not result:
+                print("\nPrediction failed. Training model...")
+                if not predictor.train(args.data):
+                    raise RuntimeError("Training failed")
+                print("\nTraining completed successfully")
                 
-                if current_data.empty or next_data.empty:
-                    print(f"Skipping hour {hour} - insufficient data")
-                    continue
-                
-                # Make prediction for next hour
-                prediction = predictor.predict_next_hour(hourly_data, date, hour)
-                
-                if prediction is not None:
-                    actual = next_data['Solar Rad - W/m^2'].iloc[0]
-                    error = abs(actual - prediction)
-                    total_error += error
-                    total_predictions += 1
-                    
-                    # Update learning with actual value
-                    predictor.update_with_actual(date, hour + 1, actual)
+                # Try prediction again
+                result = predictor.predict_next(args.data)
+                if not result:
+                    raise RuntimeError("Prediction failed after training")
             
-            # Print progress every 10 dates
-            if (date_idx + 1) % 10 == 0:
-                print(f"\nProcessed {date_idx + 1} dates")
-                print(f"Current prediction history size: {len(predictor.prediction_history)}")
-        
-        # Print overall performance
-        if total_predictions > 0:
-            avg_error = total_error / total_predictions
-            print(f"\nOverall Performance:")
-            print(f"Total predictions: {total_predictions}")
-            print(f"Average error: {avg_error:.2f} W/m²")
-            print(f"Final prediction history size: {len(predictor.prediction_history)}")
-        
-        # Generate final learning analysis
-        print("\nGenerating final learning analysis...")
-        predictor.analyze_learning_performance()
-        
-        # Print paths to analysis files
-        print("\nAnalysis files can be found in:")
-        print(f"Stats folder: {os.path.abspath(predictor.stats_folder)}")
+            # Save prediction results
+            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            output_file = output_dir / f'prediction_{timestamp}.csv'
+            
+            pd.DataFrame([result]).to_csv(output_file, index=False)
+            print(f"\nPrediction Results:")
+            print(f"Current Hour: {result['current_hour']:02d}:00")
+            print(f"Target Hour: {result['target_hour']:02d}:00")
+            print(f"Predicted Value: {result['predicted_value']:.2f} W/m²")
+            print(f"Confidence: {result['confidence']:.2%}")
+            print(f"\nResults saved to: {output_file}")
             
     except Exception as e:
         print(f"Error in main: {str(e)}")
         traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
