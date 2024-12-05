@@ -265,6 +265,8 @@ class PredictionErrorLearner:
         self.recent_errors = []
         self.learning_rate = 0.2
         self.pattern_adjustments = {}
+        self.min_adjustment = 0.5  # Changed from 0.4
+        self.max_adjustment = 2.0  # Changed from 2.5
         
     def record_error(self, hour, predicted, actual, conditions, error_history=None):
         error = actual - predicted
@@ -333,14 +335,35 @@ class PredictionErrorLearner:
             self.pattern_adjustments[key]['over_predictions'] += 1
             
     def _update_adjustment_factors(self, hour, error_pct, conditions):
+        """Update adjustment factors with more aggressive learning"""
         key = f"{hour}"
         if key not in self.adjustment_factors:
             self.adjustment_factors[key] = 1.0
             
+        # Dynamic learning rate based on error magnitude
+        if abs(error_pct) > 20:
+            learning_rate = 0.3  # More aggressive for large errors
+        else:
+            learning_rate = 0.2  # Standard rate for smaller errors
+            
         current_factor = self.adjustment_factors[key]
-        new_factor = current_factor * (1 + error_pct * self.learning_rate)
-        new_factor = max(0.4, min(2.5, new_factor))
-        self.adjustment_factors[key] = current_factor * 0.6 + new_factor * 0.4
+        
+        # Calculate new adjustment factor
+        if error_pct > 0:  # Prediction was too low
+            new_factor = current_factor * (1 + error_pct * learning_rate)
+        else:  # Prediction was too high
+            new_factor = current_factor * (1 / (1 + abs(error_pct) * learning_rate))
+            
+        # Apply limits
+        new_factor = max(self.min_adjustment, min(self.max_adjustment, new_factor))
+        
+        # Weighted average with more weight to new adjustment
+        self.adjustment_factors[key] = current_factor * 0.7 + new_factor * 0.3
+        
+        print(f"\nAdjustment factor update for hour {hour}:")
+        print(f"Previous factor: {current_factor:.3f}")
+        print(f"New factor: {new_factor:.3f}")
+        print(f"Final factor: {self.adjustment_factors[key]:.3f}")
 
     def get_hour_adjustments(self, hour):
         """Get all adjustment factors for a specific hour"""
@@ -560,6 +583,7 @@ class AutomatedPredictor:
         self.error_learner = PredictionErrorLearner()
         self.consecutive_errors = []
         self.prediction_history = []
+        self.max_consecutive_errors = 10  # Keep last 10 errors
         
         # Load previous state
         self.load_state()
@@ -765,7 +789,6 @@ class AutomatedPredictor:
         """Update learning with actual value and evaluate model"""
         try:
             updated = False
-            # Find the most recent prediction for this hour that hasn't been updated
             for pred in reversed(self.prediction_history):
                 if (pred.get('date') == str(date) and 
                     pred.get('hour') == hour and 
@@ -773,22 +796,30 @@ class AutomatedPredictor:
                     # Update prediction record with actual value
                     pred['actual'] = float(actual_value)
                     pred['error'] = float(actual_value - pred['predicted'])
-                    pred['error_percentage'] = float((pred['error'] / actual_value * 100) if actual_value != 0 else 0)
+                    pred['error_percentage'] = float((pred['error'] / actual_value * 100) 
+                                                   if actual_value != 0 else 0)
                     
-                    # Print update details for debugging
-                    print(f"\nUpdating prediction record:")
-                    print(f"Date: {date}, Hour: {hour}")
-                    print(f"Predicted: {pred['predicted']:.2f} W/m²")
-                    print(f"Actual: {actual_value:.2f} W/m²")
-                    print(f"Error: {pred['error']:.2f} W/m²")
-                    print(f"Error percentage: {pred['error_percentage']:.1f}%")
+                    # Update consecutive errors list
+                    self.consecutive_errors.append(pred['error_percentage'])
+                    if len(self.consecutive_errors) > self.max_consecutive_errors:
+                        self.consecutive_errors.pop(0)
+                    
+                    # Update error learner with more context
+                    self.error_learner.record_error(
+                        hour=hour,
+                        predicted=pred['predicted'],
+                        actual=actual_value,
+                        conditions=eval(pred['conditions']) if isinstance(pred['conditions'], str) 
+                                                         else pred['conditions']
+                    )
+                    
+                    print(f"\nUpdated consecutive errors:")
+                    print(f"Last {len(self.consecutive_errors)} errors: {[f'{e:.1f}%' for e in self.consecutive_errors]}")
                     
                     updated = True
-                    
-                    # Save updated prediction history
                     self._save_prediction_history()
                     break
-            
+                    
             if not updated:
                 print(f"Warning: No pending prediction found for date {date}, hour {hour}")
                 print(f"Current prediction history size: {len(self.prediction_history)}")
@@ -1070,35 +1101,34 @@ class AutomatedPredictor:
                 'fallback': self.fallback_predictor.get_fallback_prediction(
                     current_value, conditions, clear_sky, data
                 ),
-                'current_value': current_value  # Include for validation
+                'current_value': current_value
             }
             
-            # Get confidence scores and adjustments
-            main_confidence = self._calculate_prediction_confidence(
-                predictions['main_model'], current_value, clear_sky
-            )
+            # Get dynamic weights based on recent performance
+            weights = self._calculate_prediction_weights()
             
-            # Get weather impacts
+            # Get weather impacts and learning adjustment
             weather_impacts = self.weather_analyzer.analyze_conditions(conditions)
             weather_adjustment = 1.0
             for impact in weather_impacts.values():
-                weather_adjustment *= (1 - impact * 0.2)  # Reduce by up to 20% per condition
+                weather_adjustment *= (1 - impact * 0.2)
+                
+            # Get hour-specific adjustment from error learner
+            learning_adjustment = self.error_learner.get_adjustment(next_hour, conditions)
             
-            # Get learning rate from adaptive controller
-            if self.prediction_history:
-                recent_error = self.prediction_history[-1].get('error_percentage', 0)
-                learning_rate = self.adaptive_learning.update_learning_rate(recent_error)
-                print(f"Current learning rate: {learning_rate:.3f}")
+            print(f"\nAdjustment factors:")
+            print(f"Weather adjustment: {weather_adjustment:.3f}")
+            print(f"Learning adjustment: {learning_adjustment:.3f}")
             
-            # Choose prediction method based on confidence
-            if main_confidence < 0.7:
-                print("\nLow confidence in main prediction, using ensemble...")
-                prediction = self.ensemble_predictor.get_ensemble_prediction(predictions)
-            else:
-                prediction = predictions['main_model']
+            # Apply adjustments to prediction
+            prediction = (
+                predictions['main_model'] * weights['pattern'] +
+                predictions['moving_avg'] * weights['ratio'] +
+                predictions['clear_sky'] * weights['trend'] +
+                predictions['pattern_based'] * weights['typical']
+            )
             
-            # Apply adjustments
-            prediction *= weather_adjustment
+            prediction *= weather_adjustment * learning_adjustment
             
             # Validate prediction
             prediction = self._validate_prediction_with_outlier_detection(
@@ -1115,13 +1145,13 @@ class AutomatedPredictor:
                 'clear_sky_pred': float(predictions['clear_sky']),
                 'pattern_pred': float(predictions['pattern_based']),
                 'fallback_pred': float(predictions['fallback']),
-                'confidence': float(main_confidence),
                 'weather_adjustment': float(weather_adjustment),
-                'learning_rate': self.adaptive_learning.current_learning_rate,
+                'learning_adjustment': float(learning_adjustment),
                 'actual': None,
                 'error': None,
                 'error_percentage': None,
-                'conditions': str(conditions)
+                'conditions': str(conditions),
+                'weights': weights  # Add this line
             }
             
             # Store prediction and analyze patterns
@@ -1136,8 +1166,8 @@ class AutomatedPredictor:
             print(f"Clear Sky: {predictions['clear_sky']:.2f} W/m²")
             print(f"Pattern Based: {predictions['pattern_based']:.2f} W/m²")
             print(f"Fallback: {predictions['fallback']:.2f} W/m²")
-            print(f"Confidence: {main_confidence:.3f}")
             print(f"Weather Adjustment: {weather_adjustment:.3f}")
+            print(f"Learning Adjustment: {learning_adjustment:.3f}")
             print(f"Final Prediction: {prediction:.2f} W/m²")
             
             return prediction
@@ -1580,32 +1610,39 @@ class AutomatedPredictor:
             return 0
 
     def _calculate_prediction_weights(self):
-        """Calculate dynamic weights with learning-based adjustments"""
-        if not self.consecutive_errors:
+        """Calculate dynamic weights based on recent performance"""
+        try:
+            if not self.consecutive_errors:
+                return {'pattern': 0.3, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.2}
+            
+            # Calculate error statistics
+            recent_errors = np.array(self.consecutive_errors[-5:])  # Last 5 errors
+            avg_error = np.mean(np.abs(recent_errors))
+            error_std = np.std(recent_errors)
+            
+            # Adjust weights based on error patterns
+            if avg_error < 10:  # Very accurate predictions
+                weights = {'pattern': 0.4, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.1}
+            elif avg_error < 20:  # Moderately accurate
+                weights = {'pattern': 0.3, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.2}
+            else:  # Less accurate
+                weights = {'pattern': 0.2, 'ratio': 0.2, 'trend': 0.3, 'typical': 0.3}
+            
+            # Adjust for variability
+            if error_std > 15:  # High variability
+                weights['trend'] += 0.1
+                weights['pattern'] -= 0.1
+            
+            print(f"\nCalculated weights based on recent performance:")
+            print(f"Average error: {avg_error:.1f}%")
+            print(f"Error std: {error_std:.1f}%")
+            print(f"Weights: {weights}")
+            
+            return weights
+            
+        except Exception as e:
+            print(f"Error in _calculate_prediction_weights: {str(e)}")
             return {'pattern': 0.3, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.2}
-        
-        # Calculate error statistics
-        recent_errors = np.array(self.consecutive_errors[-5:])
-        error_std = np.std(recent_errors) if len(recent_errors) > 1 else 0
-        
-        # Base weights based on error patterns
-        if error_std < 50:  # Stable predictions
-            weights = {'pattern': 0.4, 'ratio': 0.3, 'trend': 0.2, 'typical': 0.1}
-        elif error_std < 100:  # Moderate variability
-            weights = {'pattern': 0.3, 'ratio': 0.3, 'trend': 0.3, 'typical': 0.1}
-        else:  # High variability
-            weights = {'pattern': 0.2, 'ratio': 0.2, 'trend': 0.4, 'typical': 0.2}
-        
-        # Apply learning-based adjustments
-        if self.prediction_history:
-            df = pd.DataFrame(self.prediction_history)
-            if len(df) >= 100:
-                recent_error = df['error'].tail(100).abs().mean()
-                if recent_error > 50:  # High error rate
-                    weights['pattern'] *= 0.9
-                    weights['trend'] *= 1.1
-        
-        return weights
 
     def _validate_prediction(self, prediction, clear_sky, current_value, hour):
         """Validate and adjust prediction with provided hour"""
