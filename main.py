@@ -1275,11 +1275,35 @@ class AutomatedPredictor:
 
 
     def predict_next_hour(self, data, target_date, current_hour):
-        """Make prediction for the next hour with enhanced reliability"""
         try:
             current_hour = int(current_hour)
             next_hour = (current_hour + 1) % 24
             
+            # Force 0 for nighttime hours
+            if next_hour >= 18 or next_hour <= 5:
+                print(f"\nNighttime hour {next_hour:02d}:00 - Setting prediction to 0 W/m²")
+                prediction_record = {
+                    'date': str(target_date),
+                    'hour': int(next_hour),
+                    'predicted': 0.0,
+                    'main_prediction': 0.0,
+                    'moving_avg': 0.0,
+                    'clear_sky_pred': 0.0,
+                    'pattern_pred': 0.0,
+                    'fallback_pred': 0.0,
+                    'weather_adjustment': 1.0,
+                    'learning_adjustment': 1.0,
+                    'actual': None,
+                    'error': None,
+                    'error_percentage': None,
+                    'conditions': str({}),
+                    'weights': {'pattern': 0, 'ratio': 0, 'trend': 0, 'typical': 0},
+                    'cloud_cover': 0.0,
+                    'cloud_factor': 1.0
+                }
+                self.prediction_history.append(prediction_record)
+                return 0.0
+
             # Get current day's data and conditions
             current_day = data[data['timestamp'].dt.date == target_date]
             if current_day.empty:
@@ -1418,8 +1442,14 @@ class AutomatedPredictor:
             return None
 
     def _get_main_prediction(self, current_value, conditions, clear_sky):
-        """Get main model prediction with reliability checks"""
+        """Get main model prediction with enhanced transition handling"""
         try:
+            hour = conditions.get('hour', 0)
+            
+            # Force 0 for nighttime hours
+            if hour >= 18 or hour <= 5:
+                return 0.0, None, 1.0
+
             # Get similar days for pattern and ratio predictions
             similar_days = self._find_similar_days(
                 data=self.prediction_history,
@@ -1444,7 +1474,6 @@ class AutomatedPredictor:
             adjusted_clear_sky = clear_sky * (1 - (cloud_cover * 0.7))
             
             # Get typical value for this hour
-            hour = conditions.get('hour', 0)
             typical_pred = self._get_typical_value(hour) or current_value
             historical_avg = self._get_historical_average(conditions) or current_value
 
@@ -1506,7 +1535,7 @@ class AutomatedPredictor:
                 final_prediction = current_value  # Fallback to current value
             
             return final_prediction, weights, adjustment
-            
+
         except Exception as e:
             print(f"Error in _get_main_prediction: {str(e)}")
             traceback.print_exc()
@@ -1515,6 +1544,13 @@ class AutomatedPredictor:
     def _get_ensemble_prediction(self, **predictions):
         """Combine multiple predictions using dynamic weights"""
         try:
+            # Get current hour
+            hour = predictions.get('hour', 0)
+            
+            # Force 0 for nighttime hours
+            if hour >= 18 or hour <= 5:
+                return 0.0
+
             # Base weights
             weights = {
                 'main_prediction': 0.4,
@@ -1580,6 +1616,11 @@ class AutomatedPredictor:
             
             # Fallback to main prediction or current value if ensemble fails
             return predictions.get('main_prediction', current_value)
+            
+        except Exception as e:
+            print(f"Error in _get_ensemble_prediction: {str(e)}")
+            traceback.print_exc()
+            return predictions.get('main_prediction', predictions.get('current_value', 0))
             
         except Exception as e:
             print(f"Error in _get_ensemble_prediction: {str(e)}")
@@ -1758,6 +1799,15 @@ class AutomatedPredictor:
     def _get_pattern_prediction(self, similar_days, current_value):
         """Get prediction based on similar day patterns"""
         try:
+            # Get current hour from conditions if available
+            hour = None
+            if similar_days and similar_days[0].get('data') is not None:
+                hour = similar_days[0]['data'].get('hour', None)
+            
+            # Force 0 for nighttime hours if hour is available
+            if hour is not None and (hour >= 18 or hour <= 5):
+                return 0.0
+
             if similar_days is None or len(similar_days) == 0:
                 return current_value
             
@@ -1926,36 +1976,62 @@ class AutomatedPredictor:
             traceback.print_exc()
 
     def _validate_prediction(self, prediction, clear_sky, current_value, hour):
-        """Validate and adjust prediction with provided hour"""
+        """Validate and adjust prediction with enhanced transition handling"""
         try:
-            # Use provided hour instead of system time
+            # Nighttime hours (18:00-05:59) - Always return 0
             if hour >= 18 or hour <= 5:
                 return 0.0
-            
-            # Early morning transition (06:00-07:59)
-            if hour < 8:
+
+            # Early morning transition (06:00-08:59)
+            if hour < 9:
                 if hour == 6:
-                    return min(max(prediction, current_value * 0.5), clear_sky * 0.3)
+                    # Gradual increase from 0, limited by clear sky
+                    max_value = min(clear_sky * 0.15, 50)  # More conservative limit
+                    return min(max(prediction * 0.5, current_value * 0.7), max_value)
                 elif hour == 7:
-                    return min(max(prediction, current_value * 0.7), clear_sky * 0.5)
-            
-            # Late afternoon transition (16:00-17:59)
-            if hour >= 16:
-                if hour == 17:
-                    return min(prediction, clear_sky * 0.2)
+                    # Slightly higher limits but still conservative
+                    max_value = min(clear_sky * 0.3, 150)
+                    base_pred = min(max(prediction * 0.7, current_value * 0.8), max_value)
+                    # Ensure smooth transition from hour 6
+                    return max(base_pred, current_value * 1.2)
+                elif hour == 8:
+                    # Transition to normal day values
+                    max_value = min(clear_sky * 0.5, 300)
+                    base_pred = min(max(prediction * 0.8, current_value * 0.9), max_value)
+                    return max(base_pred, current_value * 1.1)
+
+            # Late afternoon transition (15:00-17:59)
+            if hour >= 15:
+                if hour == 15:
+                    # Start gradual decrease
+                    max_value = clear_sky * 0.7
+                    min_value = current_value * 0.7
+                    return min(max(prediction * 0.9, min_value), max_value)
                 elif hour == 16:
-                    return min(prediction, clear_sky * 0.4)
-            
-            # Normal daytime hours (08:00-15:59)
+                    # Steeper decrease
+                    max_value = clear_sky * 0.4
+                    min_value = current_value * 0.5
+                    return min(max(prediction * 0.8, min_value), max_value)
+                elif hour == 17:
+                    # Final transition to night
+                    max_value = clear_sky * 0.15
+                    min_value = current_value * 0.3
+                    return min(max(prediction * 0.6, min_value), max_value)
+
+            # Normal daytime hours (09:00-14:59)
             prediction = max(0, min(prediction, clear_sky * 0.95))
             
             # Limit maximum change from current value
-            max_increase = current_value * 2.5 if current_value > 0 else clear_sky * 0.5
-            max_decrease = current_value * 0.4 if current_value > 0 else 0
-            prediction = min(max(prediction, max_decrease), max_increase)
-            
-            return prediction
-            
+            if current_value > 0:
+                max_increase = current_value * 1.5
+                max_decrease = current_value * 0.6
+                prediction = min(max(prediction, max_decrease), max_increase)
+            else:
+                # If current value is 0, use clear sky as reference
+                prediction = min(prediction, clear_sky * 0.5)
+
+            return max(0, prediction)
+
         except Exception as e:
             print(f"Error in _validate_prediction: {str(e)}")
             return current_value
@@ -2495,6 +2571,11 @@ class AutomatedPredictor:
     def _get_moving_average(self, data, target_date, current_hour):
         """Calculate moving average prediction based on recent data"""
         try:
+            # Force 0 for nighttime hours
+            next_hour = (current_hour + 1) % 24
+            if next_hour >= 18 or next_hour <= 5:
+                return 0.0
+
             # Get data up to current hour
             historical_data = data[data['timestamp'].dt.date <= target_date].copy()
             current_mask = (historical_data['timestamp'].dt.date == target_date) & \
