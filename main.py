@@ -2107,58 +2107,49 @@ class AutomatedPredictor:
             traceback.print_exc()
 
     def _validate_prediction(self, prediction, clear_sky, current_value, hour):
-        """Validate and adjust prediction with enhanced transition handling"""
+        """Enhanced prediction validation with transition handling"""
         try:
-            # Nighttime and early morning (18:00-05:59) - Always return 0
-            if hour >= 18 or hour <= 5:
+            # Nighttime validation (no change needed)
+            if hour >= 18 or hour <= 4:
                 return 0.0
 
-            # Early morning transition (06:00-08:59)
-            if hour < 9:
-                if hour == 6:
-                    # More conservative morning start
-                    max_value = min(clear_sky * 0.10, 30)  # Reduced from 0.15 to 0.10
-                    return min(max(prediction * 0.4, current_value * 0.6), max_value)
-                elif hour == 7:
-                    # Gradual increase
-                    max_value = min(clear_sky * 0.25, 120)  # Reduced from 0.3 to 0.25
-                    base_pred = min(max(prediction * 0.6, current_value * 0.7), max_value)
-                    return max(base_pred, current_value * 1.1)
-                elif hour == 8:
-                    # Smoother transition to normal day values
-                    max_value = min(clear_sky * 0.45, 250)  # Reduced from 0.5 to 0.45
-                    base_pred = min(max(prediction * 0.7, current_value * 0.8), max_value)
-                    return max(base_pred, current_value * 1.05)
+            # Dawn transition (5-7)
+            if hour == 5:
+                max_value = min(clear_sky * 0.05, 10)  # More conservative
+                return min(prediction * 0.3, max_value)
+            elif hour == 6:
+                max_value = min(clear_sky * 0.15, 50)
+                return min(max(prediction * 0.5, current_value * 0.7), max_value)
+            elif hour == 7:
+                max_value = min(clear_sky * 0.35, 150)
+                return min(max(prediction * 0.7, current_value * 0.8), max_value)
 
-            # Late afternoon transition (15:00-17:59)
-            if hour >= 15:
-                if hour == 15:
-                    # More gradual decrease
-                    max_value = clear_sky * 0.75  # Increased from 0.7 to 0.75
-                    min_value = current_value * 0.75  # Increased from 0.7 to 0.75
-                    return min(max(prediction * 0.95, min_value), max_value)
-                elif hour == 16:
-                    # Less steep decrease
-                    max_value = clear_sky * 0.45  # Increased from 0.4 to 0.45
-                    min_value = current_value * 0.6  # Increased from 0.5 to 0.6
-                    return min(max(prediction * 0.85, min_value), max_value)
-                elif hour == 17:
-                    # Smoother transition to night
-                    max_value = clear_sky * 0.20  # Increased from 0.15 to 0.20
-                    min_value = current_value * 0.4  # Increased from 0.3 to 0.4
-                    return min(max(prediction * 0.7, min_value), max_value)
+            # Dusk transition (15-17)
+            if hour == 15:
+                max_value = clear_sky * 0.65  # More gradual decrease
+                min_value = current_value * 0.8
+                return min(max(prediction * 0.9, min_value), max_value)
+            elif hour == 16:
+                max_value = clear_sky * 0.35
+                min_value = current_value * 0.7
+                return min(max(prediction * 0.8, min_value), max_value)
+            elif hour == 17:
+                max_value = clear_sky * 0.15
+                min_value = current_value * 0.5
+                return min(max(prediction * 0.6, min_value), max_value)
 
-            # Normal daytime hours (09:00-14:59)
-            prediction = max(0, min(prediction, clear_sky * 0.95))
-            
-            # Limit maximum change from current value
-            if current_value > 0:
-                max_increase = current_value * 1.5
-                max_decrease = current_value * 0.6
-                prediction = min(max(prediction, max_decrease), max_increase)
-            else:
-                # If current value is 0, use clear sky as reference
-                prediction = min(prediction, clear_sky * 0.5)
+            # Peak hours (8-14)
+            if 8 <= hour <= 14:
+                # More dynamic limits based on clear sky
+                max_limit = clear_sky * 0.98  # Increased from 0.95
+                
+                # Asymmetric change limits
+                if current_value > 0:
+                    max_increase = current_value * 1.4  # Reduced from 1.5
+                    max_decrease = current_value * 0.7  # Increased from 0.6
+                    prediction = min(max(prediction, max_decrease), max_increase)
+                
+                return min(max(0, prediction), max_limit)
 
             return max(0, prediction)
 
@@ -2547,21 +2538,24 @@ class AutomatedPredictor:
             return None
 
     def _get_dynamic_learning_rate(self, hour, error_history):
-        """Calculate dynamic learning rate based on hour and recent performance"""
+        """Calculate dynamic learning rate with improved transitions"""
         try:
-            # Base learning rates for different periods
+            # Enhanced base rates for different periods
             base_rates = {
-                'early_morning': 0.4,  # 6-9 hours
-                'peak_hours': 0.3,     # 10-14 hours
-                'afternoon': 0.35,     # 15-17 hours
+                'dawn': 0.5,      # 5-6 hours (higher for better dawn adaptation)
+                'morning': 0.4,   # 7-9 hours
+                'peak': 0.3,      # 10-14 hours
+                'afternoon': 0.45, # 15-17 hours (increased for better afternoon)
                 'other': 0.2
             }
             
-            # Determine period
-            if 6 <= hour <= 9:
-                base_rate = base_rates['early_morning']
+            # Determine period with enhanced transition handling
+            if hour == 5 or hour == 6:
+                base_rate = base_rates['dawn']
+            elif 7 <= hour <= 9:
+                base_rate = base_rates['morning']
             elif 10 <= hour <= 14:
-                base_rate = base_rates['peak_hours']
+                base_rate = base_rates['peak']
             elif 15 <= hour <= 17:
                 base_rate = base_rates['afternoon']
             else:
@@ -2569,53 +2563,59 @@ class AutomatedPredictor:
                 
             # Adjust based on recent error patterns
             if error_history:
-                recent_errors = error_history[-5:]  # Last 5 errors
+                recent_errors = error_history[-5:]
                 error_std = np.std(recent_errors)
+                mean_error = np.mean(recent_errors)
                 
-                # Increase learning rate if errors are consistently high
-                if error_std > 50:  # High variability
+                # Increase learning rate for consistent under-predictions
+                if mean_error < -50:  # Consistent under-prediction
                     base_rate *= 1.5
-                elif np.mean(np.abs(recent_errors)) > 75:  # Large errors
+                elif mean_error > 50:  # Consistent over-prediction
                     base_rate *= 1.3
-                
-            return min(base_rate, 0.5)  # Cap at 0.5 to prevent instability
+                    
+                # Adjust for high variability
+                if error_std > 100:  # Very high variability
+                    base_rate *= 1.4
+                    
+            return min(base_rate, 0.6)  # Increased max rate for faster adaptation
             
         except Exception as e:
             print(f"Error in _get_dynamic_learning_rate: {str(e)}")
-            return 0.2  # Default learning rate
+            return 0.3  # Increased default rate
 
     def _calculate_weather_impact(self, conditions, hour):
-        """Calculate enhanced weather impact factor"""
+        """Calculate enhanced weather impact with improved correlations"""
         try:
             impact = 1.0
             
-            # Enhanced weighting for peak hours (10-14)
-            is_peak_hour = 10 <= hour <= 14
-            
-            # Temperature impact
-            temp = conditions.get('temperature', 25)
-            if is_peak_hour:
-                temp_impact = 1 - abs(temp - 30) / 50  # Optimal temp around 30°C
-                impact *= temp_impact * 1.5  # Higher weight during peak hours
-            else:
-                temp_impact = 1 - abs(temp - 25) / 40
-                impact *= temp_impact
-                
-            # Humidity impact
+            # Enhanced weighting based on correlation analysis
+            pressure = conditions.get('pressure', 1008)
             humidity = conditions.get('humidity', 70)
-            if is_peak_hour:
-                humidity_impact = 1 - (humidity / 100) * 0.8  # More sensitive to humidity
+            temperature = conditions.get('temperature', 25)
+            
+            # Pressure impact (strongest correlation)
+            pressure_impact = 1 + (pressure - 1008) * 0.02  # Increased weight
+            impact *= pressure_impact
+            
+            # Humidity impact (second strongest)
+            if humidity > 80:
+                humidity_impact = 1 - (humidity - 80) * 0.015
             else:
-                humidity_impact = 1 - (humidity / 100) * 0.6
+                humidity_impact = 1 + (70 - humidity) * 0.01
             impact *= humidity_impact
             
-            # UV index impact
-            uv = conditions.get('uv', 5)
-            expected_uv = self._get_expected_uv_for_hour(hour)
-            uv_ratio = min(uv / expected_uv if expected_uv > 0 else 1, 1.5)
-            impact *= uv_ratio
+            # Temperature impact (negative correlation)
+            temp_optimal = 28  # Adjusted based on analysis
+            temp_impact = 1 - abs(temperature - temp_optimal) * 0.02
+            impact *= temp_impact
             
-            return max(0.1, min(impact, 1.5))  # Limit impact range
+            # Time-based adjustments
+            if 5 <= hour <= 7:  # Dawn period
+                impact *= 0.85  # More conservative
+            elif 15 <= hour <= 17:  # Dusk period
+                impact *= 0.9
+                
+            return max(0.5, min(impact, 1.5))  # Wider range for impact
             
         except Exception as e:
             print(f"Error in _calculate_weather_impact: {str(e)}")
