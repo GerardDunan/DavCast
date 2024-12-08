@@ -15,29 +15,155 @@ warnings.filterwarnings('ignore')
 ADDU_LATITUDE = 7.0711
 ADDU_LONGITUDE = 125.6134
 
+def calculate_cloud_cover(temperature, humidity, pressure, solar_rad, clear_sky_rad):
+    """
+    Calculate cloud cover using multiple empirical models and sensor data.
+    
+    Based on research:
+    1. Kasten & Czeplak (1980) - Solar radiation and cloud cover relationship
+    2. Crawford & Duchon (1999) - Cloud cover from radiation ratio
+    3. Dobson & Smith (1988) - Temperature-humidity based cloud estimation
+    
+    Parameters:
+        temperature (float): Air temperature in Celsius
+        humidity (float): Relative humidity (0-100)
+        pressure (float): Atmospheric pressure in hPa
+        solar_rad (float): Measured solar radiation in W/m²
+        clear_sky_rad (float): Calculated clear sky radiation in W/m²
+        
+    Returns:
+        float: Estimated cloud cover (0-1)
+    """
+    try:
+        # Validate inputs
+        if not all(isinstance(x, (int, float)) for x in [temperature, humidity, pressure, solar_rad, clear_sky_rad]):
+            print("Warning: Invalid input types for cloud cover calculation")
+            return 0.5
+
+        # 1. Radiation ratio method (Crawford & Duchon, 1999)
+        if clear_sky_rad > 10:  # Increased threshold for more reliable daytime readings
+            rad_ratio = min(1.0, max(0.0, solar_rad / clear_sky_rad))
+            cloud_cover_rad = 1 - np.sqrt(rad_ratio)
+        else:
+            cloud_cover_rad = 0.5
+
+        # 2. Temperature-Humidity method (Dobson & Smith, 1988)
+        rh_factor = np.clip(humidity / 100.0, 0, 1)
+        temp_factor = np.clip((30 - temperature) / 30, 0, 1)
+        cloud_cover_th = rh_factor * temp_factor
+
+        # 3. Pressure variation impact
+        pressure_norm = np.clip((pressure - 980) / (1030 - 980), 0, 1)
+        
+        # Dynamic weighting based on time of day and data reliability
+        if clear_sky_rad > 50:  # Strong daylight
+            weights = [0.7, 0.2, 0.1]  # Prioritize radiation method
+        elif clear_sky_rad > 10:  # Weak daylight
+            weights = [0.5, 0.3, 0.2]  # Balanced weights
+        else:  # Night or very low light
+            weights = [0.2, 0.6, 0.2]  # Prioritize temperature-humidity method
+
+        # Calculate weighted cloud cover
+        cloud_cover = (
+            weights[0] * cloud_cover_rad +
+            weights[1] * cloud_cover_th +
+            weights[2] * pressure_norm
+        )
+
+        return float(np.clip(cloud_cover, 0, 1))
+
+    except Exception as e:
+        print(f"Error in calculate_cloud_cover: {str(e)}")
+        traceback.print_exc()
+        return 0.5
+
 class WeatherConditionAnalyzer:
     def __init__(self):
-        self.condition_impacts = {}
         self.condition_thresholds = {
             'temperature': {'high': 30, 'low': 20},
             'humidity': {'high': 80, 'low': 40},
             'cloud_cover': {'high': 0.8, 'low': 0.2}
         }
+        self.cloud_cover_history = []
+        self.max_history_size = 1000  # Prevent unlimited growth
 
     def analyze_conditions(self, conditions):
-        impact_factors = {}
-        
-        temp = conditions.get('temperature', 25)
-        if temp > self.condition_thresholds['temperature']['high']:
-            impact_factors['temperature'] = min((temp - self.condition_thresholds['temperature']['high']) / 10, 1)
-        elif temp < self.condition_thresholds['temperature']['low']:
-            impact_factors['temperature'] = min((self.condition_thresholds['temperature']['low'] - temp) / 10, 1)
+        """Analyze weather conditions including cloud cover"""
+        try:
+            impact_factors = {}
             
-        humidity = conditions.get('humidity', 60)
-        if humidity > self.condition_thresholds['humidity']['high']:
-            impact_factors['humidity'] = min((humidity - self.condition_thresholds['humidity']['high']) / 20, 1)
+            # Get parameters with validation
+            temp = float(conditions.get('temperature', 25))
+            humidity = float(conditions.get('humidity', 60))
+            pressure = float(conditions.get('pressure', 1013.25))
+            solar_rad = float(conditions.get('solar_rad', 0))
+            clear_sky_rad = float(conditions.get('clear_sky_rad', 0))
+            hour = conditions.get('hour', 12)
+
+            # Calculate cloud cover
+            cloud_cover = calculate_cloud_cover(
+                temperature=temp,
+                humidity=humidity,
+                pressure=pressure,
+                solar_rad=solar_rad,
+                clear_sky_rad=clear_sky_rad
+            )
+
+            # Store cloud cover with timestamp and hour
+            self.cloud_cover_history.append({
+                'timestamp': pd.Timestamp.now(),
+                'hour': hour,
+                'cloud_cover': cloud_cover,
+                'conditions': conditions.copy()
+            })
+
+            # Maintain history size
+            if len(self.cloud_cover_history) > self.max_history_size:
+                self.cloud_cover_history = self.cloud_cover_history[-self.max_history_size:]
+
+            # Calculate cloud cover impact with time-of-day consideration
+            if 6 <= hour <= 18:  # Daytime hours
+                if cloud_cover > self.condition_thresholds['cloud_cover']['high']:
+                    impact_factors['cloud_cover'] = min((cloud_cover - self.condition_thresholds['cloud_cover']['high']) / 0.2, 1)
+                    # Increase impact during peak solar hours
+                    if 10 <= hour <= 14:
+                        impact_factors['cloud_cover'] *= 1.2
+            else:  # Night hours - reduced impact
+                if cloud_cover > self.condition_thresholds['cloud_cover']['high']:
+                    impact_factors['cloud_cover'] = min((cloud_cover - self.condition_thresholds['cloud_cover']['high']) / 0.4, 0.5)
+
+            # Calculate other impacts
+            if temp > self.condition_thresholds['temperature']['high']:
+                impact_factors['temperature'] = min((temp - self.condition_thresholds['temperature']['high']) / 10, 1)
+            elif temp < self.condition_thresholds['temperature']['low']:
+                impact_factors['temperature'] = min((self.condition_thresholds['temperature']['low'] - temp) / 10, 1)
+
+            if humidity > self.condition_thresholds['humidity']['high']:
+                impact_factors['humidity'] = min((humidity - self.condition_thresholds['humidity']['high']) / 20, 1)
+
+            return impact_factors
+
+        except Exception as e:
+            print(f"Error in analyze_conditions: {str(e)}")
+            traceback.print_exc()
+            return {}
+
+    def get_cloud_cover_trend(self, hours=3):
+        """Analyze recent cloud cover trend"""
+        try:
+            if not self.cloud_cover_history:
+                return None
+                
+            recent_history = self.cloud_cover_history[-hours:]
+            if len(recent_history) < 2:
+                return None
+                
+            cloud_values = [h['cloud_cover'] for h in recent_history]
+            return np.polyfit(range(len(cloud_values)), cloud_values, 1)[0]
             
-        return impact_factors
+        except Exception as e:
+            print(f"Error in get_cloud_cover_trend: {str(e)}")
+            return None
 
 def preprocess_data(data_path):
     """Preprocess data with enhanced feature engineering"""
@@ -620,7 +746,13 @@ class AutomatedPredictor:
             'trend': {'weight': 0.2, 'errors': [], 'window_size': 100},
             'typical': {'weight': 0.2, 'errors': [], 'window_size': 100}
         }
-        
+
+        self.cloud_impact_weights = {
+            'high_cloud': 0.7,    # Significant reduction in radiation
+            'medium_cloud': 0.85,  # Moderate reduction
+            'low_cloud': 0.95     # Slight reduction
+        }
+
         # Add hourly error tracking
         self.hourly_errors = {hour: [] for hour in range(24)}
         self.error_window_size = 100
@@ -1087,6 +1219,34 @@ class AutomatedPredictor:
                 }
         return stats
 
+    def _get_historical_average(self, conditions):
+        """Calculate historical average based on similar conditions"""
+        try:
+            hour = conditions.get('hour', 0)
+            
+            # Get historical data for this hour
+            if not self.prediction_history:
+                return None
+                
+            history_df = pd.DataFrame(self.prediction_history)
+            hour_data = history_df[history_df['hour'] == hour]
+            
+            if hour_data.empty:
+                return None
+            
+            # Calculate weighted average based on recency
+            hour_data['days_old'] = (pd.Timestamp.now() - pd.to_datetime(hour_data['timestamp'])).dt.days
+            hour_data['weight'] = np.exp(-hour_data['days_old'] / 30)  # Exponential decay
+            
+            weighted_avg = (hour_data['actual'] * hour_data['weight']).sum() / hour_data['weight'].sum()
+            
+            return float(weighted_avg)
+            
+        except Exception as e:
+            print(f"Error in _get_historical_average: {str(e)}")
+            return None
+
+
     def predict_next_hour(self, data, target_date, current_hour):
         """Make prediction for the next hour with enhanced reliability"""
         try:
@@ -1141,11 +1301,34 @@ class AutomatedPredictor:
             # Get dynamic weights based on recent performance
             weights = self._calculate_prediction_weights()
             
-            # Get weather impacts and learning adjustment
+            # Enhanced weather impacts calculation with cloud cover
             weather_impacts = self.weather_analyzer.analyze_conditions(conditions)
             weather_adjustment = 1.0
-            for impact in weather_impacts.values():
-                weather_adjustment *= (1 - impact * 0.2)
+            
+            # Specific cloud cover adjustment
+            cloud_cover = weather_impacts.get('cloud_cover', 0)
+            cloud_factor = 1.0
+            if cloud_cover > 0:
+                if cloud_cover > 0.8:
+                    cloud_factor = self.cloud_impact_weights['high_cloud']
+                elif cloud_cover > 0.4:
+                    cloud_factor = self.cloud_impact_weights['medium_cloud']
+                else:
+                    cloud_factor = self.cloud_impact_weights['low_cloud']
+                
+                # Apply cloud adjustment to clear sky prediction
+                predictions['clear_sky'] *= cloud_factor
+                
+                # Adjust weights based on cloud cover
+                if cloud_cover > 0.8:
+                    weights['clear_sky'] *= 0.5  # Reduce clear sky weight in cloudy conditions
+                    weights['pattern'] *= 1.2    # Increase pattern weight
+                    weights['moving_avg'] *= 1.3 # Increase moving average weight
+
+            # Apply other weather impacts
+            for impact_type, impact in weather_impacts.items():
+                if impact_type != 'cloud_cover':  # Handle other impacts separately
+                    weather_adjustment *= (1 - impact * 0.2)
                 
             # Get hour-specific adjustment from error learner
             learning_adjustment = self.error_learner.get_adjustment(next_hour, conditions)
@@ -1185,7 +1368,9 @@ class AutomatedPredictor:
                 'error': None,
                 'error_percentage': None,
                 'conditions': str(conditions),
-                'weights': weights  # Add this line
+                'weights': weights,
+                'cloud_cover': float(cloud_cover),
+                'cloud_adjustment': cloud_factor
             }
             
             # Store prediction and analyze patterns
@@ -1202,6 +1387,8 @@ class AutomatedPredictor:
             print(f"Fallback: {predictions['fallback']:.2f} W/m²")
             print(f"Weather Adjustment: {weather_adjustment:.3f}")
             print(f"Learning Adjustment: {learning_adjustment:.3f}")
+            print(f"Cloud Cover: {cloud_cover:.3f}")
+            print(f"Cloud Adjustment: {cloud_factor:.3f}")
             print(f"Final Prediction: {prediction:.2f} W/m²")
             
             return prediction
@@ -1216,64 +1403,95 @@ class AutomatedPredictor:
         try:
             # Get similar days for pattern and ratio predictions
             similar_days = self._find_similar_days(
-                data=self.prediction_history,  # Use prediction history instead of raw data
-                target_date=pd.Timestamp.now().date(),  # Use current date
-                current_hour=conditions.get('hour', 0),  # Get hour from conditions
+                data=self.prediction_history,
+                target_date=pd.Timestamp.now().date(),
+                current_hour=conditions.get('hour', 0),
                 conditions=conditions
             )
             
-            # Calculate base predictions
-            pattern_pred = self._get_pattern_prediction(similar_days, current_value)
-            ratio_pred = self._get_ratio_prediction(similar_days, current_value)
+            # Calculate base predictions with fallback values
+            pattern_pred = self._get_pattern_prediction(similar_days, current_value) or current_value
+            ratio_pred = self._get_ratio_prediction(similar_days, current_value) or current_value
             
             # Get trend prediction using recent history
             if len(self.prediction_history) >= 2:
-                recent_data = pd.DataFrame(self.prediction_history[-24:])  # Last 24 hours
+                recent_data = pd.DataFrame(self.prediction_history[-24:])
                 trend_pred = self._get_trend_prediction(recent_data, recent_data['hour'].iloc[-1])
             else:
                 trend_pred = current_value
+
+            # Get cloud cover and adjust clear sky
+            cloud_cover = self.weather_analyzer.analyze_conditions(conditions).get('cloud_cover', 0)
+            adjusted_clear_sky = clear_sky * (1 - (cloud_cover * 0.7))
             
             # Get typical value for this hour
             hour = conditions.get('hour', 0)
-            typical_pred = self._get_typical_value(hour)
-            
+            typical_pred = self._get_typical_value(hour) or current_value
+            historical_avg = self._get_historical_average(conditions) or current_value
+
             # Print debug information
             print(f"\nPrediction components:")
+            print(f"Current value: {current_value:.2f}")
             print(f"Pattern prediction: {pattern_pred:.2f}")
             print(f"Ratio prediction: {ratio_pred:.2f}")
             print(f"Trend prediction: {trend_pred:.2f}")
             print(f"Typical prediction: {typical_pred:.2f}")
+            print(f"Adjusted clear sky: {adjusted_clear_sky:.2f}")
+            print(f"Historical average: {historical_avg:.2f}")
             
             # Get dynamic weights based on recent performance
             weights = self._calculate_prediction_weights()
-            print(f"Weights: {weights}")
+            print(f"Base weights: {weights}")
             
-            # Combine predictions
-            prediction = (
-                pattern_pred * weights['pattern'] +
-                ratio_pred * weights['ratio'] +
-                trend_pred * weights['trend'] +
-                typical_pred * weights['typical']
+            # Ensure all components are valid numbers
+            components = {
+                'pattern': pattern_pred,
+                'ratio': ratio_pred,
+                'trend': trend_pred,
+                'typical': typical_pred
+            }
+            
+            # Filter out None values and adjust weights
+            valid_components = {k: v for k, v in components.items() if v is not None}
+            if not valid_components:
+                return current_value, weights, 1.0
+                
+            # Normalize remaining weights
+            total_weight = sum(weights[k] for k in valid_components.keys())
+            if total_weight > 0:
+                normalized_weights = {k: weights[k]/total_weight for k in valid_components.keys()}
+            else:
+                normalized_weights = {k: 1.0/len(valid_components) for k in valid_components.keys()}
+
+            # First combine model-based predictions
+            model_prediction = sum(valid_components[k] * normalized_weights[k] for k in valid_components.keys())
+
+            # Then combine with current value and clear sky components
+            final_prediction = (
+                model_prediction * 0.4 +
+                current_value * 0.4 +
+                adjusted_clear_sky * 0.2
             )
             
             # Apply learning adjustment
             adjustment = self.error_learner.get_adjustment(hour, conditions)
-            prediction *= adjustment
+            final_prediction *= adjustment
             
-            print(f"Combined prediction: {prediction:.2f}")
+            print(f"Model prediction: {model_prediction:.2f}")
+            print(f"Final prediction: {final_prediction:.2f}")
             print(f"Adjustment factor: {adjustment:.3f}")
             
             # Validate prediction
-            if not np.isfinite(prediction) or prediction < 0:
+            if not np.isfinite(final_prediction) or final_prediction < 0:
                 print("Invalid prediction value, using fallback")
-                prediction = current_value  # Fallback to current value
+                final_prediction = current_value  # Fallback to current value
             
-            return prediction, weights, adjustment
+            return final_prediction, weights, adjustment
             
         except Exception as e:
             print(f"Error in _get_main_prediction: {str(e)}")
             traceback.print_exc()
-            return None, None, None
+            return current_value, None, 1.0
 
     def _get_ensemble_prediction(self, **predictions):
         """Combine multiple predictions using dynamic weights"""
