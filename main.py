@@ -1275,13 +1275,14 @@ class AutomatedPredictor:
 
 
     def predict_next_hour(self, data, target_date, current_hour):
+        """Make prediction for the next hour with enhanced reliability"""
         try:
             current_hour = int(current_hour)
             next_hour = (current_hour + 1) % 24
             
-            # Force 0 for nighttime hours
+            # Force 0 for nighttime hours (including hour 5)
             if next_hour >= 18 or next_hour <= 5:
-                print(f"\nNighttime hour {next_hour:02d}:00 - Setting prediction to 0 W/m²")
+                print(f"\nNighttime/Early morning hour {next_hour:02d}:00 - Setting prediction to 0 W/m²")
                 prediction_record = {
                     'date': str(target_date),
                     'hour': int(next_hour),
@@ -1978,45 +1979,44 @@ class AutomatedPredictor:
     def _validate_prediction(self, prediction, clear_sky, current_value, hour):
         """Validate and adjust prediction with enhanced transition handling"""
         try:
-            # Nighttime hours (18:00-05:59) - Always return 0
+            # Nighttime and early morning (18:00-05:59) - Always return 0
             if hour >= 18 or hour <= 5:
                 return 0.0
 
             # Early morning transition (06:00-08:59)
             if hour < 9:
                 if hour == 6:
-                    # Gradual increase from 0, limited by clear sky
-                    max_value = min(clear_sky * 0.15, 50)  # More conservative limit
-                    return min(max(prediction * 0.5, current_value * 0.7), max_value)
+                    # More conservative morning start
+                    max_value = min(clear_sky * 0.10, 30)  # Reduced from 0.15 to 0.10
+                    return min(max(prediction * 0.4, current_value * 0.6), max_value)
                 elif hour == 7:
-                    # Slightly higher limits but still conservative
-                    max_value = min(clear_sky * 0.3, 150)
-                    base_pred = min(max(prediction * 0.7, current_value * 0.8), max_value)
-                    # Ensure smooth transition from hour 6
-                    return max(base_pred, current_value * 1.2)
-                elif hour == 8:
-                    # Transition to normal day values
-                    max_value = min(clear_sky * 0.5, 300)
-                    base_pred = min(max(prediction * 0.8, current_value * 0.9), max_value)
+                    # Gradual increase
+                    max_value = min(clear_sky * 0.25, 120)  # Reduced from 0.3 to 0.25
+                    base_pred = min(max(prediction * 0.6, current_value * 0.7), max_value)
                     return max(base_pred, current_value * 1.1)
+                elif hour == 8:
+                    # Smoother transition to normal day values
+                    max_value = min(clear_sky * 0.45, 250)  # Reduced from 0.5 to 0.45
+                    base_pred = min(max(prediction * 0.7, current_value * 0.8), max_value)
+                    return max(base_pred, current_value * 1.05)
 
             # Late afternoon transition (15:00-17:59)
             if hour >= 15:
                 if hour == 15:
-                    # Start gradual decrease
-                    max_value = clear_sky * 0.7
-                    min_value = current_value * 0.7
-                    return min(max(prediction * 0.9, min_value), max_value)
+                    # More gradual decrease
+                    max_value = clear_sky * 0.75  # Increased from 0.7 to 0.75
+                    min_value = current_value * 0.75  # Increased from 0.7 to 0.75
+                    return min(max(prediction * 0.95, min_value), max_value)
                 elif hour == 16:
-                    # Steeper decrease
-                    max_value = clear_sky * 0.4
-                    min_value = current_value * 0.5
-                    return min(max(prediction * 0.8, min_value), max_value)
+                    # Less steep decrease
+                    max_value = clear_sky * 0.45  # Increased from 0.4 to 0.45
+                    min_value = current_value * 0.6  # Increased from 0.5 to 0.6
+                    return min(max(prediction * 0.85, min_value), max_value)
                 elif hour == 17:
-                    # Final transition to night
-                    max_value = clear_sky * 0.15
-                    min_value = current_value * 0.3
-                    return min(max(prediction * 0.6, min_value), max_value)
+                    # Smoother transition to night
+                    max_value = clear_sky * 0.20  # Increased from 0.15 to 0.20
+                    min_value = current_value * 0.4  # Increased from 0.3 to 0.4
+                    return min(max(prediction * 0.7, min_value), max_value)
 
             # Normal daytime hours (09:00-14:59)
             prediction = max(0, min(prediction, clear_sky * 0.95))
@@ -2722,7 +2722,7 @@ def main():
             avg_error = total_error / total_predictions
             print(f"\nOverall Performance:")
             print(f"Total predictions: {total_predictions}")
-            print(f"Average error: {avg_error:.2f} W/m²")
+            print(f"Average error: {avg_error:.2f} W/m��")
             print(f"Final prediction history size: {len(predictor.prediction_history)}")
         
         # Generate final learning analysis
