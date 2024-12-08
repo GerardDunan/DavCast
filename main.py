@@ -122,7 +122,7 @@ class WeatherConditionAnalyzer:
             print(f"Clear Sky Radiation: {clear_sky_rad}W/m²")
 
             # Calculate cloud cover
-            cloud_cover = calculate_cloud_cover(
+            cloud_cover = calculate_clear_sky_radiation(
                 temperature=temp,
                 humidity=humidity,
                 pressure=pressure,
@@ -410,13 +410,14 @@ def calculate_clear_sky_radiation(hour, latitude, longitude, date, temperature=2
         clear_sky = direct + diffuse
         
         # 13. Apply time-of-day corrections
-        if hour < 3 or hour > 18:  # Night hours
+        if hour < 5:  # Changed from 6 to 5
             return 0
-        elif hour < 8 or hour > 16:  # Early morning/late afternoon
-            clear_sky *= 0.75 + 0.25 * cos_zenith  # Gradual transition
-        elif 11 <= hour <= 13:  # Peak hours
-            clear_sky *= 0.95 + 0.05 * cos_zenith  # Small zenith angle correction
-            
+        elif hour < 8:  # Early morning
+            # Ensure minimum values for dawn
+            min_values = {5: 5, 6: 20, 7: 50}
+            base_value = min_values.get(hour, clear_sky * 0.1)
+            clear_sky = max(base_value, clear_sky * (0.1 * (hour - 4)))  # Progressive increase
+        
         # 14. Final validation
         clear_sky = float(np.clip(clear_sky, 0, 1200))  # Cap at 1200 W/m²
         
@@ -1392,7 +1393,8 @@ class AutomatedPredictor:
                 'moving_avg': self._get_moving_average(data, target_date, current_hour),
                 'clear_sky': adjusted_clear_sky,
                 'pattern_based': self._get_pattern_prediction(
-                    self._find_similar_days(data, target_date, current_hour, conditions)
+                    self._find_similar_days(data, target_date, current_hour, conditions),
+                    current_value  # Added current_value argument
                 ),
                 'fallback': self.fallback_predictor.get_fallback_prediction(
                     current_value, conditions, adjusted_clear_sky, data
@@ -1453,6 +1455,7 @@ class AutomatedPredictor:
                 'cloud_cover': float(weather_impacts.get('cloud_cover', 0)),
                 'cloud_factor': float(cloud_factor)
             }
+
             
             # Store prediction and analyze patterns
             self.prediction_history.append(prediction_record)
@@ -1481,20 +1484,20 @@ class AutomatedPredictor:
 
     def _get_main_prediction(self, current_value, conditions, clear_sky):
         try:
-            # Add bias correction
             hour = conditions.get('hour', 0)
-            
-            # Initialize prediction with current value
-            prediction = current_value
+            prediction = current_value  # Initialize prediction
             
             # Apply bias correction
-            prediction = self._apply_bias_correction(prediction, hour)
+            bias_corrected = self._apply_bias_correction(prediction, hour)
+            if bias_corrected is not None:  # Add null check
+                prediction = bias_corrected
             
             # Add confidence-based weighting
             confidence = self._calculate_prediction_confidence(prediction, current_value, clear_sky)
             if confidence < 0.7:
                 historical_avg = self._get_historical_average(conditions)
-                prediction = (prediction * confidence + historical_avg * (1 - confidence))
+                if historical_avg is not None:  # Add null check
+                    prediction = (prediction * confidence + historical_avg * (1 - confidence))
             
             # Enhanced validation
             if prediction > clear_sky * 0.95:
@@ -1744,45 +1747,17 @@ class AutomatedPredictor:
             return 0.0
 
     def _get_pattern_prediction(self, similar_days, current_value):
-        """Get prediction based on similar day patterns with enhanced dawn handling"""
         try:
-            if not similar_days:
+            if not similar_days or current_value is None:
                 return current_value
                 
-            hour = similar_days[0]['data']['hour'].iloc[0] if not similar_days[0]['data'].empty else None
+            hour = similar_days[0]['data']['hour'].iloc[0] if similar_days and similar_days[0]['data'].empty is False else None
             
             # Special handling for dawn hours
             if hour is not None and 5 <= hour <= 8:
-                dawn_predictions = []
-                dawn_weights = []
-                
-                for day in similar_days:
-                    day_data = day['data']
-                    if not day_data.empty:
-                        # Get values for next hour
-                        next_hour = hour + 1
-                        next_data = day_data[day_data['hour'] == next_hour]
-                        
-                        if not next_data.empty:
-                            solar_value = next_data['Solar Rad - W/m^2'].iloc[0]
-                            temp = next_data['Average Temperature'].iloc[0]
-                            humidity = next_data['Average Humidity'].iloc[0]
-                            
-                            # Calculate dawn-specific weight
-                            dawn_weight = day['similarity']
-                            if temp < 25:
-                                dawn_weight *= 1.2
-                            if humidity > 80:
-                                dawn_weight *= 0.8
-                            
-                            if solar_value > 0:
-                                dawn_predictions.append(solar_value)
-                                dawn_weights.append(dawn_weight)
-                
-                if dawn_predictions:
-                    weighted_pred = np.average(dawn_predictions, weights=dawn_weights)
-                    min_values = {5: 5, 6: 20, 7: 50, 8: 100}
-                    return max(min_values.get(hour, 0), weighted_pred)
+                # Ensure minimum values even if no predictions
+                min_values = {5: 5, 6: 20, 7: 50, 8: 100}
+                base_value = min_values.get(hour, current_value)
             
             # Regular pattern prediction
             predictions = []
@@ -3087,7 +3062,7 @@ class AutomatedPredictor:
             # Create all directories
             for directory in [self.base_dir, self.data_folder, self.stats_folder, 
                              self.reports_folder, self.models_folder, self.history_folder]:  # Add history_folder
-                os.makedirs(directory, exist_ok=True)
+                os.makedirs(directory, mode=0o777, exist_ok=True)
                 print(f"Directory created/verified: {directory}")
 
             print("\nInitialized file paths:")
