@@ -1025,10 +1025,36 @@ class AutomatedPredictor:
         """Evaluate current model performance and save if best"""
         try:
             if len(self.prediction_history) >= self.model_performance['evaluation_window']:
-                recent_predictions = pd.DataFrame(self.prediction_history[-self.model_performance['evaluation_window']:])
+                # Convert prediction history to DataFrame if it's not already
+                if isinstance(self.prediction_history, list):
+                    recent_predictions = pd.DataFrame(self.prediction_history[-self.model_performance['evaluation_window']:])
+                else:
+                    recent_predictions = self.prediction_history[-self.model_performance['evaluation_window']:]
+                
+                # Calculate current performance
                 current_mae = np.mean(np.abs(recent_predictions['error']))
                 self.model_performance['current_mae'] = current_mae
                 
+                print(f"\nEvaluating model performance:")
+                print(f"Current MAE: {current_mae:.2f} W/m²")
+                print(f"Best MAE: {self.model_performance.get('best_mae', float('inf')):.2f} W/m²")
+                
+                # Always save performance metrics
+                metrics_path = os.path.join(self.models_folder, 'model_performance.json')
+                performance_metrics = {
+                    'current_mae': float(current_mae),
+                    'best_mae': float(self.model_performance.get('best_mae', float('inf'))),
+                    'best_timestamp': str(self.model_performance.get('best_timestamp', None)),
+                    'total_predictions': len(self.prediction_history),
+                    'last_evaluated': str(pd.Timestamp.now()),
+                    'evaluation_window': self.model_performance['evaluation_window']
+                }
+                
+                with open(metrics_path, 'w') as f:
+                    json.dump(performance_metrics, f, indent=4)
+                print(f"Performance metrics saved to: {metrics_path}")
+                
+                # Save best model if current performance is better
                 if current_mae < self.model_performance.get('best_mae', float('inf')):
                     print(f"\nNew best model detected! (MAE: {current_mae:.2f} W/m² vs previous: {self.model_performance.get('best_mae', float('inf')):.2f} W/m²)")
                     self.model_performance['best_mae'] = current_mae
@@ -1062,17 +1088,13 @@ class AutomatedPredictor:
                     
                     print(f"Saved new best model to: {best_model_path}")
                     print(f"Archived copy saved to: {archive_path}")
-                    
-                    # Save performance metrics
-                    metrics_path = os.path.join(self.models_folder, 'model_performance.json')
-                    with open(metrics_path, 'w') as f:
-                        json.dump({
-                            'best_mae': float(self.model_performance['best_mae']),
-                            'best_timestamp': str(self.model_performance['best_timestamp']),
-                            'current_mae': float(current_mae),
-                            'last_updated': str(pd.Timestamp.now())
-                        }, f, indent=4)
-                    
+                
+                else:
+                    print("Current model performance not better than best model.")
+                
+            else:
+                print(f"\nNot enough predictions ({len(self.prediction_history)}) for model evaluation. Need {self.model_performance['evaluation_window']}.")
+                
         except Exception as e:
             print(f"Error in evaluate_and_save_model: {str(e)}")
             traceback.print_exc()
@@ -2538,7 +2560,7 @@ class AutomatedPredictor:
                 # Calculate pattern similarity
                 pattern_similarity = self._calculate_pattern_similarity(
                     current_pattern, pattern['values'])
-                    
+                
                 # Calculate time-based weight
                 days_diff = (current_date - date).days
                 time_weight = np.exp(-days_diff / 30)  # Exponential decay
@@ -2756,8 +2778,8 @@ class AutomatedPredictor:
             report_path = report_dir / 'detailed_report.txt'
             print(f"Generating report file: {report_path}")
 
-            # Open and write to the report file
-            with open(report_path, 'w') as f:
+            # Open file with UTF-8 encoding
+            with open(report_path, 'w', encoding='utf-8') as f:
                 f.write(f"=== Detailed Learning Report ({report_period}) ===\n")
                 f.write(f"Generated: {pd.Timestamp.now()}\n\n")
                 
@@ -2873,25 +2895,52 @@ class AutomatedPredictor:
             f.write(f"\nError in hourly analysis: {str(e)}\n")
 
     def _write_weather_analysis(self, f, history_df):
-        """Analyze and write weather condition impacts"""
+        """Analyze and write weather condition impacts with improved correlation analysis"""
         try:
             # Convert conditions from string to dict if needed
-            if 'conditions' in history_df.columns:
-                conditions_df = pd.DataFrame([
-                    eval(cond) if isinstance(cond, str) else cond 
-                    for cond in history_df['conditions']
-                ])
-                
-                # Analyze each weather parameter
-                for param in ['temperature', 'humidity', 'pressure', 'uv']:
-                    if param in conditions_df.columns:
-                        f.write(f"\n{param.capitalize()} Impact Analysis:\n")
-                        
-                        # Create bins for the parameter
-                        bins = pd.qcut(conditions_df[param], q=5)
-                        impact_analysis = history_df.groupby(bins)['error_percentage'].agg([
+            if 'conditions' not in history_df.columns:
+                f.write("\nNo weather conditions data available for analysis\n")
+                return
+
+            # Convert conditions to DataFrame, handling both string and dict formats
+            conditions_df = pd.DataFrame([
+                eval(cond) if isinstance(cond, str) else cond 
+                for cond in history_df['conditions']
+            ])
+            
+            # Ensure numeric values for correlation analysis
+            for param in ['temperature', 'humidity', 'pressure', 'uv']:
+                if param in conditions_df.columns:
+                    conditions_df[param] = pd.to_numeric(conditions_df[param], errors='coerce')
+            
+            # Analyze each weather parameter
+            for param in ['temperature', 'humidity', 'pressure', 'uv']:
+                if param in conditions_df.columns:
+                    f.write(f"\n{param.capitalize()} Impact Analysis:\n")
+                    
+                    # Handle parameters with potential duplicate values
+                    unique_values = conditions_df[param].nunique()
+                    if unique_values < 5:
+                        # Use value_counts for parameters with few unique values
+                        impact_analysis = history_df.groupby(conditions_df[param])['error_percentage'].agg([
                             'mean', 'std', 'count'
                         ]).round(2)
+                    else:
+                        try:
+                            # Create bins with duplicate handling
+                            bins = pd.qcut(conditions_df[param], q=5, duplicates='drop')
+                            impact_analysis = history_df.groupby(bins)['error_percentage'].agg([
+                                'mean', 'std', 'count'
+                            ]).round(2)
+                        except ValueError:
+                            # Fallback to custom bins if qcut fails
+                            min_val = conditions_df[param].min()
+                            max_val = conditions_df[param].max()
+                            custom_bins = np.linspace(min_val, max_val, 6)
+                            bins = pd.cut(conditions_df[param], bins=custom_bins)
+                            impact_analysis = history_df.groupby(bins)['error_percentage'].agg([
+                                'mean', 'std', 'count'
+                            ]).round(2)
                         
                         for bin_range, stats in impact_analysis.iterrows():
                             f.write(f"\n  Range {bin_range}:\n")
@@ -2899,43 +2948,86 @@ class AutomatedPredictor:
                             f.write(f"    Mean Error %: {stats['mean']:.2f}%\n")
                             f.write(f"    Error Std %: {stats['std']:.2f}%\n")
 
-            # Add correlation analysis
+            # Improved correlation analysis
             f.write("\nWeather Parameter Correlations:\n")
             for param in ['temperature', 'humidity', 'pressure', 'uv']:
                 if param in conditions_df.columns:
-                    correlation = np.corrcoef(
-                        conditions_df[param], 
-                        history_df['error_percentage']
-                    )[0,1]
-                    f.write(f"{param.capitalize()} correlation with error: {correlation:.3f}\n")
+                    # Remove any NaN values for correlation calculation
+                    valid_mask = ~(conditions_df[param].isna() | history_df['error_percentage'].isna())
+                    if valid_mask.any():
+                        param_values = conditions_df[param][valid_mask].values
+                        error_values = history_df['error_percentage'][valid_mask].values
+                        if len(param_values) > 1 and len(error_values) > 1:
+                            correlation = np.corrcoef(param_values, error_values)[0,1]
+                            f.write(f"{param.capitalize()} correlation with error: {correlation:.3f}\n")
+                        else:
+                            f.write(f"{param.capitalize()} correlation with error: insufficient data points\n")
+                    else:
+                        f.write(f"{param.capitalize()} correlation with error: insufficient valid data\n")
+
+            # Add additional weather impact summary
+            f.write("\nWeather Impact Summary:\n")
+            for param in ['temperature', 'humidity', 'pressure', 'uv']:
+                if param in conditions_df.columns:
+                    param_data = conditions_df[param]
+                    error_data = history_df['error_percentage']
+                    
+                    # Calculate average error for high and low values
+                    median_value = param_data.median()
+                    high_mask = param_data > median_value
+                    low_mask = param_data <= median_value
+                    
+                    high_error = error_data[high_mask].mean()
+                    low_error = error_data[low_mask].mean()
+                    
+                    f.write(f"\n{param.capitalize()}:\n")
+                    f.write(f"  High values (>{median_value:.1f}): {high_error:.2f}% mean error\n")
+                    f.write(f"  Low values (<={median_value:.1f}): {low_error:.2f}% mean error\n")
+                    f.write(f"  Impact difference: {abs(high_error - low_error):.2f}%\n")
 
         except Exception as e:
             f.write(f"\nError in weather analysis: {str(e)}\n")
+            traceback.print_exc()
 
     def _write_learning_progress(self, f, history_df):
-        """Analyze and write learning progress over time"""
+        """Analyze and write learning progress over time with proper window handling"""
         try:
-            # Calculate rolling metrics
+            # Calculate rolling metrics with data length validation
             window_sizes = [24, 72, 168]  # 1 day, 3 days, 1 week
             
             f.write("\nLearning Progress Analysis:\n")
             for window in window_sizes:
-                rolling_mae = history_df['error'].abs().rolling(window).mean()
-                rolling_mape = history_df['error_percentage'].abs().rolling(window).mean()
-                
-                f.write(f"\n{window}-hour Rolling Window:\n")
-                f.write(f"  Initial MAE: {rolling_mae.iloc[window]:.2f} W/m²\n")
-                f.write(f"  Final MAE: {rolling_mae.iloc[-1]:.2f} W/m²\n")
-                f.write(f"  Initial MAPE: {rolling_mape.iloc[window]:.2f}%\n")
-                f.write(f"  Final MAPE: {rolling_mape.iloc[-1]:.2f}%\n")
-                
-                # Calculate improvement
-                mae_improvement = ((rolling_mae.iloc[window] - rolling_mae.iloc[-1]) / 
-                                 rolling_mae.iloc[window] * 100)
-                f.write(f"  MAE Improvement: {mae_improvement:.1f}%\n")
+                # Check if we have enough data for this window size
+                if len(history_df) > window:
+                    rolling_mae = history_df['error'].abs().rolling(window, min_periods=1).mean()
+                    rolling_mape = history_df['error_percentage'].abs().rolling(window, min_periods=1).mean()
+                    
+                    f.write(f"\n{window}-hour Rolling Window:\n")
+                    
+                    # Get initial values (using first available value after window)
+                    initial_idx = min(window, len(rolling_mae) - 1)
+                    initial_mae = rolling_mae.iloc[initial_idx]
+                    initial_mape = rolling_mape.iloc[initial_idx]
+                    
+                    # Get final values
+                    final_mae = rolling_mae.iloc[-1]
+                    final_mape = rolling_mape.iloc[-1]
+                    
+                    f.write(f"  Initial MAE: {initial_mae:.2f} W/m²\n")
+                    f.write(f"  Final MAE: {final_mae:.2f} W/m²\n")
+                    f.write(f"  Initial MAPE: {initial_mape:.2f}%\n")
+                    f.write(f"  Final MAPE: {final_mape:.2f}%\n")
+                    
+                    # Calculate improvement
+                    if initial_mae != 0:
+                        mae_improvement = ((initial_mae - final_mae) / initial_mae * 100)
+                        f.write(f"  MAE Improvement: {mae_improvement:.1f}%\n")
+                else:
+                    f.write(f"\n{window}-hour Rolling Window: Insufficient data (need >{window} points)\n")
 
         except Exception as e:
             f.write(f"\nError in learning progress analysis: {str(e)}\n")
+            traceback.print_exc()
 
     def _write_error_patterns(self, f, history_df):
         """Analyze and write error patterns"""
@@ -3011,8 +3103,13 @@ class AutomatedPredictor:
             print(f"Error saving performance metrics: {str(e)}")
 
     def _generate_performance_plots(self, report_dir, history_df):
+        """Generate comprehensive performance visualization plots"""
         try:
             plot_files = []
+            
+            # Ensure date column is datetime
+            if 'date' in history_df.columns:
+                history_df['date'] = pd.to_datetime(history_df['date'])
             
             # Error Distribution
             plot_path = report_dir / 'error_distribution.png'
@@ -3028,9 +3125,10 @@ class AutomatedPredictor:
             # Learning Progress
             plt.figure(figsize=(10, 6))
             history_df['rolling_mae'] = history_df['error'].abs().rolling(24).mean()
-            plt.plot(history_df.index, history_df['rolling_mae'])
+            plt.plot(range(len(history_df)), history_df['rolling_mae'])
             plt.title('Learning Progress (24-hour Rolling MAE)')
             plt.ylabel('Mean Absolute Error (W/m²)')
+            plt.xlabel('Prediction Number')
             plt.savefig(report_dir / 'learning_progress.png')
             plt.close()
             plot_files.append(report_dir / 'learning_progress.png')
@@ -3038,14 +3136,17 @@ class AutomatedPredictor:
             
             # Hourly Performance Heatmap
             plt.figure(figsize=(12, 8))
+            # Create pivot table using numeric indices instead of dates
             hourly_errors = history_df.pivot_table(
-                values='error_percentage', 
-                index=history_df['date'].dt.date,
+                values='error_percentage',
+                index=history_df.index // 24,  # Group by day number
                 columns='hour',
                 aggfunc='mean'
             )
             sns.heatmap(hourly_errors, cmap='RdYlBu_r')
             plt.title('Hourly Error Patterns')
+            plt.xlabel('Hour of Day')
+            plt.ylabel('Day Number')
             plt.savefig(report_dir / 'hourly_heatmap.png')
             plt.close()
             plot_files.append(report_dir / 'hourly_heatmap.png')
@@ -3054,7 +3155,8 @@ class AutomatedPredictor:
             # Prediction vs Actual Scatter
             plt.figure(figsize=(10, 10))
             plt.scatter(history_df['actual'], history_df['predicted'], alpha=0.5)
-            plt.plot([0, history_df['actual'].max()], [0, history_df['actual'].max()], 'r--')
+            max_val = max(history_df['actual'].max(), history_df['predicted'].max())
+            plt.plot([0, max_val], [0, max_val], 'r--')
             plt.title('Predicted vs Actual Values')
             plt.xlabel('Actual (W/m²)')
             plt.ylabel('Predicted (W/m²)')
@@ -3063,7 +3165,7 @@ class AutomatedPredictor:
             plot_files.append(report_dir / 'prediction_scatter.png')
             print(f"Saved plot: {report_dir / 'prediction_scatter.png'}")
             
-            # Add new plot: Error trends by hour
+            # Error trends by hour
             plt.figure(figsize=(12, 6))
             hourly_mean_error = history_df.groupby('hour')['error_percentage'].mean()
             hourly_std_error = history_df.groupby('hour')['error_percentage'].std()
@@ -3220,6 +3322,10 @@ def main():
             print(f"Total predictions: {total_predictions}")
             print(f"Average error: {avg_error:.2f} W/m²")
         
+        # Evaluate and save best model
+        print("\nEvaluating final model performance...")
+        predictor.evaluate_and_save_model()
+        
         # Generate final learning analysis
         print("\nGenerating final learning analysis...")
         predictor.analyze_learning_performance()
@@ -3233,6 +3339,7 @@ def main():
         
         print("\nAnalysis complete. Reports generated in:")
         print(f"Stats folder: {os.path.abspath(predictor.stats_folder)}")
+        print(f"Models folder: {os.path.abspath(predictor.models_folder)}")
             
     except Exception as e:
         print(f"Error in main: {str(e)}")
