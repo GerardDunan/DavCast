@@ -1,4 +1,3 @@
-import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -10,9 +9,6 @@ from datetime import datetime
 import traceback
 import pickle
 import json
-import argparse
-from pathlib import Path
-from typing import Optional, Dict, Any
 warnings.filterwarnings('ignore')
 
 # Constants
@@ -132,14 +128,17 @@ def preprocess_data(data_path):
         minute_data['day_of_year'] = minute_data['timestamp'].dt.dayofyear
         minute_data['minute'] = minute_data['timestamp'].dt.minute  # Add minute information
         
-        # Calculate clear sky radiation for both datasets
+        # Calculate clear sky radiation for both datasets using actual weather data
         for df in [hourly_data, minute_data]:
             df['clear_sky_radiation'] = df.apply(
                 lambda row: calculate_clear_sky_radiation(
-                    row['hour'] + row['minute']/60 if 'minute' in df.columns else row['hour'],  # Use decimal hours
+                    row['hour'] + row['minute']/60 if 'minute' in df.columns else row['hour'],
                     ADDU_LATITUDE, 
                     ADDU_LONGITUDE, 
-                    row['date']
+                    row['date'],
+                    temperature=row['Average Temperature'],
+                    humidity=row['Average Humidity'],
+                    pressure=row['Average Barometer']
                 ), 
                 axis=1
             )
@@ -196,80 +195,154 @@ def process_features(data):
             else:
                 data[col] = data[col].fillna(data.groupby('hour')[col].transform('mean'))
 
-def calculate_clear_sky_radiation(hour, latitude, longitude, date):
-    """Calculate theoretical clear sky radiation"""
-    try:
-        # Convert inputs to float
-        hour = float(hour)
-        latitude = float(latitude)
-        longitude = float(longitude)
+def calculate_clear_sky_radiation(hour, latitude, longitude, date, temperature=25, humidity=60, pressure=1013.25):
+    """
+    Calculate theoretical clear sky radiation using the Bird Clear Sky Model (Bird & Hulstrom, 1981)
+    
+    Parameters:
+        hour (float): Hour of day (0-24)
+        latitude (float): Location latitude in degrees (-90 to 90)
+        longitude (float): Location longitude in degrees (-180 to 180)
+        date (datetime.date): Date of calculation
+        temperature (float): Ambient temperature in Celsius
+        humidity (float): Relative humidity (0-100)
+        pressure (float): Atmospheric pressure in hPa
         
-        # Ensure date is a proper datetime.date object
+    Returns:
+        float: Clear sky radiation in W/m²
+    """
+    try:
+        # 1. Input validation and conversion
+        hour = float(np.clip(hour, 0, 24))
+        latitude = float(np.clip(latitude, -90, 90))
+        longitude = float(np.clip(longitude, -180, 180))
+        temperature = float(np.clip(temperature, -50, 60))
+        humidity = float(np.clip(humidity, 0, 100))
+        pressure = float(np.clip(pressure, 300, 1100))
+        
+        # Ensure proper date object
         if isinstance(date, str):
             date = pd.to_datetime(date).date()
         elif isinstance(date, pd.Timestamp):
             date = date.date()
-        elif pd.isna(date):
-            print(f"Warning: Invalid date provided: {date}")
-            return 0.0
             
-        # Convert latitude and longitude to radians
-        lat_rad = np.radians(latitude)
-        
-        # Calculate day of year
+        # 2. Calculate day of year and solar position
         day_of_year = date.timetuple().tm_yday
+        day_angle = 2 * np.pi * (day_of_year - 1) / 365
         
-        # Calculate solar declination
-        declination = 23.45 * np.sin(np.radians(360/365 * (day_of_year - 81)))
-        declination_rad = np.radians(declination)
+        # Solar constant (W/m²) - NASA updated value
+        solar_constant = 1361.1
         
-        # Calculate hour angle
-        hour_angle = 15 * (hour - 12)  # 15 degrees per hour from solar noon
-        hour_angle_rad = np.radians(hour_angle)
-        
-        # Calculate solar altitude
-        sin_altitude = (np.sin(lat_rad) * np.sin(declination_rad)) + \
-                       (np.cos(lat_rad) * np.cos(declination_rad) * \
-                       np.cos(hour_angle_rad))
-        solar_altitude = np.arcsin(sin_altitude)
-        
-        # Calculate air mass
-        if sin_altitude > 0:
-            air_mass = 1 / (sin_altitude + 0.50572 * pow(6.07995 + solar_altitude, -1.6364))
-        else:
-            return 0
-        
-        # Calculate extraterrestrial radiation
-        # Solar constant (W/m²)
-        solar_constant = 1361
-        
-        # Calculate eccentricity correction
-        day_angle = 2 * np.pi * day_of_year / 365
+        # 3. Calculate Earth-Sun distance correction (Spencer, 1971)
         eccentricity = (1.00011 + 0.034221 * np.cos(day_angle) + 
                        0.00128 * np.sin(day_angle) + 
                        0.000719 * np.cos(2 * day_angle) + 
                        0.000077 * np.sin(2 * day_angle))
         
-        # Calculate clear sky radiation
-        clear_sky = (solar_constant * eccentricity * 
-                    np.exp(-0.8662 * air_mass * 0.095) * 
-                    sin_altitude)
+        # 4. Solar declination (Spencer, 1971)
+        declination = (0.006918 - 0.399912 * np.cos(day_angle) + 
+                      0.070257 * np.sin(day_angle) - 
+                      0.006758 * np.cos(2 * day_angle) + 
+                      0.000907 * np.sin(2 * day_angle) - 
+                      0.002697 * np.cos(3 * day_angle) + 
+                      0.001480 * np.sin(3 * day_angle))
         
-        # Add basic cloud impact based on hour
+        # 5. Calculate solar position
+        lat_rad = np.radians(latitude)
+        hour_angle = np.radians(15 * (hour - 12))  # 15 degrees per hour from solar noon
+        
+        # Solar zenith angle
+        cos_zenith = (np.sin(lat_rad) * np.sin(declination) + 
+                     np.cos(lat_rad) * np.cos(declination) * np.cos(hour_angle))
+        cos_zenith = np.clip(cos_zenith, -1, 1)
+        zenith = np.arccos(cos_zenith)
+        
+        # Return 0 if sun is below horizon
+        if cos_zenith <= 0:
+            return 0.0
+        
+        # 6. Calculate relative air mass (Kasten and Young, 1989)
+        air_mass = 1 / (cos_zenith + 0.50572 * pow(96.07995 - np.degrees(zenith), -1.6364))
+        
+        # Pressure-corrected air mass
+        air_mass_pressure = air_mass * (pressure / 1013.25)
+        
+        # 7. Calculate precipitable water content (Leckner, 1978)
+        T = temperature + 273.15  # Convert to Kelvin
+        e_sat = 6.11 * np.exp((17.27 * temperature) / (temperature + 237.3))
+        vapor_pressure = e_sat * humidity / 100
+        water = 0.14 * vapor_pressure * air_mass + 2.1
+        
+        # 8. Calculate atmospheric transmittances
+        
+        # Rayleigh scattering (Bird & Hulstrom, 1981)
+        tau_r = np.exp(-0.0903 * pow(air_mass_pressure, 0.84) * 
+                      (1.0 + air_mass_pressure - pow(air_mass_pressure, 1.01)))
+        
+        # Ozone transmittance (Bird & Hulstrom, 1981)
+        ozone = 0.35  # cm NTP
+        tau_o = 1 - 0.1611 * ozone * air_mass * (1.0 + 139.48 * ozone * air_mass) ** -0.3035 - \
+                0.002715 * ozone * air_mass / (1.0 + 0.044 * ozone * air_mass + 0.0003 * (ozone * air_mass) ** 2)
+        
+        # Water vapor transmittance (Bird & Hulstrom, 1981)
+        tau_w = 1 - 2.4959 * water * air_mass / \
+                ((1 + 79.034 * water * air_mass) ** 0.6828 + 6.385 * water * air_mass)
+        
+        # Aerosol transmittance (Bird & Hulstrom, 1981)
+        beta = 0.05  # Angstrom turbidity coefficient
+        alpha = 1.3   # Wavelength exponent
+        tau_a = np.exp(-beta * pow(air_mass, alpha))
+        
+        # 9. Calculate direct normal irradiance (DNI)
+        dni = solar_constant * eccentricity * tau_r * tau_o * tau_w * (0.9 * tau_a + 0.1)
+        
+        # 10. Calculate diffuse radiation components
+        
+        # Rayleigh diffuse radiation
+        dr = 0.5 * solar_constant * eccentricity * cos_zenith * (1 - tau_r) * tau_o * tau_w * tau_a
+        
+        # Aerosol diffuse radiation
+        da = 0.5 * solar_constant * eccentricity * cos_zenith * tau_r * tau_o * tau_w * (1 - tau_a * 0.9)
+        
+        # Multiple reflection factor
+        ground_albedo = 0.2
+        sky_albedo = 0.068
+        reflection_factor = 1 / (1 - ground_albedo * sky_albedo)
+        
+        # Total diffuse radiation
+        diffuse = (dr + da) * reflection_factor
+        
+        # 11. Calculate direct radiation on horizontal surface
+        direct = dni * cos_zenith
+        
+        # 12. Total clear sky radiation
+        clear_sky = direct + diffuse
+        
+        # 13. Apply time-of-day corrections
         if hour < 6 or hour > 18:  # Night hours
             return 0
         elif hour < 8 or hour > 16:  # Early morning/late afternoon
-            clear_sky *= 0.7
+            clear_sky *= 0.75 + 0.25 * cos_zenith  # Gradual transition
         elif 11 <= hour <= 13:  # Peak hours
-            clear_sky *= 0.95
-        else:  # Other daylight hours
-            clear_sky *= 0.85
+            clear_sky *= 0.95 + 0.05 * cos_zenith  # Small zenith angle correction
+            
+        # 14. Final validation
+        clear_sky = float(np.clip(clear_sky, 0, 1200))  # Cap at 1200 W/m²
         
-        return max(0, min(clear_sky, 1200))  # Cap at 1200 W/m²
+        # 15. Debug information for high values
+        if clear_sky > 800:
+            print(f"\nHigh radiation value detected ({clear_sky:.2f} W/m²):")
+            print(f"Hour: {hour}, Zenith: {np.degrees(zenith):.1f}°")
+            print(f"Direct: {direct:.2f}, Diffuse: {diffuse:.2f}")
+            print(f"Transmittances - Rayleigh: {tau_r:.3f}, Ozone: {tau_o:.3f}, "
+                  f"Water: {tau_w:.3f}, Aerosol: {tau_a:.3f}")
+        
+        return clear_sky
         
     except Exception as e:
         print(f"Error in calculate_clear_sky_radiation: {str(e)}")
-        return 0
+        traceback.print_exc()
+        return 0.0    
 
 class PredictionErrorLearner:
     def __init__(self):
@@ -606,7 +679,7 @@ class AutomatedPredictor:
         self.data_folder = data_folder
         self.history_folder = os.path.join(data_folder, 'history')
         self.models_folder = os.path.join(data_folder, 'models')
-        self.stats_folder = os.path.join(data_folder, 'learning_stats')
+        self.stats_folder = os.path.join(data_folder, 'learning_stats')  # Changed to learning_stats
         
         os.makedirs(self.data_folder, exist_ok=True)
         os.makedirs(self.history_folder, exist_ok=True)
@@ -627,12 +700,9 @@ class AutomatedPredictor:
         self.error_learner = PredictionErrorLearner()
         self.consecutive_errors = []
         self.prediction_history = []
-        self.max_consecutive_errors = 10
+        self.max_consecutive_errors = 10  # Keep last 10 errors
         
-        # Initialize model state
-        self._is_trained = False  # Move this BEFORE loading the model
-        
-        # Load previous state and best model
+        # Load previous state
         self.load_state()
         
         # Add model versioning
@@ -979,51 +1049,36 @@ class AutomatedPredictor:
                     best_state = pickle.load(f)
                     
                 # Restore model state
-                self.hourly_patterns = best_state.get('hourly_patterns', {})
-                self.seasonal_patterns = best_state.get('seasonal_patterns', {})
-                self.transition_patterns = best_state.get('transition_patterns', {})
-                self.weather_impacts = best_state.get('weather_impacts', {})
+                self.hourly_patterns = best_state['hourly_patterns']
+                self.seasonal_patterns = best_state['seasonal_patterns']
+                self.transition_patterns = best_state['transition_patterns']
+                self.weather_impacts = best_state['weather_impacts']
                 
                 # Restore error learner state
-                error_learner_state = best_state.get('error_learner_state', {})
-                if error_learner_state:
-                    self.error_learner.error_history = error_learner_state.get('error_history', [])
-                    self.error_learner.adjustment_factors = error_learner_state.get('adjustment_factors', {})
-                    self.error_learner.pattern_adjustments = error_learner_state.get('pattern_adjustments', {})
+                error_learner_state = best_state['error_learner_state']
+                self.error_learner.error_history = error_learner_state['error_history']
+                self.error_learner.adjustment_factors = error_learner_state['adjustment_factors']
+                self.error_learner.pattern_adjustments = error_learner_state['pattern_adjustments']
                 
                 # Restore performance metrics
-                self.model_performance = best_state.get('model_performance', {
+                self.model_performance = best_state['model_performance']
+                
+                print(f"Loaded best model from {best_model_path}")
+                print(f"Best model MAE: {self.model_performance['best_mae']:.2f} W/m²")
+                print(f"Best model timestamp: {self.model_performance['best_timestamp']}")
+                
+            else:
+                print("No best model found - starting fresh")
+                self.model_performance = {
                     'best_mae': float('inf'),
                     'best_timestamp': None,
                     'current_mae': float('inf'),
                     'evaluation_window': 100
-                })
-                
-                # Verify model state is complete and valid
-                pattern_count = sum(len(patterns) for patterns in self.hourly_patterns.values())
-                if pattern_count > 0:
-                    print(f"Found {pattern_count} valid patterns across {len(self.hourly_patterns)} hours")
-                    self._is_trained = True  # Set the flag here
-                    print(f"Loaded best model from {best_model_path}")
-                    print(f"Best model MAE: {self.model_performance['best_mae']:.2f} W/m²")
-                    print(f"Best model timestamp: {self.model_performance['best_timestamp']}")
-                    print("Model state verified and ready for predictions")
-                    return True
-                    
-                print("Loaded model state is incomplete - will need training")
-                self._is_trained = False
-                return False
-                
-            else:
-                print("No best model found - starting fresh")
-                self._is_trained = False
-                return False
+                }
                 
         except Exception as e:
             print(f"Error loading best model: {str(e)}")
             traceback.print_exc()
-            self._is_trained = False
-            return False
 
     def learn_from_historical_data(self, data):
         """Learn patterns from all historical data"""
@@ -1149,37 +1204,7 @@ class AutomatedPredictor:
             current_hour = int(current_hour)
             next_hour = (current_hour + 1) % 24
             
-            # Check if next hour is during nighttime (00:00-05:00 or 18:00-23:00)
-            if next_hour <= 5 or next_hour >= 18:
-                # Return zero prediction with metadata for nighttime hours
-                prediction_record = {
-                    'date': str(target_date),
-                    'hour': int(next_hour),
-                    'predicted': 0.0,
-                    'main_prediction': 0.0,
-                    'moving_avg': 0.0,
-                    'clear_sky_pred': 0.0,
-                    'pattern_pred': 0.0,
-                    'fallback_pred': 0.0,
-                    'weather_adjustment': 1.0,
-                    'learning_adjustment': 1.0,
-                    'actual': None,
-                    'error': None,
-                    'error_percentage': None,
-                    'conditions': str({'hour': next_hour, 'is_night': True}),
-                    'weights': {
-                        'pattern': 0.3,
-                        'ratio': 0.3,
-                        'trend': 0.2,
-                        'typical': 0.2
-                    }
-                }
-                
-                self.prediction_history.append(prediction_record)
-                print(f"\nNighttime hour {next_hour:02d}:00 - Setting prediction to 0 W/m²")
-                return 0.0
-            
-            # Rest of the existing prediction logic for daytime hours
+            # Get current day's data and conditions
             current_day = data[data['timestamp'].dt.date == target_date]
             if current_day.empty:
                 raise ValueError("No data available for target date")
@@ -1200,7 +1225,13 @@ class AutomatedPredictor:
             
             # Get clear sky radiation
             clear_sky = calculate_clear_sky_radiation(
-                next_hour, ADDU_LATITUDE, ADDU_LONGITUDE, target_date
+                hour=current_hour,
+                latitude=ADDU_LATITUDE,
+                longitude=ADDU_LONGITUDE,
+                date=target_date,
+                temperature=current_data['Average Temperature'],  # Using actual temperature
+                humidity=current_data['Average Humidity'],        # Using actual humidity
+                pressure=current_data['Average Barometer']        # Using actual pressure
             )
             
             # Get predictions from all available methods
@@ -1699,6 +1730,7 @@ class AutomatedPredictor:
                 trend = np.polyfit(x, data, 1)[0]
                 next_value = data[-1] + trend
                 return max(0, float(next_value))
+            
             return float(data[-1]) if len(data) > 0 else 0
                 
         except Exception as e:
@@ -2423,117 +2455,6 @@ class AutomatedPredictor:
             traceback.print_exc()
             return None
 
-    def train(self, data_path: str) -> bool:
-        """Train the model with historical data"""
-        try:
-            print("\nStarting model training...")
-            
-            # Load and preprocess data
-            hourly_data, minute_data, feature_averages = preprocess_data(data_path)
-            if hourly_data is None or minute_data is None:
-                raise ValueError("Failed to load and preprocess data")
-                
-            print(f"\nLoaded data shape: {hourly_data.shape}")
-            print(f"Date range: {hourly_data['timestamp'].min()} to {hourly_data['timestamp'].max()}")
-            
-            # Learn from historical data
-            print("\nLearning from historical data...")
-            self.learn_from_historical_data(hourly_data)
-            
-            # Verify training was successful
-            if not self.hourly_patterns or not any(len(patterns) > 0 for patterns in self.hourly_patterns.values()):
-                raise ValueError("Training failed to generate valid patterns")
-            
-            # Save trained model state
-            self.save_state()
-            
-            # Set trained flag
-            self._is_trained = True
-            
-            print("\nModel training completed successfully")
-            print(f"Model files saved in: {os.path.abspath(self.models_folder)}")
-            print(f"Training statistics saved in: {os.path.abspath(self.stats_folder)}")
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error during training: {str(e)}")
-            traceback.print_exc()
-            self._is_trained = False
-            return False
-
-    def predict_next(self, data_path: str, target_hour: Optional[int] = None) -> Dict[str, Any]:
-        """Make prediction for the next hour"""
-        try:
-            # Verify model state
-            if not hasattr(self, '_is_trained') or not self._is_trained:
-                raise ValueError("Model not trained")
-                
-            # Verify patterns exist and are valid
-            pattern_count = sum(len(patterns) for patterns in self.hourly_patterns.values())
-            if pattern_count == 0:
-                self._is_trained = False
-                raise ValueError("Model state invalid - no valid patterns found")
-                
-            # Load and preprocess latest data
-            hourly_data, _, _ = preprocess_data(data_path)
-            if hourly_data is None:
-                raise ValueError("Failed to load and preprocess data")
-                
-            # Get latest timestamp and conditions
-            latest_data = hourly_data.iloc[-1]
-            current_hour = latest_data['timestamp'].hour
-            current_date = latest_data['timestamp'].date()
-            
-            print(f"\nMaking prediction using data from:")
-            print(f"Date: {current_date}")
-            print(f"Current Hour: {current_hour:02d}:00")
-            print(f"Available patterns: {pattern_count}")
-            
-            # Get current conditions
-            conditions = {
-                'temperature': float(latest_data['Average Temperature']),
-                'humidity': float(latest_data['Average Humidity']),
-                'pressure': float(latest_data['Average Barometer']),
-                'uv': float(latest_data['UV Index'])
-            }
-            
-            print(f"Conditions: Temperature={conditions['temperature']:.1f}°C, Humidity={conditions['humidity']:.1f}%")
-            
-            # Make prediction for next hour
-            prediction = self.predict_next_hour(hourly_data, current_date, current_hour)
-            if prediction is None:
-                raise ValueError("Failed to generate prediction")
-                
-            # Calculate clear sky radiation
-            clear_sky = calculate_clear_sky_radiation(
-                current_hour, 
-                ADDU_LATITUDE, 
-                ADDU_LONGITUDE, 
-                current_date
-            )
-            
-            # Format results
-            result = {
-                'timestamp': latest_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
-                'current_hour': current_hour,
-                'target_hour': (current_hour + 1) % 24,
-                'predicted_value': float(prediction),
-                'conditions': conditions,
-                'confidence': self._calculate_prediction_confidence(
-                    prediction, 
-                    latest_data['Solar Rad - W/m^2'],
-                    clear_sky
-                )
-            }
-            
-            return result
-            
-        except Exception as e:
-            print(f"Error making prediction: {str(e)}")
-            traceback.print_exc()
-            return {}
-
 def save_results(results_df, plot_path, csv_path):
     """Save results with visualization"""
     try:
@@ -2604,88 +2525,80 @@ def save_results(results_df, plot_path, csv_path):
         print(f"Error in save_results: {str(e)}")
         traceback.print_exc()
 
-def parse_arguments() -> argparse.Namespace:
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(
-        description='Solar Radiation Prediction System',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    
-    parser.add_argument(
-        '--mode',
-        type=str,
-        choices=['train', 'predict'],
-        required=True,
-        help='Operation mode: train the model or make predictions'
-    )
-    
-    parser.add_argument(
-        '--data',
-        type=str,
-        required=True,
-        help='Path to the dataset CSV file'
-    )
-    
-    parser.add_argument(
-        '--output',
-        type=str,
-        default='predictions',
-        help='Output directory for predictions and model files'
-    )
-    
-    return parser.parse_args()
-
 def main():
-    """Main execution function"""
     try:
-        # Parse command line arguments
-        args = parse_arguments()
+        print("Starting automated solar radiation prediction system...")
         
-        # Create output directories
-        output_dir = Path(args.output)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Initialize predictor with error tracking
+        predictor = AutomatedPredictor()
+
+        # Load and preprocess data
+        hourly_data, minute_data, feature_averages = preprocess_data('dataset.csv')
+        if hourly_data is None or minute_data is None:
+            raise ValueError("Failed to load and preprocess data")
         
-        # Initialize predictor
-        predictor = AutomatedPredictor(data_folder=str(output_dir))
+        print(f"\nLoaded data shape: {hourly_data.shape}")
+        print(f"Date range: {hourly_data['timestamp'].min()} to {hourly_data['timestamp'].max()}")
         
-        if args.mode == 'train':
-            # Train mode
-            if not predictor.train(args.data):
-                raise RuntimeError("Training failed")
-            print("\nTraining completed successfully")
+        print("\nLearning from historical data...")
+        predictor.learn_from_historical_data(hourly_data)
+        
+        # Get all unique dates
+        dates = sorted(hourly_data['timestamp'].dt.date.unique())
+        print(f"\nProcessing {len(dates)} unique dates")
+        
+        total_predictions = 0
+        total_error = 0
+        
+        print("\nTesting predictions on historical data...")
+        for date_idx, date in enumerate(dates):
+            print(f"\nProcessing date {date} ({date_idx + 1}/{len(dates)})")
+            day_data = hourly_data[hourly_data['timestamp'].dt.date == date]
+            
+            for hour in range(23):  # Up to 23 to predict next hour
+                current_data = day_data[day_data['timestamp'].dt.hour == hour]
+                next_data = day_data[day_data['timestamp'].dt.hour == hour + 1]
                 
-        elif args.mode == 'predict':
-            # Try prediction first
-            result = predictor.predict_next(args.data)
-            
-            # If prediction fails, try training
-            if not result:
-                print("\nPrediction failed. Training model...")
-                if not predictor.train(args.data):
-                    raise RuntimeError("Training failed")
-                print("\nTraining completed successfully")
+                if current_data.empty or next_data.empty:
+                    print(f"Skipping hour {hour} - insufficient data")
+                    continue
                 
-                # Try prediction again
-                result = predictor.predict_next(args.data)
-                if not result:
-                    raise RuntimeError("Prediction failed after training")
+                # Make prediction for next hour
+                prediction = predictor.predict_next_hour(hourly_data, date, hour)
+                
+                if prediction is not None:
+                    actual = next_data['Solar Rad - W/m^2'].iloc[0]
+                    error = abs(actual - prediction)
+                    total_error += error
+                    total_predictions += 1
+                    
+                    # Update learning with actual value
+                    predictor.update_with_actual(date, hour + 1, actual)
             
-            # Save prediction results
-            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-            output_file = output_dir / f'prediction_{timestamp}.csv'
-            
-            pd.DataFrame([result]).to_csv(output_file, index=False)
-            print(f"\nPrediction Results:")
-            print(f"Current Hour: {result['current_hour']:02d}:00")
-            print(f"Target Hour: {result['target_hour']:02d}:00")
-            print(f"Predicted Value: {result['predicted_value']:.2f} W/m²")
-            print(f"Confidence: {result['confidence']:.2%}")
-            print(f"\nResults saved to: {output_file}")
+            # Print progress every 10 dates
+            if (date_idx + 1) % 10 == 0:
+                print(f"\nProcessed {date_idx + 1} dates")
+                print(f"Current prediction history size: {len(predictor.prediction_history)}")
+        
+        # Print overall performance
+        if total_predictions > 0:
+            avg_error = total_error / total_predictions
+            print(f"\nOverall Performance:")
+            print(f"Total predictions: {total_predictions}")
+            print(f"Average error: {avg_error:.2f} W/m²")
+            print(f"Final prediction history size: {len(predictor.prediction_history)}")
+        
+        # Generate final learning analysis
+        print("\nGenerating final learning analysis...")
+        predictor.analyze_learning_performance()
+        
+        # Print paths to analysis files
+        print("\nAnalysis files can be found in:")
+        print(f"Stats folder: {os.path.abspath(predictor.stats_folder)}")
             
     except Exception as e:
         print(f"Error in main: {str(e)}")
         traceback.print_exc()
-        sys.exit(1)
 
 if __name__ == "__main__":
     main()
