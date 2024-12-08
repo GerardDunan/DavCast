@@ -5,10 +5,11 @@ import seaborn as sns
 from scipy import stats
 import os
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 import traceback
 import pickle
 import json
+from pathlib import Path
 warnings.filterwarnings('ignore')
 
 # Constants
@@ -720,24 +721,10 @@ class FallbackPredictor:
 
 class AutomatedPredictor:
     def __init__(self, data_folder='predictions/'):
-        # Create all necessary folders
-        self.data_folder = data_folder
-        self.history_folder = os.path.join(data_folder, 'history')
-        self.models_folder = os.path.join(data_folder, 'models')
-        self.stats_folder = os.path.join(data_folder, 'learning_stats')  # Changed to learning_stats
+        # Initialize directories first
+        self._initialize_directories()
         
-        os.makedirs(self.data_folder, exist_ok=True)
-        os.makedirs(self.history_folder, exist_ok=True)
-        os.makedirs(self.models_folder, exist_ok=True)
-        os.makedirs(self.stats_folder, exist_ok=True)
-        
-        # Define file paths
-        self.patterns_file = os.path.join(self.models_folder, 'learned_patterns.pkl')
-        self.errors_file = os.path.join(self.history_folder, 'prediction_errors.csv')
-        self.stats_file = os.path.join(self.stats_folder, 'hourly_stats.json')
-        self.learning_state_file = os.path.join(self.models_folder, 'learning_state.pkl')
-        
-        # Initialize learning parameters
+        # Initialize other attributes
         self.hourly_patterns = {}
         self.seasonal_patterns = {}
         self.transition_patterns = {}
@@ -745,7 +732,7 @@ class AutomatedPredictor:
         self.error_learner = PredictionErrorLearner()
         self.consecutive_errors = []
         self.prediction_history = []
-        self.max_consecutive_errors = 10  # Keep last 10 errors
+        self.max_consecutive_errors = 10
         
         # Load previous state
         self.load_state()
@@ -815,7 +802,7 @@ class AutomatedPredictor:
         try:
             timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
             
-            # 1. Save learning state
+            # Save learning state
             learning_state = {
                 'hourly_patterns': self.hourly_patterns,
                 'seasonal_patterns': self.seasonal_patterns,
@@ -835,28 +822,15 @@ class AutomatedPredictor:
             with open(state_file, 'wb') as f:
                 pickle.dump(learning_state, f)
             
-            # Cleanup old learning states
-            self._cleanup_old_learning_states(max_states=5)  # Keep only 5 most recent states
-            
-            # 2. Save prediction history as CSV
+            # Save prediction history if exists
             if self.prediction_history:
                 history_df = pd.DataFrame(self.prediction_history)
-                # Aggregate by hour and save last 30 days
-                history_df['date'] = pd.to_datetime(history_df['date'])
-                cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=30)
-                history_df = history_df[history_df['date'] >= cutoff_date]
-                
-                history_file = os.path.join(
-                    self.history_folder, 
-                    f'prediction_history_{timestamp}.csv'
-                )
+                history_file = os.path.join(self.history_folder, f'prediction_history_{timestamp}.csv')
                 history_df.to_csv(history_file, index=False)
-            
-            # 3. Save hourly statistics
-            hourly_stats = self._get_compressed_stats()
-            stats_file = os.path.join(self.stats_folder, f'hourly_stats_{timestamp}.json')
-            with open(stats_file, 'w') as f:
-                json.dump(hourly_stats, f)
+                
+                # Also save latest version to stats folder
+                latest_history_file = os.path.join(self.stats_folder, 'latest_prediction_history.csv')
+                history_df.to_csv(latest_history_file, index=False)
             
             print(f"\nSaved learning state and history at {timestamp}")
             
@@ -936,31 +910,47 @@ class AutomatedPredictor:
         """Load previous learning state and history"""
         try:
             if os.path.exists(self.learning_state_file):
+                print(f"Loading learning state from: {self.learning_state_file}")
                 with open(self.learning_state_file, 'rb') as f:
                     state = pickle.load(f)
-                    self.hourly_patterns = state['hourly_patterns']
-                    self.seasonal_patterns = state['seasonal_patterns']
-                    self.transition_patterns = state['transition_patterns']
-                    self.weather_impacts = state['weather_impacts']
-                    self.consecutive_errors = state['consecutive_errors']
+                    self.hourly_patterns = state.get('hourly_patterns', {})
+                    self.seasonal_patterns = state.get('seasonal_patterns', {})
+                    self.transition_patterns = state.get('transition_patterns', {})
+                    self.weather_impacts = state.get('weather_impacts', {})
+                    self.consecutive_errors = state.get('consecutive_errors', [])
                     
                     # Restore error learner state
-                    error_state = state['error_learner_state']
-                    self.error_learner.error_history = error_state['error_history']
-                    self.error_learner.adjustment_factors = error_state['adjustment_factors']
-                    self.error_learner.pattern_adjustments = error_state['pattern_adjustments']
+                    error_state = state.get('error_learner_state', {})
+                    self.error_learner.error_history = error_state.get('error_history', {})
+                    self.error_learner.adjustment_factors = error_state.get('adjustment_factors', {})
+                    self.error_learner.pattern_adjustments = error_state.get('pattern_adjustments', {})
                 
-                # Load prediction history
+                # Load prediction history if exists
                 if os.path.exists(self.errors_file):
+                    print(f"Loading prediction history from: {self.errors_file}")
                     self.prediction_history = pd.read_csv(self.errors_file).to_dict('records')
                 
-                print("Loaded previous learning state")
+                print("Successfully loaded previous learning state")
             else:
                 print("No previous learning state found - starting fresh")
+                # Initialize empty state
+                self.hourly_patterns = {}
+                self.seasonal_patterns = {}
+                self.transition_patterns = {}
+                self.weather_impacts = {}
+                self.consecutive_errors = []
+                self.prediction_history = []
                 
         except Exception as e:
             print(f"Error loading state: {str(e)}")
             print("Starting with fresh learning state")
+            # Initialize empty state on error
+            self.hourly_patterns = {}
+            self.seasonal_patterns = {}
+            self.transition_patterns = {}
+            self.weather_impacts = {}
+            self.consecutive_errors = []
+            self.prediction_history = []
 
     def update_with_actual(self, date, hour, actual_value):
         """Update learning with actual value and evaluate model"""
@@ -1657,16 +1647,60 @@ class AutomatedPredictor:
             return 0.5  # Return moderate confidence on error
 
     def _save_prediction_history(self):
-        """Save prediction history to CSV"""
+        """Save prediction history to CSV with enhanced saving"""
         try:
             if self.prediction_history:
                 timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-                history_file = os.path.join(self.history_folder, f'prediction_history_{timestamp}.csv')
                 
-                # Convert to DataFrame and save
+                # Save to history folder
+                history_file = os.path.join(self.history_folder, f'prediction_history_{timestamp}.csv')
                 history_df = pd.DataFrame(self.prediction_history)
                 history_df.to_csv(history_file, index=False)
                 print(f"\nSaved prediction history to: {history_file}")
+                
+                # Save to data folder
+                data_file = os.path.join(self.data_folder, 'latest_predictions.csv')
+                history_df.to_csv(data_file, index=False)
+                print(f"Saved latest predictions to: {data_file}")
+                
+                # Save detailed data to reports folder
+                report_file = os.path.join(self.reports_folder, f'detailed_predictions_{timestamp}.csv')
+                
+                # Add additional analysis columns
+                history_df['timestamp'] = pd.to_datetime(history_df['date'])
+                history_df['hour_of_day'] = history_df['hour']
+                history_df['prediction_accuracy'] = 100 - abs(history_df['error_percentage'])
+                
+                # Save detailed report
+                history_df.to_csv(report_file, index=False)
+                print(f"Saved detailed prediction report to: {report_file}")
+                
+                # Generate and save summary report
+                summary_file = os.path.join(self.reports_folder, f'prediction_summary_{timestamp}.txt')
+                with open(summary_file, 'w') as f:
+                    f.write("=== Prediction Summary ===\n\n")
+                    f.write(f"Generated: {timestamp}\n")
+                    f.write(f"Total Predictions: {len(history_df)}\n")
+                    f.write(f"Date Range: {history_df['timestamp'].min()} to {history_df['timestamp'].max()}\n\n")
+                    
+                    # Add hourly statistics
+                    f.write("Hourly Performance:\n")
+                    hourly_stats = history_df.groupby('hour').agg({
+                        'error': ['mean', 'std'],
+                        'error_percentage': 'mean',
+                        'prediction_accuracy': 'mean'
+                    }).round(2)
+                    
+                    for hour in range(24):
+                        if hour in hourly_stats.index:
+                            stats = hourly_stats.loc[hour]
+                            f.write(f"\nHour {hour:02d}:00\n")
+                            f.write(f"  Mean Error: {stats[('error', 'mean')]:.2f} W/m²\n")
+                            f.write(f"  Error Std: {stats[('error', 'std')]:.2f} W/m²\n")
+                            f.write(f"  Mean Error %: {stats[('error_percentage', 'mean')]:.2f}%\n")
+                            f.write(f"  Accuracy: {stats[('prediction_accuracy', 'mean')]:.2f}%\n")
+                
+                print(f"Saved prediction summary to: {summary_file}")
                 
         except Exception as e:
             print(f"Error saving prediction history: {str(e)}")
@@ -2307,7 +2341,7 @@ class AutomatedPredictor:
             if actual is not None:
                 prediction_record['actual'] = actual
                 prediction_record['error'] = actual - predicted
-                prediction_record['error_percentage'] = (prediction_record['error'] / actual *100) if actual !=0 else 0
+                prediction_record['error_percentage'] = (prediction_record['error'] / actual * 100 if actual != 0 else 0)
             
             self.prediction_history.append(prediction_record)
             
@@ -2662,13 +2696,444 @@ class AutomatedPredictor:
             traceback.print_exc()
             return None
 
+    def generate_detailed_learning_report(self, report_period='all'):
+        """Generate comprehensive learning report with enhanced saving"""
+        try:
+            # Add validation for report_period
+            valid_periods = ['all', 'day', 'week', 'month']
+            if report_period not in valid_periods:
+                raise ValueError(f"Invalid report period. Must be one of {valid_periods}")
+
+            # Add check for minimum data requirements
+            if len(self.prediction_history) < 24:
+                print("Warning: Limited data available for analysis (less than 24 predictions)")
+
+            if not self.prediction_history:
+                print("No prediction history available for analysis")
+                return
+
+            # Convert history to DataFrame
+            history_df = pd.DataFrame(self.prediction_history)
+            history_df['date'] = pd.to_datetime(history_df['date'])
+
+            # Filter data based on report period
+            if report_period != 'all':
+                cutoff_date = pd.Timestamp.now()
+                if report_period == 'day':
+                    cutoff_date -= timedelta(days=1)
+                elif report_period == 'week':
+                    cutoff_date -= timedelta(days=7)
+                elif report_period == 'month':
+                    cutoff_date -= timedelta(days=30)
+                history_df = history_df[history_df['date'] >= cutoff_date]
+
+            # Create report directory with timestamp and period
+            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            report_name = f'learning_report_{report_period}_{timestamp}'
+            report_dir = Path(self.reports_folder) / report_name
+            report_dir.mkdir(parents=True, exist_ok=True)
+            print(f"\nCreating report directory: {report_dir}")
+
+            # Save data files
+            history_df = pd.DataFrame(self.prediction_history)
+            
+            # Save raw data
+            data_file = report_dir / 'prediction_data.csv'
+            history_df.to_csv(data_file, index=False)
+            print(f"Saved prediction data to: {data_file}")
+            
+            # Save processed data with additional metrics
+            processed_df = history_df.copy()
+            processed_df['timestamp'] = pd.to_datetime(processed_df['date'])
+            processed_df['hour_of_day'] = processed_df['hour']
+            processed_df['prediction_accuracy'] = 100 - abs(processed_df['error_percentage'])
+            
+            processed_file = report_dir / 'processed_data.csv'
+            processed_df.to_csv(processed_file, index=False)
+            print(f"Saved processed data to: {processed_file}")
+
+            # Generate main report file
+            report_path = report_dir / 'detailed_report.txt'
+            print(f"Generating report file: {report_path}")
+
+            # Open and write to the report file
+            with open(report_path, 'w') as f:
+                f.write(f"=== Detailed Learning Report ({report_period}) ===\n")
+                f.write(f"Generated: {pd.Timestamp.now()}\n\n")
+                
+                # Overall Statistics
+                f.write("1. Overall Performance Metrics\n")
+                f.write("============================\n")
+                self._write_overall_metrics(f, history_df)
+
+                # Hourly Performance
+                f.write("\n2. Hourly Performance Analysis\n")
+                f.write("============================\n")
+                self._write_hourly_analysis(f, history_df)
+
+                # Weather Impact Analysis
+                f.write("\n3. Weather Impact Analysis\n")
+                f.write("========================\n")
+                self._write_weather_analysis(f, history_df)
+
+                # Learning Progress
+                f.write("\n4. Learning Progress Analysis\n")
+                f.write("==========================\n")
+                self._write_learning_progress(f, history_df)
+
+                # Error Pattern Analysis
+                f.write("\n5. Error Pattern Analysis\n")
+                f.write("=======================\n")
+                self._write_error_patterns(f, history_df)
+
+            # Generate JSON metrics file
+            metrics_path = report_dir / 'performance_metrics.json'
+            self._save_performance_metrics(metrics_path, history_df)
+
+            # Generate visualizations
+            self._generate_performance_plots(report_dir, history_df)
+
+            print(f"\nDetailed learning report generated at: {report_dir}")
+
+            # Print confirmation of saved files
+            print(f"\nReport files saved:")
+            print(f"Main report: {report_path}")
+            print(f"Metrics: {report_dir / 'performance_metrics.json'}")
+            print(f"Plots: {report_dir}")
+
+            # Create a ZIP archive of the report directory
+            import shutil
+            zip_path = Path(self.reports_folder) / f'{report_name}.zip'
+            shutil.make_archive(str(zip_path.with_suffix('')), 'zip', report_dir)
+            print(f"\nCreated ZIP archive of report: {zip_path}")
+
+            return report_dir
+
+        except Exception as e:
+            print(f"Error generating detailed report: {str(e)}")
+            traceback.print_exc()
+
+    def _write_overall_metrics(self, f, history_df):
+        """Write overall performance metrics to report"""
+        try:
+            # Basic metrics
+            metrics = {
+                'Total Predictions': len(history_df),
+                'Mean Absolute Error': history_df['error'].abs().mean(),
+                'RMSE': np.sqrt((history_df['error'] ** 2).mean()),
+                'Mean Absolute Percentage Error': history_df['error_percentage'].abs().mean(),
+                'Bias (Mean Error)': history_df['error'].mean(),
+                'Error Standard Deviation': history_df['error'].std()
+            }
+
+            # Write metrics
+            for metric, value in metrics.items():
+                f.write(f"{metric}: {value:.2f}\n")
+
+            # Prediction accuracy bands
+            accuracy_bands = {
+                '< 5%': (history_df['error_percentage'].abs() < 5).mean() * 100,
+                '5-10%': ((history_df['error_percentage'].abs() >= 5) & 
+                          (history_df['error_percentage'].abs() < 10)).mean() * 100,
+                '10-20%': ((history_df['error_percentage'].abs() >= 10) & 
+                           (history_df['error_percentage'].abs() < 20)).mean() * 100,
+                '> 20%': (history_df['error_percentage'].abs() >= 20).mean() * 100
+            }
+
+            f.write("\nPrediction Accuracy Bands:\n")
+            for band, percentage in accuracy_bands.items():
+                f.write(f"  {band}: {percentage:.1f}%\n")
+
+        except Exception as e:
+            f.write(f"\nError calculating overall metrics: {str(e)}\n")
+
+    def _write_hourly_analysis(self, f, history_df):
+        """Write detailed hourly performance analysis"""
+        try:
+            hourly_stats = history_df.groupby('hour').agg({
+                'error': ['mean', 'std', 'count'],
+                'error_percentage': ['mean', 'std'],
+                'predicted': ['mean', 'min', 'max'],
+                'actual': ['mean', 'min', 'max']
+            }).round(2)
+
+            f.write("\nHourly Performance Breakdown:\n")
+            for hour in range(24):
+                if hour in hourly_stats.index:
+                    stats = hourly_stats.loc[hour]
+                    f.write(f"\nHour {hour:02d}:00\n")
+                    f.write(f"  Predictions: {stats[('error', 'count')]:.0f}\n")
+                    f.write(f"  Mean Error: {stats[('error', 'mean')]:.2f} W/m²\n")
+                    f.write(f"  Error Std: {stats[('error', 'std')]:.2f} W/m²\n")
+                    f.write(f"  Mean % Error: {stats[('error_percentage', 'mean')]:.2f}%\n")
+                    f.write(f"  Prediction Range: [{stats[('predicted', 'min')]:.0f}, {stats[('predicted', 'max')]:.0f}] W/m²\n")
+                    f.write(f"  Actual Range: [{stats[('actual', 'min')]:.0f}, {stats[('actual', 'max')]:.0f}] W/m²\n")
+
+        except Exception as e:
+            f.write(f"\nError in hourly analysis: {str(e)}\n")
+
+    def _write_weather_analysis(self, f, history_df):
+        """Analyze and write weather condition impacts"""
+        try:
+            # Convert conditions from string to dict if needed
+            if 'conditions' in history_df.columns:
+                conditions_df = pd.DataFrame([
+                    eval(cond) if isinstance(cond, str) else cond 
+                    for cond in history_df['conditions']
+                ])
+                
+                # Analyze each weather parameter
+                for param in ['temperature', 'humidity', 'pressure', 'uv']:
+                    if param in conditions_df.columns:
+                        f.write(f"\n{param.capitalize()} Impact Analysis:\n")
+                        
+                        # Create bins for the parameter
+                        bins = pd.qcut(conditions_df[param], q=5)
+                        impact_analysis = history_df.groupby(bins)['error_percentage'].agg([
+                            'mean', 'std', 'count'
+                        ]).round(2)
+                        
+                        for bin_range, stats in impact_analysis.iterrows():
+                            f.write(f"\n  Range {bin_range}:\n")
+                            f.write(f"    Count: {stats['count']:.0f}\n")
+                            f.write(f"    Mean Error %: {stats['mean']:.2f}%\n")
+                            f.write(f"    Error Std %: {stats['std']:.2f}%\n")
+
+            # Add correlation analysis
+            f.write("\nWeather Parameter Correlations:\n")
+            for param in ['temperature', 'humidity', 'pressure', 'uv']:
+                if param in conditions_df.columns:
+                    correlation = np.corrcoef(
+                        conditions_df[param], 
+                        history_df['error_percentage']
+                    )[0,1]
+                    f.write(f"{param.capitalize()} correlation with error: {correlation:.3f}\n")
+
+        except Exception as e:
+            f.write(f"\nError in weather analysis: {str(e)}\n")
+
+    def _write_learning_progress(self, f, history_df):
+        """Analyze and write learning progress over time"""
+        try:
+            # Calculate rolling metrics
+            window_sizes = [24, 72, 168]  # 1 day, 3 days, 1 week
+            
+            f.write("\nLearning Progress Analysis:\n")
+            for window in window_sizes:
+                rolling_mae = history_df['error'].abs().rolling(window).mean()
+                rolling_mape = history_df['error_percentage'].abs().rolling(window).mean()
+                
+                f.write(f"\n{window}-hour Rolling Window:\n")
+                f.write(f"  Initial MAE: {rolling_mae.iloc[window]:.2f} W/m²\n")
+                f.write(f"  Final MAE: {rolling_mae.iloc[-1]:.2f} W/m²\n")
+                f.write(f"  Initial MAPE: {rolling_mape.iloc[window]:.2f}%\n")
+                f.write(f"  Final MAPE: {rolling_mape.iloc[-1]:.2f}%\n")
+                
+                # Calculate improvement
+                mae_improvement = ((rolling_mae.iloc[window] - rolling_mae.iloc[-1]) / 
+                                 rolling_mae.iloc[window] * 100)
+                f.write(f"  MAE Improvement: {mae_improvement:.1f}%\n")
+
+        except Exception as e:
+            f.write(f"\nError in learning progress analysis: {str(e)}\n")
+
+    def _write_error_patterns(self, f, history_df):
+        """Analyze and write error patterns"""
+        try:
+            f.write("\nError Pattern Analysis:\n")
+
+            # Analyze consecutive errors
+            history_df['error_direction'] = np.sign(history_df['error'])
+            consecutive_errors = (history_df['error_direction'] != 
+                                history_df['error_direction'].shift()).cumsum()
+            error_runs = history_df.groupby(consecutive_errors)['error_direction'].agg(['count', 'first'])
+            
+            f.write("\nConsecutive Error Patterns:\n")
+            f.write("  Over-predictions (>3 consecutive):\n")
+            over_runs = error_runs[
+                (error_runs['first'] < 0) & (error_runs['count'] > 3)
+            ]['count'].value_counts()
+            for length, count in over_runs.items():
+                f.write(f"    {length} consecutive: {count} occurrences\n")
+                
+            f.write("\n  Under-predictions (>3 consecutive):\n")
+            under_runs = error_runs[
+                (error_runs['first'] > 0) & (error_runs['count'] > 3)
+            ]['count'].value_counts()
+            for length, count in under_runs.items():
+                f.write(f"    {length} consecutive: {count} occurrences\n")
+
+        except Exception as e:
+            f.write(f"\nError in error pattern analysis: {str(e)}\n")
+
+    def _save_performance_metrics(self, metrics_path, history_df):
+        try:
+            metrics = {
+                'metadata': {
+                    'generated_at': str(pd.Timestamp.now()),
+                    'version': '1.0',
+                    'data_points': len(history_df),
+                    'date_range': {
+                        'start': str(history_df['date'].min()),
+                        'end': str(history_df['date'].max())
+                    }
+                },
+                'overall': {
+                    'total_predictions': len(history_df),
+                    'mae': float(history_df['error'].abs().mean()),
+                    'rmse': float(np.sqrt((history_df['error'] ** 2).mean())),
+                    'mape': float(history_df['error_percentage'].abs().mean()),
+                    'bias': float(history_df['error'].mean())
+                },
+                'hourly': {
+                    str(hour): {
+                        'mae': float(hour_data['error'].abs().mean()),
+                        'mape': float(hour_data['error_percentage'].abs().mean()),
+                        'count': int(len(hour_data))
+                    }
+                    for hour, hour_data in history_df.groupby('hour')
+                },
+                'learning_progress': {
+                    'initial_mae': float(history_df['error'].abs().iloc[:24].mean()),
+                    'final_mae': float(history_df['error'].abs().iloc[-24:].mean()),
+                    'improvement_percentage': float(
+                        (history_df['error'].abs().iloc[:24].mean() - 
+                         history_df['error'].abs().iloc[-24:].mean()) / 
+                        history_df['error'].abs().iloc[:24].mean() * 100
+                    )
+                }
+            }
+
+            with open(metrics_path, 'w') as f:
+                json.dump(metrics, f, indent=2)
+
+        except Exception as e:
+            print(f"Error saving performance metrics: {str(e)}")
+
+    def _generate_performance_plots(self, report_dir, history_df):
+        try:
+            plot_files = []
+            
+            # Error Distribution
+            plot_path = report_dir / 'error_distribution.png'
+            plt.figure(figsize=(10, 6))
+            sns.histplot(data=history_df, x='error_percentage', bins=50)
+            plt.title('Error Distribution')
+            plt.xlabel('Error Percentage')
+            plt.savefig(plot_path)
+            plt.close()
+            plot_files.append(plot_path)
+            print(f"Saved plot: {plot_path}")
+            
+            # Learning Progress
+            plt.figure(figsize=(10, 6))
+            history_df['rolling_mae'] = history_df['error'].abs().rolling(24).mean()
+            plt.plot(history_df.index, history_df['rolling_mae'])
+            plt.title('Learning Progress (24-hour Rolling MAE)')
+            plt.ylabel('Mean Absolute Error (W/m²)')
+            plt.savefig(report_dir / 'learning_progress.png')
+            plt.close()
+            plot_files.append(report_dir / 'learning_progress.png')
+            print(f"Saved plot: {report_dir / 'learning_progress.png'}")
+            
+            # Hourly Performance Heatmap
+            plt.figure(figsize=(12, 8))
+            hourly_errors = history_df.pivot_table(
+                values='error_percentage', 
+                index=history_df['date'].dt.date,
+                columns='hour',
+                aggfunc='mean'
+            )
+            sns.heatmap(hourly_errors, cmap='RdYlBu_r')
+            plt.title('Hourly Error Patterns')
+            plt.savefig(report_dir / 'hourly_heatmap.png')
+            plt.close()
+            plot_files.append(report_dir / 'hourly_heatmap.png')
+            print(f"Saved plot: {report_dir / 'hourly_heatmap.png'}")
+            
+            # Prediction vs Actual Scatter
+            plt.figure(figsize=(10, 10))
+            plt.scatter(history_df['actual'], history_df['predicted'], alpha=0.5)
+            plt.plot([0, history_df['actual'].max()], [0, history_df['actual'].max()], 'r--')
+            plt.title('Predicted vs Actual Values')
+            plt.xlabel('Actual (W/m²)')
+            plt.ylabel('Predicted (W/m²)')
+            plt.savefig(report_dir / 'prediction_scatter.png')
+            plt.close()
+            plot_files.append(report_dir / 'prediction_scatter.png')
+            print(f"Saved plot: {report_dir / 'prediction_scatter.png'}")
+            
+            # Add new plot: Error trends by hour
+            plt.figure(figsize=(12, 6))
+            hourly_mean_error = history_df.groupby('hour')['error_percentage'].mean()
+            hourly_std_error = history_df.groupby('hour')['error_percentage'].std()
+            plt.errorbar(hourly_mean_error.index, hourly_mean_error, 
+                        yerr=hourly_std_error, capsize=5)
+            plt.title('Mean Error by Hour')
+            plt.xlabel('Hour of Day')
+            plt.ylabel('Mean Error Percentage')
+            plt.grid(True)
+            plt.savefig(report_dir / 'hourly_error_trends.png')
+            plt.close()
+            plot_files.append(report_dir / 'hourly_error_trends.png')
+            print(f"Saved plot: {report_dir / 'hourly_error_trends.png'}")
+            
+            print(f"\nGenerated plots saved to: {report_dir}")
+            print("Plot files created:")
+            for plot_file in plot_files:
+                print(f"- {plot_file}")
+
+        except Exception as e:
+            print(f"Error generating performance plots: {str(e)}")
+            traceback.print_exc()
+
+    def _initialize_directories(self):
+        """Initialize all required directories and file paths for saving reports and data"""
+        try:
+            # Create base directories with absolute paths
+            self.base_dir = os.path.abspath(os.path.join(os.getcwd(), 'predictions'))
+            self.data_folder = os.path.join(self.base_dir, 'data')
+            self.stats_folder = os.path.join(self.base_dir, 'stats')
+            self.reports_folder = os.path.join(self.base_dir, 'reports')
+            self.models_folder = os.path.join(self.base_dir, 'models')
+            self.history_folder = os.path.join(self.base_dir, 'history')  # Add history folder
+
+            # Initialize file paths
+            self.learning_state_file = os.path.join(self.models_folder, 'learning_state.pkl')
+            self.patterns_file = os.path.join(self.models_folder, 'learned_patterns.pkl')
+            self.errors_file = os.path.join(self.stats_folder, 'prediction_errors.csv')
+            self.stats_file = os.path.join(self.stats_folder, 'hourly_stats.json')
+
+            # Create all directories
+            for directory in [self.base_dir, self.data_folder, self.stats_folder, 
+                             self.reports_folder, self.models_folder, self.history_folder]:  # Add history_folder
+                os.makedirs(directory, exist_ok=True)
+                print(f"Directory created/verified: {directory}")
+
+            print("\nInitialized file paths:")
+            print(f"Learning state: {self.learning_state_file}")
+            print(f"Patterns file: {self.patterns_file}")
+            print(f"Errors file: {self.errors_file}")
+            print(f"Stats file: {self.stats_file}")
+            print(f"History folder: {self.history_folder}")  # Add print statement
+
+        except Exception as e:
+            print(f"Error initializing directories: {str(e)}")
+            traceback.print_exc()
+
 def main():
     try:
         print("Starting automated solar radiation prediction system...")
         
         # Initialize predictor with error tracking
         predictor = AutomatedPredictor()
-
+        print("\nInitialized directory structure:")
+        print(f"Base directory: {predictor.base_dir}")
+        print(f"Data folder: {predictor.data_folder}")
+        print(f"Stats folder: {predictor.stats_folder}")
+        print(f"Reports folder: {predictor.reports_folder}")
+        print(f"Models folder: {predictor.models_folder}")
+        
         # Load and preprocess data
         hourly_data, minute_data, feature_averages = preprocess_data('dataset.csv')
         if hourly_data is None or minute_data is None:
@@ -2688,11 +3153,14 @@ def main():
         total_error = 0
         
         print("\nTesting predictions on historical data...")
+        batch_size = 24  # Process in 24-hour batches
+        current_batch = []
+        
         for date_idx, date in enumerate(dates):
             print(f"\nProcessing date {date} ({date_idx + 1}/{len(dates)})")
             day_data = hourly_data[hourly_data['timestamp'].dt.date == date]
             
-            for hour in range(23):  # Up to 23 to predict next hour
+            for hour in range(23):
                 current_data = day_data[day_data['timestamp'].dt.hour == hour]
                 next_data = day_data[day_data['timestamp'].dt.hour == hour + 1]
                 
@@ -2711,26 +3179,59 @@ def main():
                     
                     # Update learning with actual value
                     predictor.update_with_actual(date, hour + 1, actual)
+                    
+                    # Add to current batch
+                    current_batch.append({
+                        'date': date,
+                        'hour': hour + 1,
+                        'predicted': prediction,
+                        'actual': actual,
+                        'error': error,
+                        'error_percentage': (error/actual * 100) if actual != 0 else 0
+                    })
+                    
+                    # Save batch when it reaches batch_size
+                    if len(current_batch) >= batch_size:
+                        batch_df = pd.DataFrame(current_batch)
+                        batch_file = os.path.join(
+                            predictor.data_folder,
+                            f'prediction_batch_{date}_{hour:02d}.csv'
+                        )
+                        batch_df.to_csv(batch_file, index=False)
+                        current_batch = []
             
-            # Print progress every 10 dates
-            if (date_idx + 1) % 10 == 0:
-                print(f"\nProcessed {date_idx + 1} dates")
-                print(f"Current prediction history size: {len(predictor.prediction_history)}")
+            # Generate daily report
+            if (date_idx + 1) % 7 == 0:  # Generate report every week
+                predictor.generate_detailed_learning_report('week')
+        
+        # Save any remaining batch data
+        if current_batch:
+            batch_df = pd.DataFrame(current_batch)
+            batch_file = os.path.join(
+                predictor.data_folder,
+                f'prediction_batch_final.csv'
+            )
+            batch_df.to_csv(batch_file, index=False)
         
         # Print overall performance
         if total_predictions > 0:
             avg_error = total_error / total_predictions
             print(f"\nOverall Performance:")
             print(f"Total predictions: {total_predictions}")
-            print(f"Average error: {avg_error:.2f} W/m��")
-            print(f"Final prediction history size: {len(predictor.prediction_history)}")
+            print(f"Average error: {avg_error:.2f} W/m²")
         
         # Generate final learning analysis
         print("\nGenerating final learning analysis...")
         predictor.analyze_learning_performance()
         
-        # Print paths to analysis files
-        print("\nAnalysis files can be found in:")
+        # Generate reports for different time periods
+        print("\nGenerating learning reports...")
+        for period in ['day', 'week', 'month', 'all']:
+            report_dir = predictor.generate_detailed_learning_report(period)
+            print(f"\nReport for {period} generated at:")
+            print(f"- {report_dir}")
+        
+        print("\nAnalysis complete. Reports generated in:")
         print(f"Stats folder: {os.path.abspath(predictor.stats_folder)}")
             
     except Exception as e:
