@@ -15,69 +15,6 @@ warnings.filterwarnings('ignore')
 ADDU_LATITUDE = 7.0711
 ADDU_LONGITUDE = 125.6134
 
-class AdaptiveLearningController:
-    def __init__(self):
-        self.base_learning_rate = 0.2
-        self.current_learning_rate = 0.2
-        self.error_window = []
-        self.max_window_size = 100
-        self.adaptation_threshold = 20
-        self.learning_states = {
-            'normal': {'rate': 0.2, 'window': 100},
-            'adaptive': {'rate': 0.4, 'window': 50},
-            'aggressive': {'rate': 0.6, 'window': 25}
-        }
-        self.current_state = 'normal'
-
-    def update_learning_rate(self, error_percentage):
-        self.error_window.append(abs(error_percentage))
-        if len(self.error_window) > self.max_window_size:
-            self.error_window.pop(0)
-        avg_error = np.mean(self.error_window[-10:])
-        
-        if avg_error > self.adaptation_threshold * 1.5:
-            self.current_state = 'aggressive'
-        elif avg_error > self.adaptation_threshold:
-            self.current_state = 'adaptive'
-        else:
-            self.current_state = 'normal'
-            
-        self.current_learning_rate = self.learning_states[self.current_state]['rate']
-        return self.current_learning_rate
-
-class EnsemblePredictor:
-    def __init__(self):
-        self.methods = {
-            'main_model': {'weight': 0.4, 'error_history': []},
-            'moving_avg': {'weight': 0.3, 'error_history': []},
-            'clear_sky': {'weight': 0.2, 'error_history': []},
-            'pattern_based': {'weight': 0.1, 'error_history': []}
-        }
-        self.confidence_window = 24
-
-    def update_weights(self, method_errors):
-        total_weight = 0
-        for method, error in method_errors.items():
-            if method in self.methods:
-                self.methods[method]['error_history'].append(error)
-                if len(self.methods[method]['error_history']) > self.confidence_window:
-                    self.methods[method]['error_history'].pop(0)
-                recent_errors = np.array(self.methods[method]['error_history'][-self.confidence_window:])
-                accuracy = 1 / (np.mean(np.abs(recent_errors)) + 1e-8)
-                self.methods[method]['weight'] = accuracy
-                total_weight += accuracy
-        
-        if total_weight > 0:
-            for method in self.methods:
-                self.methods[method]['weight'] /= total_weight
-
-    def get_ensemble_prediction(self, predictions):
-        ensemble_pred = 0
-        for method, pred in predictions.items():
-            if method in self.methods:
-                ensemble_pred += pred * self.methods[method]['weight']
-        return ensemble_pred
-
 class WeatherConditionAnalyzer:
     def __init__(self):
         self.condition_impacts = {}
@@ -329,21 +266,13 @@ def calculate_clear_sky_radiation(hour, latitude, longitude, date, temperature=2
         # 14. Final validation
         clear_sky = float(np.clip(clear_sky, 0, 1200))  # Cap at 1200 W/m²
         
-        # 15. Debug information for high values
-        if clear_sky > 800:
-            print(f"\nHigh radiation value detected ({clear_sky:.2f} W/m²):")
-            print(f"Hour: {hour}, Zenith: {np.degrees(zenith):.1f}°")
-            print(f"Direct: {direct:.2f}, Diffuse: {diffuse:.2f}")
-            print(f"Transmittances - Rayleigh: {tau_r:.3f}, Ozone: {tau_o:.3f}, "
-                  f"Water: {tau_w:.3f}, Aerosol: {tau_a:.3f}")
-        
         return clear_sky
         
     except Exception as e:
         print(f"Error in calculate_clear_sky_radiation: {str(e)}")
         traceback.print_exc()
         return 0.0    
-
+    
 class PredictionErrorLearner:
     def __init__(self):
         self.error_history = {}
@@ -554,43 +483,6 @@ class ErrorPatternAnalyzer:
             print(f"Error analyzing condition impact: {str(e)}")
             return {}
 
-class SuccessTracker:
-    def __init__(self):
-        self.success_threshold = 10  # Error percentage threshold for "successful" predictions
-        self.successful_predictions = []
-        self.success_patterns = {}
-
-    def record_prediction(self, prediction_data):
-        try:
-            if abs(prediction_data['error_percentage']) <= self.success_threshold:
-                success_record = {
-                    'date': prediction_data['date'],
-                    'hour': prediction_data['hour'],
-                    'predicted': prediction_data['predicted'],
-                    'actual': prediction_data['actual'],
-                    'error_percentage': prediction_data['error_percentage'],
-                    'conditions': prediction_data['conditions']
-                }
-                self.successful_predictions.append(success_record)
-                self._update_success_patterns(success_record)
-
-        except Exception as e:
-            print(f"Error recording successful prediction: {str(e)}")
-
-    def _update_success_patterns(self, success_record):
-        try:
-            hour = success_record['hour']
-            if hour not in self.success_patterns:
-                self.success_patterns[hour] = {
-                    'count': 0,
-                    'conditions': []
-                }
-            self.success_patterns[hour]['count'] += 1
-            self.success_patterns[hour]['conditions'].append(success_record['conditions'])
-
-        except Exception as e:
-            print(f"Error updating success patterns: {str(e)}")
-
 class FallbackPredictor:
     def __init__(self):
         self.fallback_methods = {
@@ -717,11 +609,8 @@ class AutomatedPredictor:
         self.load_best_model()
         
         # Add new components
-        self.adaptive_learning = AdaptiveLearningController()
-        self.ensemble_predictor = EnsemblePredictor()
         self.weather_analyzer = WeatherConditionAnalyzer()
         self.error_analyzer = ErrorPatternAnalyzer()
-        self.success_tracker = SuccessTracker()
         self.fallback_predictor = FallbackPredictor()
         
         # Add method performance tracking
@@ -2454,76 +2343,6 @@ class AutomatedPredictor:
             print(f"Error in _get_hour_statistics: {str(e)}")
             traceback.print_exc()
             return None
-
-def save_results(results_df, plot_path, csv_path):
-    """Save results with visualization"""
-    try:
-        # Save to CSV
-        results_df.to_csv(csv_path, index=False)
-        print(f"\nSaved predictions to {csv_path}")
-        
-        # Create plot
-        plt.figure(figsize=(12, 6))
-        
-        # Ensure values are finite before plotting
-        hour_data = results_df['Hour'].values
-        pred_data = results_df['Predicted Solar Radiation (W/m²)'].values
-        
-        # Replace any non-finite values with 0
-        pred_data = np.nan_to_num(pred_data, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # Plot predictions
-        plt.plot(hour_data, pred_data, 
-                marker='o', linestyle='-', linewidth=2, label='Predicted',
-                color='blue')
-        
-        # Plot actual values where available
-        actual_mask = results_df['Actual'].notna()
-        if actual_mask.any():
-            actual_data = results_df.loc[actual_mask, 'Actual'].values
-            # Replace any non-finite values with 0
-            actual_data = np.nan_to_num(actual_data, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            plt.plot(results_df.loc[actual_mask, 'Hour'], 
-                    actual_data,
-                    marker='s', linestyle='--', linewidth=2, label='Actual',
-                    color='green')
-        
-        plt.title('Solar Radiation Predictions vs Actual Values')
-        plt.xlabel('Hour of Day')
-        plt.ylabel('Solar Radiation (W/m²)')
-        plt.grid(True)
-        plt.xticks(range(24))
-        plt.ylim(bottom=0)
-        plt.legend()
-        
-        # Add value annotations with validation
-        for idx, row in results_df.iterrows():
-            pred_val = row['Predicted']
-            if np.isfinite(pred_val):
-                plt.annotate(f"{pred_val:.0f}", 
-                            (row['Hour'], pred_val),
-                            textcoords="offset points", 
-                            xytext=(0,10), 
-                            ha='center')
-            if pd.notna(row['Actual']):
-                actual_val = row['Actual']
-                if np.isfinite(actual_val):
-                    plt.annotate(f"{actual_val:.0f}", 
-                                (row['Hour'], actual_val),
-                                textcoords="offset points", 
-                                xytext=(0,-15), 
-                                ha='center',
-                                color='green')
-        
-        plt.tight_layout()
-        plt.savefig(plot_path)
-        plt.close()
-        print(f"Saved plot to {plot_path}")
-        
-    except Exception as e:
-        print(f"Error in save_results: {str(e)}")
-        traceback.print_exc()
 
 def main():
     try:
