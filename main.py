@@ -122,7 +122,7 @@ class WeatherConditionAnalyzer:
             print(f"Clear Sky Radiation: {clear_sky_rad}W/m²")
 
             # Calculate cloud cover
-            cloud_cover = calculate_clear_sky_radiation(
+            cloud_cover = calculate_cloud_cover(
                 temperature=temp,
                 humidity=humidity,
                 pressure=pressure,
@@ -410,48 +410,21 @@ def calculate_clear_sky_radiation(hour, latitude, longitude, date, temperature=2
         clear_sky = direct + diffuse
         
         # 13. Apply time-of-day corrections
-        if hour < 5:  # Changed from 6 to 5
+        if hour < 5 or hour > 18:  # Night hours
             return 0
-        elif hour < 8:  # Early morning
-            # Ensure minimum values for dawn
-            min_values = {5: 5, 6: 20, 7: 50}
-            base_value = min_values.get(hour, clear_sky * 0.1)
-            clear_sky = max(base_value, clear_sky * (0.1 * (hour - 4)))  # Progressive increase
-        
+        elif hour < 8 or hour > 16:  # Early morning/late afternoon
+            clear_sky *= 0.75 + 0.25 * cos_zenith  # Gradual transition
+        elif 11 <= hour <= 13:  # Peak hours
+            clear_sky *= 0.95 + 0.05 * cos_zenith  # Small zenith angle correction
+            
         # 14. Final validation
         clear_sky = float(np.clip(clear_sky, 0, 1200))  # Cap at 1200 W/m²
         
-        # Enhanced dawn/dusk adjustments
-        if 5 <= hour <= 8:  # Dawn period
-            # Calculate solar elevation angle
-            solar_elevation = np.degrees(np.pi/2 - zenith)
-            
-            # Enhanced dawn adjustment
-            if solar_elevation > -5:  # Allow some light before sunrise
-                # Progressive scaling for dawn hours
-                dawn_factor = np.clip((solar_elevation + 5) / 20, 0.05, 1.0)  # 20 degrees as reference
-                clear_sky *= dawn_factor
-                
-                # Temperature and humidity adjustments for dawn
-                if temperature < 25:
-                    clear_sky *= 0.9  # Reduce for cooler mornings
-                if humidity > 80:
-                    clear_sky *= 0.85  # Reduce for humid mornings
-                
-                # Ensure minimum values for dawn hours
-                if hour == 5:
-                    clear_sky = max(5, clear_sky)
-                elif hour == 6:
-                    clear_sky = max(20, clear_sky)
-                elif hour == 7:
-                    clear_sky = max(50, clear_sky)
-                elif hour == 8:
-                    clear_sky = max(100, clear_sky)
-        
-        return max(0, clear_sky)
+        return clear_sky
         
     except Exception as e:
         print(f"Error in calculate_clear_sky_radiation: {str(e)}")
+        traceback.print_exc()
         return 0.0    
     
 class PredictionErrorLearner:
@@ -829,7 +802,7 @@ class AutomatedPredictor:
         try:
             timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
             
-            # Save learning state
+            # Save learning state with enhanced model information
             learning_state = {
                 'hourly_patterns': self.hourly_patterns,
                 'seasonal_patterns': self.seasonal_patterns,
@@ -841,28 +814,74 @@ class AutomatedPredictor:
                     'adjustment_factors': self.error_learner.adjustment_factors,
                     'pattern_adjustments': self.error_learner.pattern_adjustments
                 },
-                'timestamp': timestamp
+                # Add model performance metrics
+                'model_performance': {
+                    'best_mae': float(self.model_performance.get('best_mae', float('inf'))),
+                    'current_mae': float(self.model_performance.get('current_mae', float('inf'))),
+                    'best_timestamp': str(self.model_performance.get('best_timestamp', None)),
+                    'evaluation_window': self.model_performance['evaluation_window'],
+                    'total_predictions': len(self.prediction_history)
+                },
+                'metadata': {
+                    'version': '1.0',
+                    'timestamp': timestamp,
+                    'created_at': str(pd.Timestamp.now()),
+                    'total_predictions': len(self.prediction_history)
+                }
             }
             
-            # Save state using regular pickle
+            # Save state using regular pickle with error handling
             state_file = os.path.join(self.models_folder, f'learning_state_{timestamp}.pkl')
-            with open(state_file, 'wb') as f:
-                pickle.dump(learning_state, f)
+            try:
+                with open(state_file, 'wb') as f:
+                    pickle.dump(learning_state, f)
+                print(f"\nSaved learning state to: {state_file}")
+                
+                # Also save latest version
+                latest_state_file = os.path.join(self.models_folder, 'latest_learning_state.pkl')
+                with open(latest_state_file, 'wb') as f:
+                    pickle.dump(learning_state, f)
+                print(f"Saved latest learning state to: {latest_state_file}")
+                
+                # Save a JSON summary of the learning state
+                summary_file = os.path.join(self.models_folder, 'learning_state_summary.json')
+                summary = {
+                    'timestamp': timestamp,
+                    'model_performance': learning_state['model_performance'],
+                    'metadata': learning_state['metadata'],
+                    'file_path': state_file
+                }
+                with open(summary_file, 'w') as f:
+                    json.dump(summary, f, indent=4)
+                print(f"Saved learning state summary to: {summary_file}")
+                
+            except Exception as e:
+                print(f"Error saving learning state: {str(e)}")
+                traceback.print_exc()
             
             # Save prediction history if exists
             if self.prediction_history:
-                history_df = pd.DataFrame(self.prediction_history)
-                history_file = os.path.join(self.history_folder, f'prediction_history_{timestamp}.csv')
-                history_df.to_csv(history_file, index=False)
+                try:
+                    history_df = pd.DataFrame(self.prediction_history)
+                    history_file = os.path.join(self.history_folder, f'prediction_history_{timestamp}.csv')
+                    history_df.to_csv(history_file, index=False)
+                    
+                    # Also save latest version to stats folder
+                    latest_history_file = os.path.join(self.stats_folder, 'latest_prediction_history.csv')
+                    history_df.to_csv(latest_history_file, index=False)
+                    
+                    print(f"Saved prediction history to: {history_file}")
+                    print(f"Saved latest history to: {latest_history_file}")
+                    
+                except Exception as e:
+                    print(f"Error saving prediction history: {str(e)}")
+                    traceback.print_exc()
+            
+            # Cleanup old learning states
+            self._cleanup_old_learning_states()
                 
-                # Also save latest version to stats folder
-                latest_history_file = os.path.join(self.stats_folder, 'latest_prediction_history.csv')
-                history_df.to_csv(latest_history_file, index=False)
-            
-            print(f"\nSaved learning state and history at {timestamp}")
-            
         except Exception as e:
-            print(f"Error saving state: {str(e)}")
+            print(f"Error in save_state: {str(e)}")
             traceback.print_exc()
 
     def _compress_patterns(self, patterns):
@@ -1066,8 +1085,10 @@ class AutomatedPredictor:
                 print(f"Current MAE: {current_mae:.2f} W/m²")
                 print(f"Best MAE: {self.model_performance.get('best_mae', float('inf')):.2f} W/m²")
                 
-                # Always save performance metrics
+                # Always save performance metrics with explicit path handling
                 metrics_path = os.path.join(self.models_folder, 'model_performance.json')
+                os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
+                
                 performance_metrics = {
                     'current_mae': float(current_mae),
                     'best_mae': float(self.model_performance.get('best_mae', float('inf'))),
@@ -1077,9 +1098,13 @@ class AutomatedPredictor:
                     'evaluation_window': self.model_performance['evaluation_window']
                 }
                 
-                with open(metrics_path, 'w') as f:
-                    json.dump(performance_metrics, f, indent=4)
-                print(f"Performance metrics saved to: {metrics_path}")
+                # Save metrics with error handling
+                try:
+                    with open(metrics_path, 'w') as f:
+                        json.dump(performance_metrics, f, indent=4)
+                    print(f"Performance metrics saved to: {metrics_path}")
+                except Exception as e:
+                    print(f"Error saving performance metrics: {str(e)}")
                 
                 # Save best model if current performance is better
                 if current_mae < self.model_performance.get('best_mae', float('inf')):
@@ -1087,7 +1112,7 @@ class AutomatedPredictor:
                     self.model_performance['best_mae'] = current_mae
                     self.model_performance['best_timestamp'] = pd.Timestamp.now()
                     
-                    # Save best model state
+                    # Save best model state with complete information
                     best_state = {
                         'hourly_patterns': self.hourly_patterns,
                         'seasonal_patterns': self.seasonal_patterns,
@@ -1099,23 +1124,45 @@ class AutomatedPredictor:
                             'pattern_adjustments': self.error_learner.pattern_adjustments
                         },
                         'model_performance': self.model_performance,
-                        'timestamp': pd.Timestamp.now()
+                        'timestamp': pd.Timestamp.now(),
+                        'metadata': {
+                            'version': '1.0',
+                            'created_at': str(pd.Timestamp.now()),
+                            'evaluation_window': self.model_performance['evaluation_window'],
+                            'total_predictions': len(self.prediction_history)
+                        }
                     }
                     
-                    # Save using regular pickle
+                    # Save best model with error handling
                     best_model_path = os.path.join(self.models_folder, 'best_model.pkl')
-                    with open(best_model_path, 'wb') as f:
-                        pickle.dump(best_state, f)
-                    
-                    # Save timestamped version
-                    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-                    archive_path = os.path.join(self.models_folder, f'best_model_{timestamp}.pkl')
-                    with open(archive_path, 'wb') as f:
-                        pickle.dump(best_state, f)
-                    
-                    print(f"Saved new best model to: {best_model_path}")
-                    print(f"Archived copy saved to: {archive_path}")
-                
+                    try:
+                        with open(best_model_path, 'wb') as f:
+                            pickle.dump(best_state, f)
+                        print(f"Saved new best model to: {best_model_path}")
+                        
+                        # Save timestamped version
+                        timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+                        archive_path = os.path.join(self.models_folder, f'best_model_{timestamp}.pkl')
+                        with open(archive_path, 'wb') as f:
+                            pickle.dump(best_state, f)
+                        print(f"Archived copy saved to: {archive_path}")
+                        
+                        # Save a JSON summary of the best model
+                        summary_path = os.path.join(self.models_folder, 'best_model_summary.json')
+                        summary = {
+                            'timestamp': str(pd.Timestamp.now()),
+                            'mae': float(current_mae),
+                            'total_predictions': len(self.prediction_history),
+                            'model_version': '1.0',
+                            'file_path': best_model_path
+                        }
+                        with open(summary_path, 'w') as f:
+                            json.dump(summary, f, indent=4)
+                        print(f"Model summary saved to: {summary_path}")
+                        
+                    except Exception as e:
+                        print(f"Error saving best model: {str(e)}")
+                        traceback.print_exc()
                 else:
                     print("Current model performance not better than best model.")
                 
@@ -1394,7 +1441,7 @@ class AutomatedPredictor:
                 'clear_sky': adjusted_clear_sky,
                 'pattern_based': self._get_pattern_prediction(
                     self._find_similar_days(data, target_date, current_hour, conditions),
-                    current_value  # Added current_value argument
+                    current_value
                 ),
                 'fallback': self.fallback_predictor.get_fallback_prediction(
                     current_value, conditions, adjusted_clear_sky, data
@@ -1455,7 +1502,6 @@ class AutomatedPredictor:
                 'cloud_cover': float(weather_impacts.get('cloud_cover', 0)),
                 'cloud_factor': float(cloud_factor)
             }
-
             
             # Store prediction and analyze patterns
             self.prediction_history.append(prediction_record)
@@ -1483,62 +1529,190 @@ class AutomatedPredictor:
             return None
 
     def _get_main_prediction(self, current_value, conditions, clear_sky):
+        """Get main model prediction with enhanced transition handling"""
         try:
             hour = conditions.get('hour', 0)
-            prediction = current_value  # Initialize prediction
             
-            # Apply bias correction
-            bias_corrected = self._apply_bias_correction(prediction, hour)
-            if bias_corrected is not None:  # Add null check
-                prediction = bias_corrected
+            # Force 0 for nighttime hours
+            if hour >= 18 or hour <= 5:
+                return 0.0, None, 1.0
+
+            # Get similar days for pattern and ratio predictions
+            similar_days = self._find_similar_days(
+                data=self.prediction_history,
+                target_date=pd.Timestamp.now().date(),
+                current_hour=conditions.get('hour', 0),
+                conditions=conditions
+            )
             
-            # Add confidence-based weighting
-            confidence = self._calculate_prediction_confidence(prediction, current_value, clear_sky)
-            if confidence < 0.7:
-                historical_avg = self._get_historical_average(conditions)
-                if historical_avg is not None:  # Add null check
-                    prediction = (prediction * confidence + historical_avg * (1 - confidence))
+            # Calculate base predictions with fallback values
+            pattern_pred = self._get_pattern_prediction(similar_days, current_value) or current_value
+            ratio_pred = self._get_ratio_prediction(similar_days, current_value) or current_value
             
-            # Enhanced validation
-            if prediction > clear_sky * 0.95:
-                prediction = clear_sky * 0.95  # Cap at 95% of clear sky
+            # Get trend prediction using recent history
+            if len(self.prediction_history) >= 2:
+                recent_data = pd.DataFrame(self.prediction_history[-24:])
+                trend_pred = self._get_trend_prediction(recent_data, recent_data['hour'].iloc[-1])
+            else:
+                trend_pred = current_value
+
+            # Get cloud cover and adjust clear sky
+            cloud_cover = self.weather_analyzer.analyze_conditions(conditions).get('cloud_cover', 0)
+            adjusted_clear_sky = clear_sky * (1 - (cloud_cover * 0.7))
             
-            # Initialize weights and adjustment
+            # Get typical value for this hour
+            typical_pred = self._get_typical_value(hour) or current_value
+            historical_avg = self._get_historical_average(conditions) or current_value
+
+            # Print debug information
+            print(f"\nPrediction components:")
+            print(f"Current value: {current_value:.2f}")
+            print(f"Pattern prediction: {pattern_pred:.2f}")
+            print(f"Ratio prediction: {ratio_pred:.2f}")
+            print(f"Trend prediction: {trend_pred:.2f}")
+            print(f"Typical prediction: {typical_pred:.2f}")
+            print(f"Adjusted clear sky: {adjusted_clear_sky:.2f}")
+            print(f"Historical average: {historical_avg:.2f}")
+            
+            # Get dynamic weights based on recent performance
             weights = self._calculate_prediction_weights()
-            adjustment = self.error_learner.get_adjustment(hour, conditions)
+            print(f"Base weights: {weights}")
             
-            return prediction, weights, adjustment
+            # Ensure all components are valid numbers
+            components = {
+                'pattern': pattern_pred,
+                'ratio': ratio_pred,
+                'trend': trend_pred,
+                'typical': typical_pred
+            }
+            
+            # Filter out None values and adjust weights
+            valid_components = {k: v for k, v in components.items() if v is not None}
+            if not valid_components:
+                return current_value, weights, 1.0
+                
+            # Normalize remaining weights
+            total_weight = sum(weights[k] for k in valid_components.keys())
+            if total_weight > 0:
+                normalized_weights = {k: weights[k]/total_weight for k in valid_components.keys()}
+            else:
+                normalized_weights = {k: 1.0/len(valid_components) for k in valid_components.keys()}
+
+            # First combine model-based predictions
+            model_prediction = sum(valid_components[k] * normalized_weights[k] for k in valid_components.keys())
+
+            # Then combine with current value and clear sky components
+            final_prediction = (
+                model_prediction * 0.4 +
+                current_value * 0.4 +
+                adjusted_clear_sky * 0.2
+            )
+            
+            # Apply learning adjustment
+            adjustment = self.error_learner.get_adjustment(hour, conditions)
+            final_prediction *= adjustment
+            
+            print(f"Model prediction: {model_prediction:.2f}")
+            print(f"Final prediction: {final_prediction:.2f}")
+            print(f"Adjustment factor: {adjustment:.3f}")
+            
+            # Validate prediction
+            if not np.isfinite(final_prediction) or final_prediction < 0:
+                print("Invalid prediction value, using fallback")
+                final_prediction = current_value  # Fallback to current value
+            
+            return final_prediction, weights, adjustment
 
         except Exception as e:
             print(f"Error in _get_main_prediction: {str(e)}")
             traceback.print_exc()
             return current_value, None, 1.0
 
-    def _get_ensemble_prediction(self, predictions):
+    def _get_ensemble_prediction(self, **predictions):
+        """Combine multiple predictions using dynamic weights"""
         try:
+            # Get current hour
+            hour = predictions.get('hour', 0)
+            
+            # Force 0 for nighttime hours
+            if hour >= 18 or hour <= 5:
+                return 0.0
+
+            # Base weights
             weights = {
-                'pattern': 0.3,
-                'weather': 0.3,
-                'trend': 0.2,
-                'typical': 0.2
+                'main_prediction': 0.4,
+                'moving_avg': 0.3,
+                'clear_sky_pred': 0.2,
+                'pattern_pred': 0.1
             }
             
-            # Adjust weights based on hour confidence
-            hour_confidence = self._get_hour_confidence(predictions['hour'])
-            if hour_confidence < 0.7:
-                weights['weather'] += 0.1  # Increase weather weight
-                weights['pattern'] -= 0.1  # Decrease pattern weight
+            # Get current value for validation
+            current_value = predictions.get('current_value', 0)
+            
+            # Remove current_value from predictions before processing
+            if 'current_value' in predictions:
+                del predictions['current_value']
+            
+            # Validate predictions
+            valid_predictions = {}
+            for method, pred in predictions.items():
+                if method in weights:
+                    # Validate prediction is reasonable (between 0.1x and 3x current value)
+                    if current_value > 0:
+                        if 0.1 * current_value <= pred <= 3 * current_value:
+                            valid_predictions[method] = pred
+                        else:
+                            valid_predictions[method] = current_value
+                    else:
+                        valid_predictions[method] = max(0, pred)
+            
+            # Adjust weights based on recent performance
+            if len(self.prediction_history) >= 24:
+                recent_errors = pd.DataFrame(self.prediction_history[-24:])
                 
-            # Calculate weighted prediction
-            final_pred = sum(pred * weights[method] 
-                            for method, pred in predictions.items() 
-                            if method in weights)
-                        
-            return final_pred
+                # Calculate error rates for each method
+                for method in valid_predictions.keys():
+                    if method in recent_errors.columns:
+                        error_rate = abs(recent_errors[method] - recent_errors['actual']).mean()
+                        weights[method] *= (1 / (error_rate + 1))
+                
+                # Normalize weights
+                total = sum(weights[m] for m in valid_predictions.keys())
+                if total > 0:
+                    weights = {k: v/total for k, v in weights.items() if k in valid_predictions}
+            
+            # Combine predictions
+            if valid_predictions:
+                ensemble_pred = sum(
+                    valid_predictions[method] * weights[method]
+                    for method in valid_predictions.keys()
+                )
+                
+                # Final validation
+                if current_value > 0:
+                    ensemble_pred = max(0.1 * current_value, min(3 * current_value, ensemble_pred))
+                else:
+                    ensemble_pred = max(0, ensemble_pred)
+                
+                print("\nEnsemble Prediction Details:")
+                for method in valid_predictions:
+                    print(f"{method}: {valid_predictions[method]:.2f} (weight: {weights[method]:.3f})")
+                print(f"Final ensemble prediction: {ensemble_pred:.2f}")
+                
+                return ensemble_pred
+            
+            # Fallback to main prediction or current value if ensemble fails
+            return predictions.get('main_prediction', current_value)
             
         except Exception as e:
             print(f"Error in _get_ensemble_prediction: {str(e)}")
-            return predictions.get('pattern', 0)
+            traceback.print_exc()
+            return predictions.get('main_prediction', predictions.get('current_value', 0))
+            
+        except Exception as e:
+            print(f"Error in _get_ensemble_prediction: {str(e)}")
+            traceback.print_exc()
+            return predictions.get('main_prediction', predictions.get('current_value', 0))
 
     def _calculate_prediction_confidence(self, prediction, current_value, clear_sky):
         """Calculate confidence score for a prediction"""
@@ -1633,41 +1807,35 @@ class AutomatedPredictor:
         try:
             similar_days = []
             
-            # Convert data to DataFrame if it's a list
-            if isinstance(data, list):
+            # Handle different input data types
+            if isinstance(data, pd.DataFrame):
+                # If input is DataFrame, use timestamp column directly
+                historical_data = data[data['timestamp'].dt.date < target_date].copy()
+                dates = historical_data['timestamp'].dt.date.unique()
+            else:
+                # If input is prediction history list
                 historical_data = pd.DataFrame(data)
                 if 'date' in historical_data.columns:
                     historical_data['date'] = pd.to_datetime(historical_data['date'])
-            else:
-                historical_data = data.copy()
-                
-            # Ensure we have timestamp/date column
-            if 'timestamp' in historical_data.columns:
-                dates = historical_data['timestamp'].dt.date.unique()
-            elif 'date' in historical_data.columns:
-                dates = historical_data['date'].dt.date.unique()
-            else:
-                print("Error: No timestamp or date column found")
-                return []
-            
-            # Filter out future dates
-            dates = [d for d in dates if d < target_date]
+                    dates = historical_data['date'].dt.date.unique()
+                else:
+                    print("No date information found in historical data")
+                    return []
             
             for date in dates:
-                # Get data for this date
-                if 'timestamp' in historical_data.columns:
+                if isinstance(data, pd.DataFrame):
                     day_data = historical_data[historical_data['timestamp'].dt.date == date]
                 else:
                     day_data = historical_data[historical_data['date'].dt.date == date]
                 
                 if len(day_data) < 24:
                     continue
-                    
+                
                 # Calculate similarity scores
                 weather_sim = self._calculate_weather_similarity(day_data, conditions)
                 pattern_sim = self._calculate_pattern_similarity(day_data, current_hour)
                 
-                if weather_sim > 0.7 and pattern_sim > 0.7:
+                if weather_sim > 0.7 and pattern_sim > 0.7:  # Stricter similarity threshold
                     similar_days.append({
                         'date': date,
                         'data': day_data,
@@ -1713,33 +1881,46 @@ class AutomatedPredictor:
             return 0.0
 
     def _calculate_pattern_similarity(self, day_data, current_hour):
+        """Calculate pattern similarity up to current hour"""
         try:
-            # Enhanced pattern matching
+            # Get radiation data based on available columns
             if 'Solar Rad - W/m^2' in day_data.columns:
                 values = day_data['Solar Rad - W/m^2']
-                
-                # Create hour mask
-                hour_mask = day_data['hour'] <= current_hour if 'hour' in day_data.columns else \
-                           day_data['timestamp'].dt.hour <= current_hour
-                
-                # Get time-of-day specific patterns
-                if 5 <= current_hour <= 8:  # Dawn
-                    weights = [0.5, 0.3, 0.2]  # More weight on recent values
-                elif 15 <= current_hour <= 17:  # Dusk
-                    weights = [0.4, 0.4, 0.2]  # Equal weight on recent values
-                else:
-                    weights = [0.3, 0.3, 0.4]  # More weight on trend
-                    
-                pattern = values[hour_mask].values[-3:]
-                if len(pattern) >= 3:
-                    similarity = np.average([
-                        1 - min(abs(pattern[-1] - pattern[-2]) / (pattern[-1] + 1e-8), 1),
-                        1 - min(abs(pattern[-2] - pattern[-3]) / (pattern[-2] + 1e-8), 1),
-                        1 - min(abs(np.std(pattern) / (np.mean(pattern) + 1e-8)), 1)
-                    ], weights=weights)
-                    return float(similarity)
+            elif 'predicted' in day_data.columns:
+                values = day_data['predicted']
+            else:
+                print("No suitable radiation data found")
+                return 0.0
             
-            return 0.0
+            # Get hour data based on available columns
+            if 'hour' in day_data.columns:
+                hour_mask = day_data['hour'] <= current_hour
+            elif 'timestamp' in day_data.columns:
+                hour_mask = day_data['timestamp'].dt.hour <= current_hour
+            else:
+                print("No suitable hour data found")
+                return 0.0
+            
+            pattern = values[hour_mask].values
+            
+            if len(pattern) < 2:
+                return 0.0
+            
+            mean_val = np.mean(pattern)
+            std_val = np.std(pattern)
+            trend = np.polyfit(np.arange(len(pattern)), pattern, 1)[0]
+            
+            mean_sim = 1 - min(abs(mean_val - pattern[-1]) / (pattern[-1] + 1e-8), 1)
+            std_sim = 1 - min(std_val / (mean_val + 1e-8), 1)
+            trend_sim = 1 - min(abs(trend) / 100, 1)
+            
+            similarity = (
+                mean_sim * 0.4 +
+                std_sim *0.3 +
+                trend_sim *0.3
+            )
+            
+            return float(similarity)
             
         except Exception as e:
             print(f"Error in _calculate_pattern_similarity: {str(e)}")
@@ -1747,30 +1928,30 @@ class AutomatedPredictor:
             return 0.0
 
     def _get_pattern_prediction(self, similar_days, current_value):
+        """Get prediction based on similar day patterns"""
         try:
-            if not similar_days or current_value is None:
+            # Get current hour from conditions if available
+            hour = None
+            if similar_days and similar_days[0].get('data') is not None:
+                hour = similar_days[0]['data'].get('hour', None)
+            
+            # Force 0 for nighttime hours if hour is available
+            if hour is not None and (hour >= 18 or hour <= 5):
+                return 0.0
+
+            if similar_days is None or len(similar_days) == 0:
                 return current_value
-                
-            hour = similar_days[0]['data']['hour'].iloc[0] if similar_days and similar_days[0]['data'].empty is False else None
             
-            # Special handling for dawn hours
-            if hour is not None and 5 <= hour <= 8:
-                # Ensure minimum values even if no predictions
-                min_values = {5: 5, 6: 20, 7: 50, 8: 100}
-                base_value = min_values.get(hour, current_value)
-            
-            # Regular pattern prediction
             predictions = []
             weights = []
             
             for day in similar_days:
-                day_data = day['data']
-                if not day_data.empty:
-                    next_hour = hour + 1 if hour is not None else None
-                    if next_hour is not None:
-                        next_data = day_data[day_data['hour'] == next_hour]
-                        if not next_data.empty:
-                            predictions.append(next_data['Solar Rad - W/m^2'].iloc[0])
+                if isinstance(day, dict) and 'data' in day and 'similarity' in day:
+                    day_data = day['data']
+                    if not day_data.empty:
+                        next_hour_data = day_data['Solar Rad - W/m^2'].values
+                        if len(next_hour_data) > 0:
+                            predictions.append(next_hour_data[-1])
                             weights.append(day['similarity'])
             
             if predictions:
@@ -1782,7 +1963,6 @@ class AutomatedPredictor:
             
         except Exception as e:
             print(f"Error in _get_pattern_prediction: {str(e)}")
-            traceback.print_exc()
             return current_value
 
     def _get_ratio_prediction(self, similar_days, current_value):
@@ -1927,33 +2107,61 @@ class AutomatedPredictor:
             traceback.print_exc()
 
     def _validate_prediction(self, prediction, clear_sky, current_value, hour):
+        """Validate and adjust prediction with enhanced transition handling"""
         try:
-            # Enhanced dawn transition (5-8 AM)
-            if 5 <= hour <= 8:
-                sunrise_factor = min(clear_sky / 100, 1.0) if clear_sky > 0 else 0.1
-                min_values = {
-                    5: {'min': 2, 'max': 8},
-                    6: {'min': 15, 'max': 40},
-                    7: {'min': 40, 'max': 160},
-                    8: {'min': 80, 'max': 350}
-                }
-                
-                if hour in min_values:
-                    limits = min_values[hour]
-                    max_value = min(clear_sky * (0.05 * hour), limits['max'])
-                    min_value = max(limits['min'], clear_sky * 0.02 * hour)
-                    return min(max(prediction * sunrise_factor, min_value), max_value)
-                
-            # Enhanced dusk transition (15-17)
-            elif 15 <= hour <= 17:
-                sunset_factor = max((18 - hour) / 3, 0.1)
-                max_values = {
-                    15: clear_sky * 0.65,
-                    16: clear_sky * 0.35,
-                    17: clear_sky * 0.15
-                }
-                return min(prediction * sunset_factor, max_values.get(hour, prediction))
+            # Nighttime and early morning (18:00-05:59) - Always return 0
+            if hour >= 18 or hour <= 5:
+                return 0.0
+
+            # Early morning transition (06:00-08:59)
+            if hour < 9:
+                if hour == 6:
+                    # More conservative morning start
+                    max_value = min(clear_sky * 0.10, 30)  # Reduced from 0.15 to 0.10
+                    return min(max(prediction * 0.4, current_value * 0.6), max_value)
+                elif hour == 7:
+                    # Gradual increase
+                    max_value = min(clear_sky * 0.25, 120)  # Reduced from 0.3 to 0.25
+                    base_pred = min(max(prediction * 0.6, current_value * 0.7), max_value)
+                    return max(base_pred, current_value * 1.1)
+                elif hour == 8:
+                    # Smoother transition to normal day values
+                    max_value = min(clear_sky * 0.45, 250)  # Reduced from 0.5 to 0.45
+                    base_pred = min(max(prediction * 0.7, current_value * 0.8), max_value)
+                    return max(base_pred, current_value * 1.05)
+
+            # Late afternoon transition (15:00-17:59)
+            if hour >= 15:
+                if hour == 15:
+                    # More gradual decrease
+                    max_value = clear_sky * 0.75  # Increased from 0.7 to 0.75
+                    min_value = current_value * 0.75  # Increased from 0.7 to 0.75
+                    return min(max(prediction * 0.95, min_value), max_value)
+                elif hour == 16:
+                    # Less steep decrease
+                    max_value = clear_sky * 0.45  # Increased from 0.4 to 0.45
+                    min_value = current_value * 0.6  # Increased from 0.5 to 0.6
+                    return min(max(prediction * 0.85, min_value), max_value)
+                elif hour == 17:
+                    # Smoother transition to night
+                    max_value = clear_sky * 0.20  # Increased from 0.15 to 0.20
+                    min_value = current_value * 0.4  # Increased from 0.3 to 0.4
+                    return min(max(prediction * 0.7, min_value), max_value)
+
+            # Normal daytime hours (09:00-14:59)
+            prediction = max(0, min(prediction, clear_sky * 0.95))
             
+            # Limit maximum change from current value
+            if current_value > 0:
+                max_increase = current_value * 1.5
+                max_decrease = current_value * 0.6
+                prediction = min(max(prediction, max_decrease), max_increase)
+            else:
+                # If current value is 0, use clear sky as reference
+                prediction = min(prediction, clear_sky * 0.5)
+
+            return max(0, prediction)
+
         except Exception as e:
             print(f"Error in _validate_prediction: {str(e)}")
             return current_value
@@ -2339,62 +2547,75 @@ class AutomatedPredictor:
             return None
 
     def _get_dynamic_learning_rate(self, hour, error_history):
+        """Calculate dynamic learning rate based on hour and recent performance"""
         try:
-            # Higher rates for problematic hours
-            if hour in [5, 6, 7, 16, 17]:  # High error hours
-                base_rate = 0.6  # Increased from 0.5
-            elif 10 <= hour <= 14:  # Peak hours
-                base_rate = 0.4  # Increased from 0.35
+            # Base learning rates for different periods
+            base_rates = {
+                'early_morning': 0.4,  # 6-9 hours
+                'peak_hours': 0.3,     # 10-14 hours
+                'afternoon': 0.35,     # 15-17 hours
+                'other': 0.2
+            }
+            
+            # Determine period
+            if 6 <= hour <= 9:
+                base_rate = base_rates['early_morning']
+            elif 10 <= hour <= 14:
+                base_rate = base_rates['peak_hours']
+            elif 15 <= hour <= 17:
+                base_rate = base_rates['afternoon']
             else:
-                base_rate = 0.3  # Increased from 0.25
+                base_rate = base_rates['other']
                 
-            # More aggressive error-based adjustment
+            # Adjust based on recent error patterns
             if error_history:
-                recent_errors = error_history[-5:]
+                recent_errors = error_history[-5:]  # Last 5 errors
                 error_std = np.std(recent_errors)
                 
-                if error_std > 50:
-                    base_rate *= 2.0  # Increased from 1.8
-                elif np.mean(np.abs(recent_errors)) > 75:
-                    base_rate *= 1.7  # Increased from 1.5
-                    
-            return min(base_rate, 0.7)  # Increased cap
+                # Increase learning rate if errors are consistently high
+                if error_std > 50:  # High variability
+                    base_rate *= 1.5
+                elif np.mean(np.abs(recent_errors)) > 75:  # Large errors
+                    base_rate *= 1.3
+                
+            return min(base_rate, 0.5)  # Cap at 0.5 to prevent instability
             
         except Exception as e:
             print(f"Error in _get_dynamic_learning_rate: {str(e)}")
-            return 0.25
+            return 0.2  # Default learning rate
 
     def _calculate_weather_impact(self, conditions, hour):
+        """Calculate enhanced weather impact factor"""
         try:
             impact = 1.0
             
-            # Enhanced pressure impact (highest correlation 0.216)
-            pressure = conditions.get('pressure', 1008)
-            pressure_diff = pressure - 1008
-            pressure_impact = 1 + pressure_diff * 0.025  # Increased from 0.02
-            impact *= pressure_impact
+            # Enhanced weighting for peak hours (10-14)
+            is_peak_hour = 10 <= hour <= 14
             
-            # Enhanced humidity impact (37.67% difference)
-            humidity = conditions.get('humidity', 70)
-            if humidity > 80:
-                impact *= 0.80  # Increased reduction
-            elif humidity < 60:
-                impact *= 1.20  # Increased boost
-                
-            # Temperature impact (-0.207 correlation)
+            # Temperature impact
             temp = conditions.get('temperature', 25)
-            if temp > 31:
-                impact *= 0.85  # Increased reduction
-            elif temp < 27:
-                impact *= 1.15  # Increased boost
+            if is_peak_hour:
+                temp_impact = 1 - abs(temp - 30) / 50  # Optimal temp around 30°C
+                impact *= temp_impact * 1.5  # Higher weight during peak hours
+            else:
+                temp_impact = 1 - abs(temp - 25) / 40
+                impact *= temp_impact
                 
-            # Time-based adjustments
-            if 10 <= hour <= 14:  # Peak hours
-                impact = (impact + 1) / 2  # Moderate impact during peak
-            elif hour <= 8 or hour >= 16:  # Transition hours
-                impact = impact * 0.8 + 0.2  # Stronger impact during transitions
+            # Humidity impact
+            humidity = conditions.get('humidity', 70)
+            if is_peak_hour:
+                humidity_impact = 1 - (humidity / 100) * 0.8  # More sensitive to humidity
+            else:
+                humidity_impact = 1 - (humidity / 100) * 0.6
+            impact *= humidity_impact
             
-            return max(0.5, min(impact, 1.5))  # Wider impact range
+            # UV index impact
+            uv = conditions.get('uv', 5)
+            expected_uv = self._get_expected_uv_for_hour(hour)
+            uv_ratio = min(uv / expected_uv if expected_uv > 0 else 1, 1.5)
+            impact *= uv_ratio
+            
+            return max(0.1, min(impact, 1.5))  # Limit impact range
             
         except Exception as e:
             print(f"Error in _calculate_weather_impact: {str(e)}")
@@ -3062,7 +3283,7 @@ class AutomatedPredictor:
             # Create all directories
             for directory in [self.base_dir, self.data_folder, self.stats_folder, 
                              self.reports_folder, self.models_folder, self.history_folder]:  # Add history_folder
-                os.makedirs(directory, mode=0o777, exist_ok=True)
+                os.makedirs(directory, exist_ok=True)
                 print(f"Directory created/verified: {directory}")
 
             print("\nInitialized file paths:")
@@ -3075,21 +3296,6 @@ class AutomatedPredictor:
         except Exception as e:
             print(f"Error initializing directories: {str(e)}")
             traceback.print_exc()
-
-    # Add bias correction to prediction
-    def _apply_bias_correction(self, prediction, hour):
-        try:
-            # Get historical bias for this hour
-            hour_stats = self._get_hour_statistics(hour)
-            if hour_stats and 'mean_error' in hour_stats:
-                bias = hour_stats['mean_error']
-                # Apply gradual bias correction
-                correction = bias * 0.3  # Start with 30% correction
-                return prediction - correction
-            return prediction
-        except Exception as e:
-            print(f"Error in _apply_bias_correction: {str(e)}")
-            return prediction
 
 def main():
     try:
