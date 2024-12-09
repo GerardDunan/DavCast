@@ -10,6 +10,7 @@ import traceback
 import pickle
 import json
 from pathlib import Path
+from copy import deepcopy
 warnings.filterwarnings('ignore')
 
 # Constants
@@ -415,7 +416,7 @@ def calculate_clear_sky_radiation(hour, latitude, longitude, date, temperature=2
         elif hour < 8 or hour > 16:  # Early morning/late afternoon
             clear_sky *= 0.75 + 0.25 * cos_zenith  # Gradual transition
         elif 11 <= hour <= 13:  # Peak hours
-            clear_sky *= 0.95 + 0.05 * cos_zenith  # Small zenith angle correction
+            clear_sky *=0.95 + 0.05 * cos_zenith  # Small zenith angle correction
             
         # 14. Final validation
         clear_sky = float(np.clip(clear_sky, 0, 1200))  # Cap at 1200 W/m²
@@ -771,6 +772,9 @@ class AutomatedPredictor:
         self.hourly_errors = {hour: [] for hour in range(24)}
         self.error_window_size = 100
 
+        # Add to existing initialization
+        self.time_series_ensemble = TimeSeriesEnsemble()
+
     def _cleanup_old_learning_states(self, max_states=5):
         """Remove old learning states when limit is reached"""
         try:
@@ -827,6 +831,12 @@ class AutomatedPredictor:
                     'timestamp': timestamp,
                     'created_at': str(pd.Timestamp.now()),
                     'total_predictions': len(self.prediction_history)
+                },
+                'ensemble_state': {
+                    'hour_specific_models': dict(
+                        (str(hour), {'model': pickle.dumps(model)})
+                        for hour, model in self.time_series_ensemble.hour_specific_models.items()
+                    )
                 }
             }
             
@@ -977,6 +987,13 @@ class AutomatedPredictor:
                     self.prediction_history = pd.read_csv(self.errors_file).to_dict('records')
                 
                 print("Successfully loaded previous learning state")
+
+                if 'ensemble_state' in state:
+                    ensemble_state = state['ensemble_state']
+                    self.time_series_ensemble.hour_specific_models = {
+                        hour: pickle.loads(model_data['model'])
+                        for hour, model_data in ensemble_state['hour_specific_models'].items()
+                    }
             else:
                 print("No previous learning state found - starting fresh")
                 # Initialize empty state
@@ -1111,7 +1128,6 @@ class AutomatedPredictor:
                     print(f"\nNew best model detected! (MAE: {current_mae:.2f} W/m² vs previous: {self.model_performance.get('best_mae', float('inf')):.2f} W/m²)")
                     self.model_performance['best_mae'] = current_mae
                     self.model_performance['best_timestamp'] = pd.Timestamp.now()
-                    
                     # Save best model state with complete information
                     best_state = {
                         'hourly_patterns': self.hourly_patterns,
@@ -1215,74 +1231,19 @@ class AutomatedPredictor:
             traceback.print_exc()
 
     def learn_from_historical_data(self, data):
-        """Learn patterns from all historical data"""
-        print("\nLearning from historical data...")
+        """Learn patterns from historical data including ensemble training"""
+        print("\nTraining ensemble models...")
         
-        # Group data by date
-        dates = data['timestamp'].dt.date.unique()
-        total_dates = len(dates)
-        
-        for i, date in enumerate(dates):
-            day_data = data[data['timestamp'].dt.date == date]
-            
-            # Skip incomplete days
-            if len(day_data) < 24:
+        for hour in range(24):
+            hour_data = data[data['timestamp'].dt.hour == hour]
+            if len(hour_data) < 24:
                 continue
-                
-            print(f"\rProcessing historical data: {i+1}/{total_dates} days", end='')
             
-            # Learn hourly patterns
-            for hour in range(24):
-                hour_data = day_data[day_data['timestamp'].dt.hour == hour]
-                if hour_data.empty:
-                    continue
-                
-                value = hour_data['Solar Rad - W/m^2'].iloc[0]
-                weather_conditions = {
-                    'temperature': hour_data['Average Temperature'].iloc[0],
-                    'humidity': hour_data['Average Humidity'].iloc[0],
-                    'pressure': hour_data['Average Barometer'].iloc[0],
-                    'uv': hour_data['UV Index'].iloc[0]
-                }
-                
-                # Store hourly pattern
-                if hour not in self.hourly_patterns:
-                    self.hourly_patterns[hour] = []
-                self.hourly_patterns[hour].append({
-                    'value': value,
-                    'conditions': weather_conditions,
-                    'date': date
-                })
-                
-                # Learn hour-to-hour transitions
-                if hour < 23:
-                    next_hour = hour + 1
-                    next_data = day_data[day_data['timestamp'].dt.hour == next_hour]
-                    if not next_data.empty:
-                        next_value = next_data['Solar Rad - W/m^2'].iloc[0]
-                        transition_key = f"{hour}-{next_hour}"
-                        if transition_key not in self.transition_patterns:
-                            self.transition_patterns[transition_key] = []
-                        self.transition_patterns[transition_key].append({
-                            'from_value': value,
-                            'to_value': next_value,
-                            'conditions': weather_conditions,
-                            'date': date
-                        })
+            features = self.time_series_ensemble.prepare_features(hour_data, hour)
+            targets = hour_data['Solar Rad - W/m^2']
             
-            # Learn seasonal patterns
-            season = self._get_season(date)
-            if season not in self.seasonal_patterns:
-                self.seasonal_patterns[season] = []
-            self.seasonal_patterns[season].append({
-                'date': date,
-                'pattern': day_data['Solar Rad - W/m^2'].values,
-                'weather': weather_conditions
-            })
-        
-        print("\nAnalyzing learned patterns...")
-        self._analyze_patterns()
-        self.save_state()
+            # Train hour-specific ensemble
+            self.time_series_ensemble.fit(features, targets, hour)
 
     def _analyze_patterns(self):
         """Analyze learned patterns to extract insights"""
@@ -1482,6 +1443,31 @@ class AutomatedPredictor:
                 prediction, next_hour, current_value
             )
             
+            # Get ensemble prediction
+            current_features = self.time_series_ensemble.prepare_features(current_data, next_hour)
+            ensemble_prediction = self.time_series_ensemble.predict(current_features, next_hour)
+            
+            # Add ensemble prediction to the prediction components
+            predictions['ensemble'] = ensemble_prediction
+            
+            # Update prediction weights to include ensemble
+            weights = {
+                'pattern': 0.2,
+                'ratio': 0.2,
+                'trend': 0.15,
+                'typical': 0.15,
+                'ensemble': 0.3  # Give significant weight to ensemble prediction
+            }
+            
+            # Update final prediction calculation
+            prediction = (
+                predictions['main_model'] * weights['pattern'] +
+                predictions['moving_avg'] * weights['ratio'] +
+                predictions['clear_sky'] * weights['trend'] +
+                predictions['pattern_based'] * weights['typical'] +
+                predictions['ensemble'] * weights['ensemble']
+            )
+            
             # Store prediction with enhanced metadata
             prediction_record = {
                 'date': str(target_date),
@@ -1515,6 +1501,7 @@ class AutomatedPredictor:
             print(f"Clear Sky: {predictions['clear_sky']:.2f} W/m²")
             print(f"Pattern Based: {predictions['pattern_based']:.2f} W/m²")
             print(f"Fallback: {predictions['fallback']:.2f} W/m²")
+            print(f"Ensemble: {predictions['ensemble']:.2f} W/m²")
             print(f"Weather Adjustment: {weather_adjustment:.3f}")
             print(f"Learning Adjustment: {learning_adjustment:.3f}")
             print(f"Cloud Cover: {weather_impacts.get('cloud_cover', 0):.3f}")
@@ -1752,12 +1739,10 @@ class AutomatedPredictor:
                 history_file = os.path.join(self.history_folder, f'prediction_history_{timestamp}.csv')
                 history_df = pd.DataFrame(self.prediction_history)
                 history_df.to_csv(history_file, index=False)
-                print(f"\nSaved prediction history to: {history_file}")
                 
                 # Save to data folder
                 data_file = os.path.join(self.data_folder, 'latest_predictions.csv')
                 history_df.to_csv(data_file, index=False)
-                print(f"Saved latest predictions to: {data_file}")
                 
                 # Save detailed data to reports folder
                 report_file = os.path.join(self.reports_folder, f'detailed_predictions_{timestamp}.csv')
@@ -1769,7 +1754,6 @@ class AutomatedPredictor:
                 
                 # Save detailed report
                 history_df.to_csv(report_file, index=False)
-                print(f"Saved detailed prediction report to: {report_file}")
                 
                 # Generate and save summary report
                 summary_file = os.path.join(self.reports_folder, f'prediction_summary_{timestamp}.txt')
@@ -2102,9 +2086,47 @@ class AutomatedPredictor:
             for method, perf in self.method_performance.items():
                 print(f"{method}: {perf['weight']:.3f}")
                 
+            # Add ensemble performance tracking
+            if 'ensemble' in predictions:
+                ensemble_error = abs(predictions['ensemble'] - actual)
+                if 'ensemble' not in self.method_performance:
+                    self.method_performance['ensemble'] = {
+                        'weight': 0.3,
+                        'errors': [],
+                        'window_size': 100
+                    }
+                self.method_performance['ensemble']['errors'].append(ensemble_error)
+                
+                # Adjust weights based on recent performance
+                self._adjust_ensemble_weight()
+    
         except Exception as e:
-            print(f"Error in _update_method_performance: {str(e)}")
+            print(f"Error updating method performance: {str(e)}")
             traceback.print_exc()
+
+    def _adjust_ensemble_weight(self):
+        """Dynamically adjust ensemble weight based on performance"""
+        try:
+            ensemble_errors = self.method_performance['ensemble']['errors'][-100:]
+            other_methods_errors = []
+            for method in ['pattern', 'ratio', 'trend', 'typical']:
+                if method in self.method_performance:
+                    other_methods_errors.extend(self.method_performance[method]['errors'][-100:])
+            
+            if ensemble_errors and other_methods_errors:
+                ensemble_mae = np.mean(ensemble_errors)
+                others_mae = np.mean(other_methods_errors)
+                
+                # Adjust weight based on relative performance
+                if ensemble_mae < others_mae:
+                    self.method_performance['ensemble']['weight'] = min(0.4, 
+                        self.method_performance['ensemble']['weight'] * 1.1)
+                else:
+                    self.method_performance['ensemble']['weight'] = max(0.2,
+                        self.method_performance['ensemble']['weight'] * 0.9)
+        
+        except Exception as e:
+            print(f"Error adjusting ensemble weight: {str(e)}")
 
     def _validate_prediction(self, prediction, clear_sky, current_value, hour):
         """Enhanced prediction validation with transition handling"""
@@ -3165,8 +3187,7 @@ class AutomatedPredictor:
                     'improvement_percentage': float(
                         (history_df['error'].abs().iloc[:24].mean() - 
                          history_df['error'].abs().iloc[-24:].mean()) / 
-                        history_df['error'].abs().iloc[:24].mean() * 100
-                    )
+                        history_df['error'].abs().iloc[:24].mean() * 100)
                 }
             }
 
@@ -3296,6 +3317,126 @@ class AutomatedPredictor:
         except Exception as e:
             print(f"Error initializing directories: {str(e)}")
             traceback.print_exc()
+
+# Add imports at the top
+from copy import deepcopy
+from lightgbm import LGBMRegressor
+from xgboost import XGBRegressor
+from catboost import CatBoostRegressor
+from sklearn.ensemble import StackingRegressor
+
+class TimeSeriesEnsemble:
+    def __init__(self):
+        # Base models with adjusted parameters
+        self.lgb = LGBMRegressor(
+            n_estimators=50,  # Reduced from 100
+            learning_rate=0.1,  # Increased from 0.05
+            num_leaves=15,   # Reduced from 31
+            min_child_samples=20,  # Add minimum samples per leaf
+            feature_fraction=0.8,
+            subsample=0.8,
+            reg_alpha=0.1,   # Add L1 regularization
+            reg_lambda=0.1,  # Add L2 regularization
+            verbose=-1       # Suppress warnings
+        )
+        
+        self.xgb = XGBRegressor(
+            n_estimators=50,  # Reduced from 100
+            learning_rate=0.1,  # Increased from 0.05
+            max_depth=4,     # Reduced from 6
+            min_child_weight=3,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            verbosity=0      # Suppress warnings
+        )
+        
+        # Stacking ensemble with simpler final estimator
+        self.ensemble = StackingRegressor(
+            estimators=[
+                ('lgb', self.lgb),
+                ('xgb', self.xgb)
+            ],
+            final_estimator=LGBMRegressor(
+                n_estimators=25,  # Reduced from 50
+                learning_rate=0.1,
+                num_leaves=7,     # Reduced complexity
+                min_child_samples=20,
+                verbose=-1
+            ),
+            n_jobs=-1  # Use all available cores
+        )
+        
+        self.hour_specific_models = {}
+
+    def prepare_features(self, data, target_hour):
+        """Prepare features with temporal components"""
+        try:
+            features = {
+                'hour_sin': np.sin(2 * np.pi * data['hour']/24),
+                'hour_cos': np.cos(2 * np.pi * data['hour']/24),
+                'temperature': data['Average Temperature'],
+                'humidity': data['Average Humidity'],
+                'pressure': data['Average Barometer'],
+                'uv': data['UV Index'],
+                'clear_sky_radiation': data['clear_sky_radiation'],
+                'rolling_mean_3h': data.groupby('date')['Solar Rad - W/m^2'].transform(
+                    lambda x: x.rolling(window=3, min_periods=1).mean()
+                )
+            }
+            
+            df = pd.DataFrame(features)
+            # Fill NaN values
+            df = df.fillna(method='ffill').fillna(method='bfill').fillna(0)
+            return df
+            
+        except Exception as e:
+            print(f"Error preparing features: {str(e)}")
+            return None
+
+    def fit(self, X, y, hour):
+        """Fit hour-specific model with handling for constant targets"""
+        if hour not in self.hour_specific_models:
+            # Check if all target values are the same or near-zero variance
+            if len(set(y)) <= 1 or y.std() < 1e-6:
+                self.hour_specific_models[hour] = {'type': 'constant', 'value': y.iloc[0]}
+                print(f"Using constant predictor for hour {hour} with value {y.iloc[0]}")
+                return
+            
+            # For daytime hours, use the ensemble
+            self.hour_specific_models[hour] = deepcopy(self.ensemble)
+            
+        if isinstance(self.hour_specific_models[hour], dict):
+            return
+            
+        # Add try-except for model fitting
+        try:
+            self.hour_specific_models[hour].fit(X, y)
+        except Exception as e:
+            print(f"Error fitting model for hour {hour}: {str(e)}")
+            # Fallback to constant predictor
+            self.hour_specific_models[hour] = {'type': 'constant', 'value': y.mean()}
+
+    def predict(self, X, hour):
+        """Get prediction with validation"""
+        try:
+            if hour not in self.hour_specific_models:
+                return None
+                
+            model = self.hour_specific_models[hour]
+            if isinstance(model, dict) and model['type'] == 'constant':
+                # Return constant value for nighttime hours
+                return model['value']
+                
+            # Handle NaN values
+            X = X.fillna(method='ffill').fillna(method='bfill')
+            
+            return float(model.predict(X)[0])
+            
+        except Exception as e:
+            print(f"Error predicting for hour {hour}: {str(e)}")
+            return None
 
 def main():
     try:
