@@ -11,6 +11,9 @@ import pickle
 import json
 from pathlib import Path
 from copy import deepcopy
+from lightgbm import LGBMRegressor
+from xgboost import XGBRegressor
+from sklearn.ensemble import StackingRegressor
 warnings.filterwarnings('ignore')
 
 # Constants
@@ -111,7 +114,7 @@ class WeatherConditionAnalyzer:
             humidity = float(conditions.get('humidity', 60))
             pressure = float(conditions.get('pressure', 1013.25))
             solar_rad = float(conditions.get('solar_rad', 0))
-            clear_sky_rad = float(conditions.get('clear_sky_rad', 1000))  # Set reasonable default
+            clear_sky_rad = float(conditions.get('clear_sky_rad', 1000))
             hour = conditions.get('hour', 12)
 
             print("\nAnalyzing Weather Conditions:")
@@ -122,7 +125,7 @@ class WeatherConditionAnalyzer:
             print(f"Solar Radiation: {solar_rad}W/m²")
             print(f"Clear Sky Radiation: {clear_sky_rad}W/m²")
 
-            # Calculate cloud cover
+            # Calculate cloud cover using the correct function
             cloud_cover = calculate_cloud_cover(
                 temperature=temp,
                 humidity=humidity,
@@ -367,20 +370,16 @@ def calculate_clear_sky_radiation(hour, latitude, longitude, date, temperature=2
         
         # 8. Calculate atmospheric transmittances
         
+        # Add ozone constant at the top of the function
+        ozone = 0.35  # cm NTP (typical value for clear sky conditions)
+        
         # Rayleigh scattering (Bird & Hulstrom, 1981)
         tau_r = np.exp(-0.0903 * pow(air_mass_pressure, 0.84) * 
                       (1.0 + air_mass_pressure - pow(air_mass_pressure, 1.01)))
-        
-        # Ozone transmittance (Bird & Hulstrom, 1981)
-        ozone = 0.35  # cm NTP
         tau_o = 1 - 0.1611 * ozone * air_mass * (1.0 + 139.48 * ozone * air_mass) ** -0.3035 - \
                 0.002715 * ozone * air_mass / (1.0 + 0.044 * ozone * air_mass + 0.0003 * (ozone * air_mass) ** 2)
-        
-        # Water vapor transmittance (Bird & Hulstrom, 1981)
         tau_w = 1 - 2.4959 * water * air_mass / \
                 ((1 + 79.034 * water * air_mass) ** 0.6828 + 6.385 * water * air_mass)
-        
-        # Aerosol transmittance (Bird & Hulstrom, 1981)
         beta = 0.05  # Angstrom turbidity coefficient
         alpha = 1.3   # Wavelength exponent
         tau_a = np.exp(-beta * pow(air_mass, alpha))
@@ -592,6 +591,52 @@ class PredictionErrorLearner:
         
         return adjustments
 
+    def _update_learning_rate(self, error_history):
+        """Dynamic learning rate based on recent performance"""
+        recent_errors = error_history[-24:]  # Last 24 predictions
+        error_std = np.std([e['error_percentage'] for e in recent_errors])
+        
+        if error_std > 50:  # High variance in errors
+            self.learning_rate = 0.15  # More aggressive learning
+        elif error_std > 25:
+            self.learning_rate = 0.1
+        else:
+            self.learning_rate = 0.05  # More conservative when stable
+
+    def _update_hourly_errors(self, hour, error_percentage):
+        """Update hourly error tracking with proper handling"""
+        try:
+            # Skip error tracking for nighttime hours
+            if hour >= 18 or hour <= 5:
+                return
+                
+            # Validate error percentage
+            if error_percentage is None or not np.isfinite(error_percentage):
+                return
+                
+            # Initialize hour if needed
+            if hour not in self.hourly_errors:
+                self.hourly_errors[hour] = []
+                
+            # Add error to history
+            self.hourly_errors[hour].append(error_percentage)
+            
+            # Maintain window size
+            if len(self.hourly_errors[hour]) > self.error_window_size:
+                self.hourly_errors[hour].pop(0)
+                
+            # Get valid recent errors
+            recent_errors = [e for e in self.hourly_errors[hour][-5:] 
+                              if np.isfinite(e)]
+            
+            # Print only if we have valid errors
+            if recent_errors:
+                print(f"\nUpdated hour {hour} performance:")
+                print(f"Recent errors: {[f'{e:.1f}%' for e in recent_errors]}")
+                
+        except Exception as e:
+            print(f"Error updating hourly errors: {str(e)}")
+
 class ErrorPatternAnalyzer:
     def __init__(self):
         self.error_patterns = {
@@ -734,6 +779,7 @@ class AutomatedPredictor:
         self.consecutive_errors = []
         self.prediction_history = []
         self.max_consecutive_errors = 10
+        #self.max_history_size = 10000  # Increase history size limit
         
         # Load previous state
         self.load_state()
@@ -774,6 +820,7 @@ class AutomatedPredictor:
 
         # Add to existing initialization
         self.time_series_ensemble = TimeSeriesEnsemble()
+        print("Initialized TimeSeriesEnsemble")
 
     def _cleanup_old_learning_states(self, max_states=5):
         """Remove old learning states when limit is reached"""
@@ -837,6 +884,10 @@ class AutomatedPredictor:
                         (str(hour), {'model': pickle.dumps(model)})
                         for hour, model in self.time_series_ensemble.hour_specific_models.items()
                     )
+                },
+                'ensemble_models': {
+                    hour: model for hour, model in self.time_series_ensemble.hour_specific_models.items()
+                    if not isinstance(model, dict)  # Skip constant predictors
                 }
             }
             
@@ -994,6 +1045,8 @@ class AutomatedPredictor:
                         hour: pickle.loads(model_data['model'])
                         for hour, model_data in ensemble_state['hour_specific_models'].items()
                     }
+                if 'ensemble_models' in state:
+                    self.time_series_ensemble.hour_specific_models.update(state['ensemble_models'])
             else:
                 print("No previous learning state found - starting fresh")
                 # Initialize empty state
@@ -1016,73 +1069,57 @@ class AutomatedPredictor:
             self.prediction_history = []
 
     def update_with_actual(self, date, hour, actual_value):
-        """Update learning with actual value and evaluate model"""
+        """Update prediction with actual value"""
         try:
+            date_str = pd.Timestamp(date).strftime('%Y-%m-%d')
             updated = False
+            
+            # Find matching prediction
             for pred in reversed(self.prediction_history):
-                if (pred.get('date') == str(date) and 
-                    pred.get('hour') == hour and 
-                    pred.get('actual') is None):
+                if (pred['date'] == date_str and 
+                    pred['hour'] == hour and 
+                    pred['actual'] is None):
                     
                     # Update prediction record
                     pred['actual'] = float(actual_value)
                     pred['error'] = float(actual_value - pred['predicted'])
-                    pred['error_percentage'] = float((pred['error'] / actual_value * 100) 
-                                                   if actual_value != 0 else 0)
                     
-                    # Update method performance
-                    method_predictions = {
-                        'pattern': pred['main_prediction'],
-                        'ratio': pred['moving_avg'],
-                        'trend': pred['clear_sky_pred'],
-                        'typical': pred['pattern_pred']
-                    }
-                    self._update_method_performance(method_predictions, actual_value)
+                    # Handle error percentage calculation
+                    if hour >= 18 or hour <= 5:  # Nighttime
+                        pred['error_percentage'] = 0.0
+                    elif actual_value == 0 and pred['predicted'] == 0:
+                        pred['error_percentage'] = 0.0
+                    elif actual_value == 0:
+                        pred['error_percentage'] = 100.0 if pred['predicted'] > 0 else 0.0
+                    else:
+                        pred['error_percentage'] = (pred['error'] / actual_value) * 100
                     
                     # Update error learner
                     self.error_learner.record_error(
                         hour=hour,
                         predicted=pred['predicted'],
                         actual=actual_value,
-                        conditions=eval(pred['conditions']) if isinstance(pred['conditions'], str) 
-                                                         else pred['conditions']
+                        conditions=pred['conditions']
                     )
                     
-                    # Update hourly errors
-                    self.hourly_errors[hour].append(pred['error_percentage'])
-                    if len(self.hourly_errors[hour]) > self.error_window_size:
-                        self.hourly_errors[hour].pop(0)
-                    
-                    print(f"\nUpdated hour {hour} performance:")
-                    print(f"Recent errors: {[f'{e:.1f}%' for e in self.hourly_errors[hour][-5:]]}")
+                    print(f"\nUpdated prediction for {date_str}, hour {hour}:")
+                    print(f"Predicted: {pred['predicted']:.2f}")
+                    print(f"Actual: {actual_value:.2f}")
+                    print(f"Error: {pred['error']:.2f}")
+                    print(f"Error %: {pred['error_percentage']:.2f}%")
                     
                     updated = True
-                    self._save_prediction_history()
                     break
-                    
+            
             if not updated:
-                print(f"Warning: No pending prediction found for date {date}, hour {hour}")
-                print(f"Current prediction history size: {len(self.prediction_history)}")
-                if self.prediction_history:
-                    print("Last prediction record:")
-                    last_pred = self.prediction_history[-1]
-                    print(f"Date: {last_pred['date']}, Hour: {last_pred['hour']}")
+                print(f"No pending prediction found for date {date}, hour {hour}")
             
-            if updated:
-                # Evaluate and save model if it's better
-                self.evaluate_and_save_model()
-                
-                # Trigger learning analysis if needed
-                if len(self.prediction_history) % 24 == 0 or abs(pred['error_percentage']) > 20:
-                    print("\nTriggering learning analysis...")
-                    self.analyze_learning_performance()
-            
-            # Save state after update
-            self.save_state()
+            return updated
             
         except Exception as e:
             print(f"Error in update_with_actual: {str(e)}")
             traceback.print_exc()
+            return False
 
     def evaluate_and_save_model(self):
         """Evaluate current model performance and save if best"""
@@ -1148,7 +1185,7 @@ class AutomatedPredictor:
                             'total_predictions': len(self.prediction_history)
                         }
                     }
-                    
+
                     # Save best model with error handling
                     best_model_path = os.path.join(self.models_folder, 'best_model.pkl')
                     try:
@@ -1231,19 +1268,26 @@ class AutomatedPredictor:
             traceback.print_exc()
 
     def learn_from_historical_data(self, data):
-        """Learn patterns from historical data including ensemble training"""
+        """Learn patterns from historical data"""
         print("\nTraining ensemble models...")
         
+        # Train hour-specific ensemble models
         for hour in range(24):
             hour_data = data[data['timestamp'].dt.hour == hour]
-            if len(hour_data) < 24:
+            if len(hour_data) < 24:  # Need minimum data
+                print(f"Insufficient data for hour {hour:02d} (samples: {len(hour_data)})")
                 continue
             
-            features = self.time_series_ensemble.prepare_features(hour_data, hour)
+            print(f"\nTraining model for hour {hour:02d} with {len(hour_data)} samples")
+            
+            # Get target values
             targets = hour_data['Solar Rad - W/m^2']
             
-            # Train hour-specific ensemble
-            self.time_series_ensemble.fit(features, targets, hour)
+            # Train ensemble model
+            self.time_series_ensemble.fit(hour_data, targets, hour)
+        
+        # Print training status
+        self.time_series_ensemble.get_training_status()
 
     def _analyze_patterns(self):
         """Analyze learned patterns to extract insights"""
@@ -1303,215 +1347,96 @@ class AutomatedPredictor:
                 return None
                 
             history_df = pd.DataFrame(self.prediction_history)
+            
+            # Convert date strings to datetime if needed
+            if 'date' in history_df.columns:
+                history_df['date'] = pd.to_datetime(history_df['date'])
+                history_df['days_old'] = (pd.Timestamp.now() - history_df['date']).dt.days
+            else:
+                print("Warning: No date information in prediction history")
+                return None
+                
             hour_data = history_df[history_df['hour'] == hour]
             
             if hour_data.empty:
                 return None
             
             # Calculate weighted average based on recency
-            hour_data['days_old'] = (pd.Timestamp.now() - pd.to_datetime(hour_data['timestamp'])).dt.days
             hour_data['weight'] = np.exp(-hour_data['days_old'] / 30)  # Exponential decay
             
-            weighted_avg = (hour_data['actual'] * hour_data['weight']).sum() / hour_data['weight'].sum()
+            # Use 'actual' values where available, otherwise use 'predicted'
+            if 'actual' in hour_data.columns:
+                values = hour_data['actual']
+            else:
+                values = hour_data['predicted']
+                
+            weighted_avg = (values * hour_data['weight']).sum() / hour_data['weight'].sum()
             
+            print(f"Historical average for hour {hour}: {weighted_avg:.2f} W/m²")
             return float(weighted_avg)
             
         except Exception as e:
             print(f"Error in _get_historical_average: {str(e)}")
+            traceback.print_exc()
             return None
 
-
     def predict_next_hour(self, data, target_date, current_hour):
-        """Make prediction for the next hour with enhanced reliability"""
+        """Enhanced prediction with validation"""
         try:
-            current_hour = int(current_hour)
+            # Input validation
+            if not isinstance(current_hour, (int, float)) or not 0 <= current_hour <= 23:
+                raise ValueError(f"Invalid hour: {current_hour}")
+            
             next_hour = (current_hour + 1) % 24
             
-            # Force 0 for nighttime hours (including hour 5)
-            if next_hour >= 18 or next_hour <= 5:
-                print(f"\nNighttime/Early morning hour {next_hour:02d}:00 - Setting prediction to 0 W/m²")
-                prediction_record = {
-                    'date': str(target_date),
-                    'hour': int(next_hour),
-                    'predicted': 0.0,
-                    'main_prediction': 0.0,
-                    'moving_avg': 0.0,
-                    'clear_sky_pred': 0.0,
-                    'pattern_pred': 0.0,
-                    'fallback_pred': 0.0,
-                    'weather_adjustment': 1.0,
-                    'learning_adjustment': 1.0,
-                    'actual': None,
-                    'error': None,
-                    'error_percentage': None,
-                    'conditions': str({}),
-                    'weights': {'pattern': 0, 'ratio': 0, 'trend': 0, 'typical': 0},
-                    'cloud_cover': 0.0,
-                    'cloud_factor': 1.0
-                }
-                self.prediction_history.append(prediction_record)
-                return 0.0
-
-            # Get current day's data and conditions
-            current_day = data[data['timestamp'].dt.date == target_date]
-            if current_day.empty:
-                raise ValueError("No data available for target date")
+            # Get conditions with validation
+            conditions = self._get_current_conditions(data, target_date, current_hour)
+            if not conditions:
+                print("Failed to get current conditions")
+                return None
             
-            current_data = current_day[current_day['timestamp'].dt.hour == current_hour]
-            if current_data.empty:
-                raise ValueError(f"No data available for hour {current_hour}")
-                
-            # Extract current conditions with hour information
-            current_value = current_data['Solar Rad - W/m^2'].iloc[0]
-            conditions = {
-                'hour': next_hour,  # Add hour information for better pattern matching
-                'temperature': float(current_data['Average Temperature'].iloc[0]),
-                'humidity': float(current_data['Average Humidity'].iloc[0]),
-                'pressure': float(current_data['Average Barometer'].iloc[0]),
-                'uv': float(current_data['UV Index'].iloc[0])
-            }
+            # Get predictions with validation
+            predictions = self._get_all_predictions(data, target_date, current_hour, conditions)
+            if not predictions:
+                print("Failed to get predictions")
+                return None
             
-            # Calculate clear sky radiation
-            clear_sky = calculate_clear_sky_radiation(
-                hour=current_hour,
-                latitude=ADDU_LATITUDE,
-                longitude=ADDU_LONGITUDE,
-                date=target_date,
-                temperature=current_data['Average Temperature'],  # Using actual temperature
-                humidity=current_data['Average Humidity'],        # Using actual humidity
-                pressure=current_data['Average Barometer']        # Using actual pressure
-            )
-            conditions['clear_sky_rad'] = clear_sky
-            
-            # Get weather impacts including cloud cover
-            weather_impacts = self.weather_analyzer.analyze_conditions(conditions)
-            
-            # Apply cloud cover impact to clear sky prediction
-            cloud_factor = 1.0 - weather_impacts.get('cloud_cover', 0)
-            adjusted_clear_sky = clear_sky * cloud_factor
-            
-            print(f"\nPrediction Adjustments:")
-            print(f"Original Clear Sky: {clear_sky:.2f}W/m²")
-            print(f"Cloud Factor: {cloud_factor:.3f}")
-            print(f"Adjusted Clear Sky: {adjusted_clear_sky:.2f}W/m²")
-            
-            # Get predictions from all available methods
-            predictions = {
-                'main_model': self._get_main_prediction(current_value, conditions, adjusted_clear_sky)[0],
-                'moving_avg': self._get_moving_average(data, target_date, current_hour),
-                'clear_sky': adjusted_clear_sky,
-                'pattern_based': self._get_pattern_prediction(
-                    self._find_similar_days(data, target_date, current_hour, conditions),
-                    current_value
-                ),
-                'fallback': self.fallback_predictor.get_fallback_prediction(
-                    current_value, conditions, adjusted_clear_sky, data
-                ),
-                'current_value': current_value
-            }
-            
-            # Get dynamic weights based on recent performance
-            weights = self._calculate_prediction_weights()
-            
-            # Enhanced weather impacts calculation with cloud cover
-            weather_adjustment = 1.0
-            
-            # Apply other weather impacts
-            for impact_type, impact in weather_impacts.items():
-                if impact_type != 'cloud_cover':  # Cloud cover already handled
-                    weather_adjustment *= (1 - impact * 0.2)
-            
-            # Get hour-specific adjustment from error learner
-            learning_adjustment = self.error_learner.get_adjustment(next_hour, conditions)
-            
-            print(f"\nAdjustment factors:")
-            print(f"Weather adjustment: {weather_adjustment:.3f}")
-            print(f"Learning adjustment: {learning_adjustment:.3f}")
-            
-            # Apply adjustments to prediction
-            prediction = (
-                predictions['main_model'] * weights['pattern'] +
-                predictions['moving_avg'] * weights['ratio'] +
-                predictions['clear_sky'] * weights['trend'] +
-                predictions['pattern_based'] * weights['typical']
-            )
-            
-            prediction *= weather_adjustment * learning_adjustment
-            
-            # Validate prediction
-            prediction = self._validate_prediction_with_outlier_detection(
-                prediction, next_hour, current_value
-            )
+            # Calculate adjustments
+            weather_adjustment = self._calculate_weather_adjustment(conditions, next_hour)
+            transition_adjustment = self._calculate_transition_adjustments(next_hour, conditions)
             
             # Get ensemble prediction
-            current_features = self.time_series_ensemble.prepare_features(current_data, next_hour)
-            ensemble_prediction = self.time_series_ensemble.predict(current_features, next_hour)
+            final_prediction = self._get_ensemble_prediction(predictions, next_hour, conditions)
             
-            # Add ensemble prediction to the prediction components
-            predictions['ensemble'] = ensemble_prediction
+            # Apply adjustments
+            final_prediction *= weather_adjustment * transition_adjustment
             
-            # Update prediction weights to include ensemble
-            weights = {
-                'pattern': 0.2,
-                'ratio': 0.2,
-                'trend': 0.15,
-                'typical': 0.15,
-                'ensemble': 0.3  # Give significant weight to ensemble prediction
-            }
+            # Validate final prediction
+            final_prediction = self._validate_prediction(final_prediction, next_hour, conditions)
             
-            # Update final prediction calculation
-            prediction = (
-                predictions['main_model'] * weights['pattern'] +
-                predictions['moving_avg'] * weights['ratio'] +
-                predictions['clear_sky'] * weights['trend'] +
-                predictions['pattern_based'] * weights['typical'] +
-                predictions['ensemble'] * weights['ensemble']
-            )
+            # Get actual value if available
+            next_data = data[
+                (data['timestamp'].dt.date == target_date) & 
+                (data['timestamp'].dt.hour == next_hour)
+            ]
+            actual_value = float(next_data['Solar Rad - W/m^2'].iloc[0]) if not next_data.empty else None
             
-            # Store prediction with enhanced metadata
-            prediction_record = {
-                'date': str(target_date),
-                'hour': int(next_hour),
-                'predicted': float(prediction),
-                'main_prediction': float(predictions['main_model']),
-                'moving_avg': float(predictions['moving_avg']),
-                'clear_sky_pred': float(predictions['clear_sky']),
-                'pattern_pred': float(predictions['pattern_based']),
-                'fallback_pred': float(predictions['fallback']),
-                'weather_adjustment': float(weather_adjustment),
-                'learning_adjustment': float(learning_adjustment),
-                'actual': None,
-                'error': None,
-                'error_percentage': None,
-                'conditions': str(conditions),
-                'weights': weights,
-                'cloud_cover': float(weather_impacts.get('cloud_cover', 0)),
-                'cloud_factor': float(cloud_factor)
-            }
+            # Store prediction with actual value if available
+            if final_prediction is not None:
+                success = self._store_prediction_with_history(
+                    target_date, 
+                    next_hour, 
+                    final_prediction, 
+                    actual_value,  # Include actual value if available
+                    conditions
+                )
+                if not success:
+                    print("Failed to store prediction")
             
-            # Store prediction and analyze patterns
-            self.prediction_history.append(prediction_record)
-            if len(self.prediction_history) % 24 == 0:
-                self.error_analyzer.analyze_errors(pd.DataFrame(self.prediction_history))
-            
-            # Print detailed prediction summary
-            print(f"\nPrediction Summary for Hour {next_hour:02d}:")
-            print(f"Main Model: {predictions['main_model']:.2f} W/m²")
-            print(f"Moving Average: {predictions['moving_avg']:.2f} W/m²")
-            print(f"Clear Sky: {predictions['clear_sky']:.2f} W/m²")
-            print(f"Pattern Based: {predictions['pattern_based']:.2f} W/m²")
-            print(f"Fallback: {predictions['fallback']:.2f} W/m²")
-            print(f"Ensemble: {predictions['ensemble']:.2f} W/m²")
-            print(f"Weather Adjustment: {weather_adjustment:.3f}")
-            print(f"Learning Adjustment: {learning_adjustment:.3f}")
-            print(f"Cloud Cover: {weather_impacts.get('cloud_cover', 0):.3f}")
-            print(f"Cloud Factor: {cloud_factor:.3f}")
-            print(f"Final Prediction: {prediction:.2f} W/m²")
-            
-            return prediction
+            return final_prediction
             
         except Exception as e:
-            print(f"Error in predict_next_hour: {str(e)}")
+            print(f"Error in prediction: {str(e)}")
             traceback.print_exc()
             return None
 
@@ -1615,91 +1540,74 @@ class AutomatedPredictor:
             traceback.print_exc()
             return current_value, None, 1.0
 
-    def _get_ensemble_prediction(self, **predictions):
-        """Combine multiple predictions using dynamic weights"""
+    def _get_ensemble_prediction(self, predictions, hour, conditions):
+        """Get ensemble prediction with normalized weights"""
         try:
-            # Get current hour
-            hour = predictions.get('hour', 0)
+            # Get ensemble model prediction
+            ensemble_prediction = None
+            if hour in self.time_series_ensemble.hour_specific_models:
+                # Prepare features for ensemble
+                features = {
+                    'temperature': conditions['temperature'],
+                    'humidity': conditions['humidity'],
+                    'pressure': conditions['pressure'],
+                    'uv': conditions['uv'],
+                    'clear_sky_rad': conditions['clear_sky_rad'],
+                    'solar_rad': conditions['solar_rad']
+                }
+                
+                ensemble_prediction = self.time_series_ensemble.predict(features, hour)
+                if ensemble_prediction is not None:
+                    predictions['ensemble'] = float(ensemble_prediction)
+                    print(f"ML Ensemble prediction: {ensemble_prediction:.2f}")
             
-            # Force 0 for nighttime hours
-            if hour >= 18 or hour <= 5:
-                return 0.0
-
-            # Base weights
+            # Base weights must sum to 1.0
             weights = {
-                'main_prediction': 0.4,
-                'moving_avg': 0.3,
-                'clear_sky_pred': 0.2,
-                'pattern_pred': 0.1
+                'main_model': 0.35,
+                'moving_avg': 0.25,
+                'pattern': 0.20,
+                'clear_sky': 0.20
             }
             
-            # Get current value for validation
-            current_value = predictions.get('current_value', 0)
+            # If ensemble prediction available, redistribute weights
+            if ensemble_prediction is not None:
+                weights = {
+                    'ensemble': 0.30,
+                    'main_model': 0.25,
+                    'moving_avg': 0.20,
+                    'pattern': 0.15,
+                    'clear_sky': 0.10
+                }
             
-            # Remove current_value from predictions before processing
-            if 'current_value' in predictions:
-                del predictions['current_value']
+            # Ensure weights sum to 1.0
+            total = sum(weights.values())
+            weights = {k: v/total for k, v in weights.items()}
             
-            # Validate predictions
-            valid_predictions = {}
+            # Calculate weighted prediction
+            final_prediction = 0.0
+            valid_weight = 0.0
+            
             for method, pred in predictions.items():
-                if method in weights:
-                    # Validate prediction is reasonable (between 0.1x and 3x current value)
-                    if current_value > 0:
-                        if 0.1 * current_value <= pred <= 3 * current_value:
-                            valid_predictions[method] = pred
-                        else:
-                            valid_predictions[method] = current_value
-                    else:
-                        valid_predictions[method] = max(0, pred)
+                if method in weights and pred is not None and np.isfinite(pred):
+                    weight = weights[method]
+                    final_prediction += pred * weight
+                    valid_weight += weight
             
-            # Adjust weights based on recent performance
-            if len(self.prediction_history) >= 24:
-                recent_errors = pd.DataFrame(self.prediction_history[-24:])
-                
-                # Calculate error rates for each method
-                for method in valid_predictions.keys():
-                    if method in recent_errors.columns:
-                        error_rate = abs(recent_errors[method] - recent_errors['actual']).mean()
-                        weights[method] *= (1 / (error_rate + 1))
-                
-                # Normalize weights
-                total = sum(weights[m] for m in valid_predictions.keys())
-                if total > 0:
-                    weights = {k: v/total for k, v in weights.items() if k in valid_predictions}
+            if valid_weight > 0:
+                final_prediction /= valid_weight
             
-            # Combine predictions
-            if valid_predictions:
-                ensemble_pred = sum(
-                    valid_predictions[method] * weights[method]
-                    for method in valid_predictions.keys()
-                )
-                
-                # Final validation
-                if current_value > 0:
-                    ensemble_pred = max(0.1 * current_value, min(3 * current_value, ensemble_pred))
-                else:
-                    ensemble_pred = max(0, ensemble_pred)
-                
-                print("\nEnsemble Prediction Details:")
-                for method in valid_predictions:
-                    print(f"{method}: {valid_predictions[method]:.2f} (weight: {weights[method]:.3f})")
-                print(f"Final ensemble prediction: {ensemble_pred:.2f}")
-                
-                return ensemble_pred
+            print(f"\nFinal ensemble prediction: {final_prediction:.2f}")
+            print("Weights used:")
+            for method, weight in weights.items():
+                if method in predictions:
+                    print(f"{method}: {weight:.2f}")
             
-            # Fallback to main prediction or current value if ensemble fails
-            return predictions.get('main_prediction', current_value)
+            return float(final_prediction)
             
         except Exception as e:
-            print(f"Error in _get_ensemble_prediction: {str(e)}")
+            print(f"Error in ensemble prediction: {str(e)}")
             traceback.print_exc()
-            return predictions.get('main_prediction', predictions.get('current_value', 0))
-            
-        except Exception as e:
-            print(f"Error in _get_ensemble_prediction: {str(e)}")
-            traceback.print_exc()
-            return predictions.get('main_prediction', predictions.get('current_value', 0))
+            return float(predictions.get('main_model', 0.0))
 
     def _calculate_prediction_confidence(self, prediction, current_value, clear_sky):
         """Calculate confidence score for a prediction"""
@@ -1911,42 +1819,31 @@ class AutomatedPredictor:
             traceback.print_exc()
             return 0.0
 
-    def _get_pattern_prediction(self, similar_days, current_value):
-        """Get prediction based on similar day patterns"""
+    def _get_pattern_prediction(self, current_value, hour):
+        """Get pattern-based prediction with validation"""
         try:
-            # Get current hour from conditions if available
-            hour = None
-            if similar_days and similar_days[0].get('data') is not None:
-                hour = similar_days[0]['data'].get('hour', None)
-            
-            # Force 0 for nighttime hours if hour is available
-            if hour is not None and (hour >= 18 or hour <= 5):
+            if hour >= 18 or hour <= 5:
                 return 0.0
-
-            if similar_days is None or len(similar_days) == 0:
+                
+            if not isinstance(current_value, (int, float)) or not np.isfinite(current_value):
+                return 0.0
+                
+            # Get historical patterns for this hour
+            hour_patterns = self.hourly_patterns.get(hour, [])
+            if not hour_patterns:
                 return current_value
+                
+            # Filter valid patterns
+            valid_patterns = [p['value'] for p in hour_patterns 
+                             if isinstance(p['value'], (int, float)) and np.isfinite(p['value'])]
             
-            predictions = []
-            weights = []
-            
-            for day in similar_days:
-                if isinstance(day, dict) and 'data' in day and 'similarity' in day:
-                    day_data = day['data']
-                    if not day_data.empty:
-                        next_hour_data = day_data['Solar Rad - W/m^2'].values
-                        if len(next_hour_data) > 0:
-                            predictions.append(next_hour_data[-1])
-                            weights.append(day['similarity'])
-            
-            if predictions:
-                weights = np.array(weights)
-                weights = weights / np.sum(weights)
-                return float(np.average(predictions, weights=weights))
-            
-            return current_value
+            if not valid_patterns:
+                return current_value
+                
+            return float(np.mean(valid_patterns))
             
         except Exception as e:
-            print(f"Error in _get_pattern_prediction: {str(e)}")
+            print(f"Error in pattern prediction: {str(e)}")
             return current_value
 
     def _get_ratio_prediction(self, similar_days, current_value):
@@ -2128,85 +2025,62 @@ class AutomatedPredictor:
         except Exception as e:
             print(f"Error adjusting ensemble weight: {str(e)}")
 
-    def _validate_prediction(self, prediction, clear_sky, current_value, hour):
-        """Enhanced prediction validation with transition handling"""
+    def _validate_prediction(self, prediction, hour, conditions):
+        """Validate prediction values"""
         try:
-            # Nighttime validation (no change needed)
-            if hour >= 18 or hour <= 4:
-                return 0.0
-
-            # Dawn transition (5-7)
-            if hour == 5:
-                max_value = min(clear_sky * 0.05, 10)  # More conservative
-                return min(prediction * 0.3, max_value)
-            elif hour == 6:
-                max_value = min(clear_sky * 0.15, 50)
-                return min(max(prediction * 0.5, current_value * 0.7), max_value)
-            elif hour == 7:
-                max_value = min(clear_sky * 0.35, 150)
-                return min(max(prediction * 0.7, current_value * 0.8), max_value)
-
-            # Dusk transition (15-17)
-            if hour == 15:
-                max_value = clear_sky * 0.65  # More gradual decrease
-                min_value = current_value * 0.8
-                return min(max(prediction * 0.9, min_value), max_value)
-            elif hour == 16:
-                max_value = clear_sky * 0.35
-                min_value = current_value * 0.7
-                return min(max(prediction * 0.8, min_value), max_value)
-            elif hour == 17:
-                max_value = clear_sky * 0.15
-                min_value = current_value * 0.5
-                return min(max(prediction * 0.6, min_value), max_value)
-
-            # Peak hours (8-14)
-            if 8 <= hour <= 14:
-                # More dynamic limits based on clear sky
-                max_limit = clear_sky * 0.98  # Increased from 0.95
+            if prediction is None:
+                return None
                 
-                # Asymmetric change limits
-                if current_value > 0:
-                    max_increase = current_value * 1.4  # Reduced from 1.5
-                    max_decrease = current_value * 0.7  # Increased from 0.6
-                    prediction = min(max(prediction, max_decrease), max_increase)
+            if not np.isfinite(prediction):
+                return None
                 
-                return min(max(0, prediction), max_limit)
-
-            return max(0, prediction)
-
+            # Get reasonable bounds based on hour and conditions
+            max_expected = self._get_max_expected(hour, conditions)
+            
+            # Clip prediction to reasonable range
+            prediction = np.clip(prediction, 0, max_expected)
+            
+            return float(prediction)
+            
         except Exception as e:
-            print(f"Error in _validate_prediction: {str(e)}")
-            return current_value
+            print(f"Validation error: {str(e)}")
+            return None
 
-    def _store_prediction(self, current_value, prediction, next_hour, conditions):
-        """Store prediction for learning"""
+    def _store_prediction_with_history(self, date, hour, predicted, actual, conditions):
+        """Store prediction with proper history tracking"""
         try:
-            transition_key = f"{next_hour-1}-{next_hour}"
-            if transition_key not in self.transition_patterns:
-                self.transition_patterns[transition_key] = []
-                
-            # Store prediction with timestamp and conditions
-            self.transition_patterns[transition_key].append({
-                'from_value': current_value,
-                'to_value': prediction,
+            # Create prediction record
+            prediction_record = {
+                'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
+                'hour': hour,
+                'predicted': float(predicted) if predicted is not None else None,
+                'actual': float(actual) if actual is not None else None,
                 'conditions': conditions,
-                'timestamp': pd.Timestamp.now(),
-                'error': None  # Will be updated when actual value is available
-            })
-            
-            # Also store in prediction history
-            self.prediction_history.append({
-                'hour': next_hour,
-                'current_value': current_value,
-                'predicted_value': prediction,
-                'conditions': str(conditions),
                 'timestamp': pd.Timestamp.now()
-            })
+            }
+            
+            # Calculate error metrics if actual value is available
+            if actual is not None and predicted is not None:
+                prediction_record['error'] = float(actual - predicted)
+                if actual != 0:
+                    prediction_record['error_percentage'] = (prediction_record['error'] / actual) * 100
+                else:
+                    prediction_record['error_percentage'] = 0.0 if predicted == 0 else 100.0
+            
+            # Store prediction without size limit
+            self.prediction_history.append(prediction_record)
+            
+            print(f"\nStored prediction for {date}, hour {hour}:")
+            print(f"Predicted: {predicted:.2f}")
+            print(f"Actual: {actual if actual is not None else 'Not yet available'}")
+            print(f"Total predictions stored: {len(self.prediction_history)}")
+            
+            return True
             
         except Exception as e:
-            print(f"Error in _store_prediction: {str(e)}")
+            print(f"Error storing prediction: {str(e)}")
             traceback.print_exc()
+            return False
 
     def analyze_learning_performance(self, window_size=100):
         """Analyze and visualize learning performance over time"""
@@ -2452,7 +2326,7 @@ class AutomatedPredictor:
                 prediction_record['error'] = actual - predicted
                 prediction_record['error_percentage'] = (prediction_record['error'] / actual * 100 if actual != 0 else 0)
             
-            self.prediction_history.append(prediction_record)
+            self._store_prediction(prediction_record)
             
             # Trigger learning analysis every 24 predictions
             if len(self.prediction_history) % 24 == 0:
@@ -2605,43 +2479,30 @@ class AutomatedPredictor:
             print(f"Error in _get_dynamic_learning_rate: {str(e)}")
             return 0.3  # Increased default rate
 
-    def _calculate_weather_impact(self, conditions, hour):
-        """Calculate enhanced weather impact with improved correlations"""
-        try:
-            impact = 1.0
-            
-            # Enhanced weighting based on correlation analysis
-            pressure = conditions.get('pressure', 1008)
-            humidity = conditions.get('humidity', 70)
-            temperature = conditions.get('temperature', 25)
-            
-            # Pressure impact (strongest correlation)
-            pressure_impact = 1 + (pressure - 1008) * 0.02  # Increased weight
-            impact *= pressure_impact
-            
-            # Humidity impact (second strongest)
-            if humidity > 80:
-                humidity_impact = 1 - (humidity - 80) * 0.015
-            else:
-                humidity_impact = 1 + (70 - humidity) * 0.01
-            impact *= humidity_impact
-            
-            # Temperature impact (negative correlation)
-            temp_optimal = 28  # Adjusted based on analysis
-            temp_impact = 1 - abs(temperature - temp_optimal) * 0.02
-            impact *= temp_impact
-            
-            # Time-based adjustments
-            if 5 <= hour <= 7:  # Dawn period
-                impact *= 0.85  # More conservative
-            elif 15 <= hour <= 17:  # Dusk period
-                impact *= 0.9
-                
-            return max(0.5, min(impact, 1.5))  # Wider range for impact
-            
-        except Exception as e:
-            print(f"Error in _calculate_weather_impact: {str(e)}")
-            return 1.0
+    def _calculate_weather_impact(self, conditions):
+        """Improved weather impact calculation based on correlations"""
+        impact = 1.0
+        
+        # Pressure impact (strongest correlation: 0.413)
+        pressure = conditions['pressure']
+        if pressure <= 1005.858:  # Highly negative impact zone
+            impact *= 0.7
+        elif pressure >= 1008.264:  # Positive impact zone
+            impact *= 1.2
+        
+        # Temperature compensation (correlation: -0.269)
+        temp = conditions['temperature']
+        if temp > 30.038:  # High temperature zone with large errors
+            impact *= 0.85
+        elif temp < 27.388:  # More accurate predictions
+            impact *= 1.1
+        
+        # UV-based adjustment (helps with daytime accuracy)
+        uv = conditions['uv']
+        if uv > 5.0:  # High UV indicates clear sky
+            impact = min(impact * 1.1, 1.2)  # Cap the increase
+        
+        return impact
 
     def _find_similar_patterns(self, current_pattern, hour, max_patterns=5):
         """Find similar patterns with enhanced time-based weighting"""
@@ -2721,61 +2582,55 @@ class AutomatedPredictor:
             return prediction
 
     def _get_moving_average(self, data, target_date, current_hour):
-        """Calculate moving average prediction based on recent data"""
+        """Calculate moving average with better handling of zero values"""
         try:
-            # Force 0 for nighttime hours
             next_hour = (current_hour + 1) % 24
             if next_hour >= 18 or next_hour <= 5:
                 return 0.0
 
-            # Get data up to current hour
             historical_data = data[data['timestamp'].dt.date <= target_date].copy()
             current_mask = (historical_data['timestamp'].dt.date == target_date) & \
                           (historical_data['timestamp'].dt.hour <= current_hour)
             historical_data = historical_data[~current_mask]
             
             if historical_data.empty:
-                return 0
+                return 0.0
             
-            # Calculate different window averages
-            values = historical_data['Solar Rad - W/m^2'].values
+            # Filter out zero values for better averages
+            valid_data = historical_data[historical_data['Solar Rad - W/m^2'] > 0]
+            if valid_data.empty:
+                return 0.0
             
-            # 24-hour moving average
+            values = valid_data['Solar Rad - W/m^2'].values
+            
+            # Calculate averages only from non-zero values
             day_avg = np.mean(values[-24:]) if len(values) >= 24 else np.mean(values)
             
-            # Hour-specific average (same hour in previous days)
-            hour_data = historical_data[historical_data['timestamp'].dt.hour == current_hour]
+            hour_data = valid_data[valid_data['timestamp'].dt.hour == current_hour]
             hour_avg = hour_data['Solar Rad - W/m^2'].mean() if not hour_data.empty else day_avg
             
-            # Recent trend (last 3 hours)
             recent_avg = np.mean(values[-3:]) if len(values) >= 3 else np.mean(values)
             
-            # Combine averages with weights
-            weights = {
-                'hour_avg': 0.5,    # Higher weight for hour-specific average
-                'day_avg': 0.3,     # Medium weight for daily pattern
-                'recent_avg': 0.2   # Lower weight for recent trend
-            }
-            
-            moving_avg = (
-                hour_avg * weights['hour_avg'] +
-                day_avg * weights['day_avg'] +
-                recent_avg * weights['recent_avg']
-            )
-            
-            # Print debug information
-            print(f"\nMoving Average Components:")
+            # Print components for debugging
+            print("\nMoving Average Components:")
             print(f"Hour average: {hour_avg:.2f}")
             print(f"Day average: {day_avg:.2f}")
             print(f"Recent average: {recent_avg:.2f}")
-            print(f"Combined moving average: {moving_avg:.2f}")
             
+            # Weighted combination
+            moving_avg = (
+                hour_avg * 0.5 +
+                day_avg * 0.3 +
+                recent_avg * 0.2
+            )
+            
+            print(f"Combined moving average: {moving_avg:.2f}")
             return float(moving_avg)
             
         except Exception as e:
-            print(f"Error in _get_moving_average: {str(e)}")
+            print(f"Error in moving average calculation: {str(e)}")
             traceback.print_exc()
-            return 0
+            return 0.0
 
     def _get_hour_statistics(self, hour):
         """Get statistical data for a specific hour"""
@@ -2934,7 +2789,10 @@ class AutomatedPredictor:
     def _write_overall_metrics(self, f, history_df):
         """Write overall performance metrics to report"""
         try:
-            # Basic metrics
+            # Convert date strings to datetime
+            history_df['date'] = pd.to_datetime(history_df['date'])
+            
+            # Basic metrics using full history
             metrics = {
                 'Total Predictions': len(history_df),
                 'Mean Absolute Error': history_df['error'].abs().mean(),
@@ -2944,11 +2802,13 @@ class AutomatedPredictor:
                 'Error Standard Deviation': history_df['error'].std()
             }
 
-            # Write metrics
+            # Write metrics with proper formatting
+            f.write("1. Overall Performance Metrics\n")
+            f.write("============================\n")
             for metric, value in metrics.items():
                 f.write(f"{metric}: {value:.2f}\n")
 
-            # Prediction accuracy bands
+            # Add prediction accuracy bands
             accuracy_bands = {
                 '< 5%': (history_df['error_percentage'].abs() < 5).mean() * 100,
                 '5-10%': ((history_df['error_percentage'].abs() >= 5) & 
@@ -2962,7 +2822,19 @@ class AutomatedPredictor:
             for band, percentage in accuracy_bands.items():
                 f.write(f"  {band}: {percentage:.1f}%\n")
 
+            # Add date range information with proper datetime handling
+            f.write("\nPrediction Period:\n")
+            start_date = history_df['date'].min()
+            end_date = history_df['date'].max()
+            total_days = (end_date - start_date).days + 1
+            
+            f.write(f"Start Date: {start_date.strftime('%Y-%m-%d')}\n")
+            f.write(f"End Date: {end_date.strftime('%Y-%m-%d')}\n")
+            f.write(f"Total Days: {total_days}\n")
+
         except Exception as e:
+            print(f"Error calculating overall metrics: {str(e)}")
+            traceback.print_exc()
             f.write(f"\nError calculating overall metrics: {str(e)}\n")
 
     def _write_hourly_analysis(self, f, history_df):
@@ -3139,15 +3011,13 @@ class AutomatedPredictor:
             f.write("\nConsecutive Error Patterns:\n")
             f.write("  Over-predictions (>3 consecutive):\n")
             over_runs = error_runs[
-                (error_runs['first'] < 0) & (error_runs['count'] > 3)
-            ]['count'].value_counts()
+                (error_runs['first'] < 0) & (error_runs['count'] > 3)]['count'].value_counts()
             for length, count in over_runs.items():
                 f.write(f"    {length} consecutive: {count} occurrences\n")
                 
             f.write("\n  Under-predictions (>3 consecutive):\n")
             under_runs = error_runs[
-                (error_runs['first'] > 0) & (error_runs['count'] > 3)
-            ]['count'].value_counts()
+                (error_runs['first'] > 0) & (error_runs['count'] > 3)]['count'].value_counts()
             for length, count in under_runs.items():
                 f.write(f"    {length} consecutive: {count} occurrences\n")
 
@@ -3156,6 +3026,16 @@ class AutomatedPredictor:
 
     def _save_performance_metrics(self, metrics_path, history_df):
         try:
+            # Create hourly stats dictionary first
+            hourly_stats = {}
+            for hour, hour_data in history_df.groupby('hour'):
+                hourly_stats[str(hour)] = {
+                    'mae': float(hour_data['error'].abs().mean()),
+                    'mape': float(hour_data['error_percentage'].abs().mean()),
+                    'count': int(len(hour_data))
+            }
+            
+            # Then use it in the main metrics dictionary
             metrics = {
                 'metadata': {
                     'generated_at': str(pd.Timestamp.now()),
@@ -3173,14 +3053,7 @@ class AutomatedPredictor:
                     'mape': float(history_df['error_percentage'].abs().mean()),
                     'bias': float(history_df['error'].mean())
                 },
-                'hourly': {
-                    str(hour): {
-                        'mae': float(hour_data['error'].abs().mean()),
-                        'mape': float(hour_data['error_percentage'].abs().mean()),
-                        'count': int(len(hour_data))
-                    }
-                    for hour, hour_data in history_df.groupby('hour')
-                },
+                'hourly': hourly_stats,
                 'learning_progress': {
                     'initial_mae': float(history_df['error'].abs().iloc[:24].mean()),
                     'final_mae': float(history_df['error'].abs().iloc[-24:].mean()),
@@ -3188,7 +3061,7 @@ class AutomatedPredictor:
                         (history_df['error'].abs().iloc[:24].mean() - 
                          history_df['error'].abs().iloc[-24:].mean()) / 
                         history_df['error'].abs().iloc[:24].mean() * 100)
-                }
+                    }
             }
 
             with open(metrics_path, 'w') as f:
@@ -3198,88 +3071,103 @@ class AutomatedPredictor:
             print(f"Error saving performance metrics: {str(e)}")
 
     def _generate_performance_plots(self, report_dir, history_df):
-        """Generate comprehensive performance visualization plots"""
+        """Generate comprehensive performance visualization plots with robust data validation"""
         try:
             plot_files = []
             
+            # Deep copy to avoid modifying original data
+            plot_df = history_df.copy()
+            
             # Ensure date column is datetime
-            if 'date' in history_df.columns:
-                history_df['date'] = pd.to_datetime(history_df['date'])
+            if 'date' in plot_df.columns:
+                plot_df['date'] = pd.to_datetime(plot_df['date'])
             
-            # Error Distribution
-            plot_path = report_dir / 'error_distribution.png'
+            # Clean and validate all numeric columns
+            numeric_columns = ['error', 'error_percentage', 'predicted', 'actual']
+            for col in numeric_columns:
+                if col in plot_df.columns:
+                    # Replace infinite values
+                    plot_df[col] = plot_df[col].replace([np.inf, -np.inf], np.nan)
+                    # Fill NaN values with column median
+                    median_value = plot_df[col].median()
+                    plot_df[col] = plot_df[col].fillna(median_value)
+                    # Clip extreme values to reasonable ranges
+                    if 'percentage' in col:
+                        plot_df[col] = plot_df[col].clip(-100, 100)
+                    else:
+                        q1, q99 = plot_df[col].quantile([0.01, 0.99])
+                        plot_df[col] = plot_df[col].clip(q1, q99)
+            
+            # 1. Error Distribution Plot
             plt.figure(figsize=(10, 6))
-            sns.histplot(data=history_df, x='error_percentage', bins=50)
-            plt.title('Error Distribution')
-            plt.xlabel('Error Percentage')
-            plt.savefig(plot_path)
+            valid_errors = plot_df['error_percentage'].dropna()
+            if len(valid_errors) > 0:
+                sns.histplot(data=valid_errors, bins=50)
+                plt.title('Error Distribution')
+                plt.xlabel('Error Percentage')
+                plt.savefig(report_dir / 'error_distribution.png')
             plt.close()
-            plot_files.append(plot_path)
-            print(f"Saved plot: {plot_path}")
             
-            # Learning Progress
+            # 2. Learning Progress Plot
             plt.figure(figsize=(10, 6))
-            history_df['rolling_mae'] = history_df['error'].abs().rolling(24).mean()
-            plt.plot(range(len(history_df)), history_df['rolling_mae'])
-            plt.title('Learning Progress (24-hour Rolling MAE)')
-            plt.ylabel('Mean Absolute Error (W/m²)')
-            plt.xlabel('Prediction Number')
-            plt.savefig(report_dir / 'learning_progress.png')
+            plot_df['rolling_mae'] = plot_df['error'].abs().rolling(24, min_periods=1).mean()
+            valid_indices = np.arange(len(plot_df))
+            valid_mae = plot_df['rolling_mae'].dropna()
+            if len(valid_mae) > 0:
+                plt.plot(valid_indices[-len(valid_mae):], valid_mae)
+                plt.title('Learning Progress (24-hour Rolling MAE)')
+                plt.ylabel('Mean Absolute Error (W/m²)')
+                plt.xlabel('Prediction Number')
+                plt.savefig(report_dir / 'learning_progress.png')
             plt.close()
-            plot_files.append(report_dir / 'learning_progress.png')
-            print(f"Saved plot: {report_dir / 'learning_progress.png'}")
             
-            # Hourly Performance Heatmap
+            # 3. Hourly Performance Heatmap
             plt.figure(figsize=(12, 8))
-            # Create pivot table using numeric indices instead of dates
-            hourly_errors = history_df.pivot_table(
-                values='error_percentage',
-                index=history_df.index // 24,  # Group by day number
-                columns='hour',
-                aggfunc='mean'
-            )
-            sns.heatmap(hourly_errors, cmap='RdYlBu_r')
-            plt.title('Hourly Error Patterns')
-            plt.xlabel('Hour of Day')
-            plt.ylabel('Day Number')
-            plt.savefig(report_dir / 'hourly_heatmap.png')
+            try:
+                hourly_errors = plot_df.pivot_table(
+                    values='error_percentage',
+                    index=plot_df.index // 24,
+                    columns='hour',
+                    aggfunc='mean'
+                )
+                if not hourly_errors.empty:
+                    sns.heatmap(hourly_errors, cmap='RdYlBu_r', center=0)
+                    plt.title('Hourly Error Patterns')
+                    plt.xlabel('Hour of Day')
+                    plt.ylabel('Day Number')
+                    plt.savefig(report_dir / 'hourly_heatmap.png')
+            except Exception as e:
+                print(f"Error generating heatmap: {str(e)}")
             plt.close()
-            plot_files.append(report_dir / 'hourly_heatmap.png')
-            print(f"Saved plot: {report_dir / 'hourly_heatmap.png'}")
             
-            # Prediction vs Actual Scatter
+            # 4. Prediction vs Actual Scatter Plot
             plt.figure(figsize=(10, 10))
-            plt.scatter(history_df['actual'], history_df['predicted'], alpha=0.5)
-            max_val = max(history_df['actual'].max(), history_df['predicted'].max())
-            plt.plot([0, max_val], [0, max_val], 'r--')
-            plt.title('Predicted vs Actual Values')
-            plt.xlabel('Actual (W/m²)')
-            plt.ylabel('Predicted (W/m²)')
-            plt.savefig(report_dir / 'prediction_scatter.png')
+            valid_mask = (
+                plot_df['actual'].notna() & 
+                plot_df['predicted'].notna() & 
+                np.isfinite(plot_df['actual']) & 
+                np.isfinite(plot_df['predicted']))
+            if valid_mask.any():
+                valid_data = plot_df[valid_mask]
+                plt.scatter(
+                    valid_data['actual'],
+                    valid_data['predicted'],
+                    alpha=0.5,
+                    s=20  # Smaller point size
+                )
+                # Add identity line
+                min_val = min(valid_data['actual'].min(), valid_data['predicted'].min())
+                max_val = max(valid_data['actual'].max(), valid_data['predicted'].max())
+                plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect Prediction')
+                plt.title('Predicted vs Actual Values')
+                plt.xlabel('Actual (W/m²)')
+                plt.ylabel('Predicted (W/m²)')
+                plt.legend()
+                plt.savefig(report_dir / 'prediction_scatter.png')
             plt.close()
-            plot_files.append(report_dir / 'prediction_scatter.png')
-            print(f"Saved plot: {report_dir / 'prediction_scatter.png'}")
-            
-            # Error trends by hour
-            plt.figure(figsize=(12, 6))
-            hourly_mean_error = history_df.groupby('hour')['error_percentage'].mean()
-            hourly_std_error = history_df.groupby('hour')['error_percentage'].std()
-            plt.errorbar(hourly_mean_error.index, hourly_mean_error, 
-                        yerr=hourly_std_error, capsize=5)
-            plt.title('Mean Error by Hour')
-            plt.xlabel('Hour of Day')
-            plt.ylabel('Mean Error Percentage')
-            plt.grid(True)
-            plt.savefig(report_dir / 'hourly_error_trends.png')
-            plt.close()
-            plot_files.append(report_dir / 'hourly_error_trends.png')
-            print(f"Saved plot: {report_dir / 'hourly_error_trends.png'}")
             
             print(f"\nGenerated plots saved to: {report_dir}")
-            print("Plot files created:")
-            for plot_file in plot_files:
-                print(f"- {plot_file}")
-
+            
         except Exception as e:
             print(f"Error generating performance plots: {str(e)}")
             traceback.print_exc()
@@ -3318,125 +3206,734 @@ class AutomatedPredictor:
             print(f"Error initializing directories: {str(e)}")
             traceback.print_exc()
 
-# Add imports at the top
-from copy import deepcopy
-from lightgbm import LGBMRegressor
-from xgboost import XGBRegressor
-from catboost import CatBoostRegressor
-from sklearn.ensemble import StackingRegressor
+    def _update_weather_impacts(self, conditions):
+        """Enhanced weather impact calculation"""
+        impacts = {}
+        
+        # Pressure has strongest correlation (0.502)
+        pressure_impact = self._calculate_pressure_impact(conditions['pressure'])
+        impacts['pressure'] = pressure_impact * 0.4  # Increased weight
+        
+        # Humidity has significant impact (129.57% difference)
+        humidity_impact = self._calculate_humidity_impact(conditions['humidity'])
+        impacts['humidity'] = humidity_impact * 0.3
+        
+        # Temperature and UV impacts
+        impacts['temperature'] = self._calculate_temperature_impact(conditions['temperature']) * 0.2
+        impacts['uv'] = self._calculate_uv_impact(conditions['uv']) * 0.1
+        
+        return impacts
+
+    def _adjust_prediction(self, initial_prediction, hour, conditions):
+        """Add pattern-based correction"""
+        if self.error_learner.pattern_adjustments.get(str(hour), {}).get('consecutive_under', 0) > 3:
+            # Compensate for persistent under-prediction
+            adjustment_factor = 1.15
+        elif self.error_learner.pattern_adjustments.get(str(hour), {}).get('consecutive_over', 0) > 3:
+            # Compensate for persistent over-prediction
+            adjustment_factor = 0.85
+        else:
+            adjustment_factor = 1.0
+            
+        return initial_prediction * adjustment_factor
+
+    def _adjust_for_error_patterns(self, hour, prediction):
+        """Enhanced error pattern correction"""
+        consecutive_unders = self.error_learner.pattern_adjustments.get(str(hour), {}).get('consecutive_under', 0)
+        consecutive_overs = self.error_learner.pattern_adjustments.get(str(hour), {}).get('consecutive_over', 0)
+        
+        if consecutive_unders > 8:  # Long streak of under-predictions
+            adjustment = 1.25
+        elif consecutive_unders > 4:
+            adjustment = 1.15
+        elif consecutive_overs > 4:
+            adjustment = 0.85
+        else:
+            adjustment = 1.0
+            
+            # Add time-of-day specific adjustments
+        if 6 <= hour <= 8:  # Morning hours (severe under-prediction)
+            adjustment *= 1.2
+        elif 15 <= hour <= 17:  # Evening hours (severe over-prediction)
+            adjustment *= 0.8
+        
+        return prediction * adjustment
+
+    def _generate_learning_analysis_plot(self, save_path):
+        try:
+            # Create figure with specific DPI
+            plt.figure(figsize=(15, 10), dpi=100)
+            
+            # Get clean data
+            history_df = pd.DataFrame(self.prediction_history)
+            if history_df.empty:
+                return
+                
+            # Convert error column to numeric and clean
+            history_df['error'] = pd.to_numeric(history_df['error'], errors='coerce')
+            history_df = history_df.replace([np.inf, -np.inf], np.nan).dropna(subset=['error'])
+            
+            if len(history_df) < 2:
+                return
+                
+            # Calculate rolling metrics with validation
+            for window, color, label in zip([24, 72, 168], ['blue', 'green', 'red'], 
+                                          ['24h', '72h', '168h']):
+                mae = history_df['error'].abs().rolling(window=window, min_periods=1).mean()
+                valid_mask = mae.notna() & np.isfinite(mae)
+                
+                if valid_mask.any():
+                    x_vals = np.arange(len(mae))[valid_mask]
+                    y_vals = mae[valid_mask].values
+                    
+                    # Remove outliers
+                    q1, q99 = np.percentile(y_vals, [1, 99])
+                    y_vals = np.clip(y_vals, q1, q99)
+                    
+                    plt.plot(x_vals, y_vals, color=color, label=f'{label} MAE', alpha=0.7)
+            
+            plt.title('Learning Progress')
+            plt.xlabel('Prediction Number')
+            plt.ylabel('Mean Absolute Error')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(save_path)
+            plt.close()
+            
+        except Exception as e:
+            print(f"Plot error: {str(e)}")
+            plt.close()
+
+    def _calculate_transition_adjustments(self, hour, conditions):
+        """Enhanced transition period handling"""
+        try:
+            # Dawn transition (5-8 AM)
+            if 5 <= hour <= 8:
+                base = {
+                    5: 1.2,  # Gentle start
+                    6: 1.5,  # Steeper increase
+                    7: 1.8,  # Peak adjustment
+                    8: 1.4   # Tapering off
+                }
+                adjustment = base.get(hour, 1.0)
+                
+                # Modify based on conditions
+                if conditions['pressure'] > 1007.6:  # High pressure improves accuracy
+                    adjustment *= 1.2
+                if conditions['humidity'] > 75:  # High humidity needs more boost
+                    adjustment *= 1.15
+                    
+            # Dusk transition (15-17)
+            elif 15 <= hour <= 17:
+                base = {
+                    15: 0.85,  # Gentle decrease
+                    16: 0.70,  # Steeper decrease
+                    17: 0.50   # Sharp reduction
+                }
+                adjustment = base.get(hour, 1.0)
+                
+                # Modify based on conditions
+                if conditions['humidity'] > 70:  # High humidity needs more reduction
+                    adjustment *= 0.85
+                    
+            else:
+                adjustment = 1.0
+                
+            return adjustment
+            
+        except Exception as e:
+            print(f"Error in transition adjustment: {str(e)}")
+            return 1.0
+
+    def _calculate_error_percentage(self, actual, predicted):
+        """Calculate error percentage with proper handling of zero values"""
+        try:
+            if actual == 0 and predicted == 0:
+                return 0.0
+            elif actual == 0:
+                return 100.0 if predicted > 0 else 0.0
+            else:
+                return ((actual - predicted) / actual) * 100
+        except Exception as e:
+            print(f"Error calculating percentage: {str(e)}")
+            return float('nan')
+
+    def _update_method_weights(self, predictions, actual):
+        """Update method weights with robust error handling"""
+        try:
+            if actual is None or not np.isfinite(actual):
+                return
+                
+            errors = {}
+            for method, pred in predictions.items():
+                if pred is not None and np.isfinite(pred):
+                    error = abs(actual - pred)
+                    errors[method] = error
+                else:
+                    errors[method] = float('inf')
+                    
+            # Calculate weights inversely proportional to errors
+            total_inverse_error = sum(1/e if e > 0 else 1 for e in errors.values())
+            
+            if total_inverse_error > 0:
+                weights = {
+                    method: (1/error)/total_inverse_error if error > 0 else 1/len(errors)
+                    for method, error in errors.items()
+                }
+            else:
+                # Equal weights if all errors are zero
+                weights = {method: 1/len(errors) for method in errors}
+                
+            return weights
+            
+        except Exception as e:
+            print(f"Error updating weights: {str(e)}")
+            return None
+
+    def _calculate_weather_adjustment(self, conditions, hour):
+        """Enhanced weather impact calculation"""
+        try:
+            # Base adjustments
+            pressure_impact = self._get_pressure_impact(conditions['pressure'])
+            humidity_impact = self._get_humidity_impact(conditions['humidity'], hour)
+            temp_impact = self._get_temperature_impact(conditions['temperature'], hour)
+            
+            # Weight impacts based on time of day
+            if 6 <= hour <= 8:  # Morning
+                weights = {'pressure': 0.5, 'humidity': 0.3, 'temperature': 0.2}
+            elif 11 <= hour <= 13:  # Peak hours
+                weights = {'pressure': 0.3, 'humidity': 0.4, 'temperature': 0.3}
+            elif 15 <= hour <= 17:  # Evening
+                weights = {'pressure': 0.2, 'humidity': 0.5, 'temperature': 0.3}
+            else:
+                weights = {'pressure': 0.4, 'humidity': 0.4, 'temperature': 0.2}
+                
+            adjustment = (
+                pressure_impact * weights['pressure'] +
+                humidity_impact * weights['humidity'] +
+                temp_impact * weights['temperature']
+            )
+            
+            return np.clip(adjustment, 0.5, 1.5)
+            
+        except Exception as e:
+            print(f"Error in weather adjustment: {str(e)}")
+            return 1.0
+
+    def _get_current_conditions(self, data, target_date, current_hour):
+        """Get current conditions with validation"""
+        try:
+            # Get current day's data
+            current_day = data[data['timestamp'].dt.date == target_date]
+            if current_day.empty:
+                print(f"No data available for date {target_date}")
+                return None
+                
+            # Get current hour data
+            current_data = current_day[current_day['timestamp'].dt.hour == current_hour]
+            if current_data.empty:
+                print(f"No data available for hour {current_hour}")
+                return None
+                
+            # Extract conditions
+            conditions = {
+                'hour': int(current_hour),
+                'temperature': float(current_data['Average Temperature'].iloc[0]),
+                'humidity': float(current_data['Average Humidity'].iloc[0]),
+                'pressure': float(current_data['Average Barometer'].iloc[0]),
+                'uv': float(current_data['UV Index'].iloc[0]),
+                'solar_rad': float(current_data['Solar Rad - W/m^2'].iloc[0]),
+                'clear_sky_rad': float(calculate_clear_sky_radiation(
+                    hour=current_hour,
+                    latitude=ADDU_LATITUDE,
+                    longitude=ADDU_LONGITUDE,
+                    date=target_date,
+                    temperature=current_data['Average Temperature'].iloc[0],
+                    humidity=current_data['Average Humidity'].iloc[0],
+                    pressure=current_data['Average Barometer'].iloc[0]
+                ))
+            }
+            
+            return conditions
+            
+        except Exception as e:
+            print(f"Error getting current conditions: {str(e)}")
+            traceback.print_exc()
+            return None
+
+    # Add this method inside the AutomatedPredictor class
+    def _get_all_predictions(self, data, target_date, current_hour, conditions):
+        """Get predictions from all available methods"""
+        try:
+            predictions = {}
+            
+            # Get current value
+            current_data = data[
+                (data['timestamp'].dt.date == target_date) & 
+                (data['timestamp'].dt.hour == current_hour)
+            ]  # Add closing bracket here
+
+            if current_data.empty:
+                print("No current data available")
+                return None
+                
+            current_value = float(current_data['Solar Rad - W/m^2'].iloc[0])
+            
+            # Calculate clear sky radiation for next hour
+            next_hour = (current_hour + 1) % 24
+            clear_sky = calculate_clear_sky_radiation(
+                hour=next_hour,
+                latitude=ADDU_LATITUDE,
+                longitude=ADDU_LONGITUDE,
+                date=target_date,
+                temperature=conditions['temperature'],
+                humidity=conditions['humidity'],
+                pressure=conditions['pressure']
+            )
+            
+            # Get main model prediction
+            main_prediction, weights, adjustment = self._get_main_prediction(
+                current_value, conditions, clear_sky
+            )
+            predictions['main_model'] = main_prediction
+            
+            # Get moving average prediction
+            moving_avg = self._get_moving_average(data, target_date, current_hour)
+            predictions['moving_avg'] = moving_avg
+            
+            # Get pattern-based prediction
+            pattern_pred = self._get_pattern_prediction(current_value, next_hour)
+            predictions['pattern'] = pattern_pred
+            
+            # Add clear sky prediction
+            predictions['clear_sky'] = clear_sky * 0.85  # Typical clear sky factor
+            
+            # Validate predictions
+            for method, pred in predictions.items():
+                if pred is None or not np.isfinite(pred):
+                    print(f"Invalid prediction from {method}")
+                    predictions[method] = current_value
+            
+            print("\nPrediction components:")
+            for method, pred in predictions.items():
+                print(f"{method}: {pred:.2f}")
+                
+            return predictions
+            
+        except Exception as e:
+            print(f"Error in _get_all_predictions: {str(e)}")
+            traceback.print_exc()
+            return None
+
+    # Add these methods inside the AutomatedPredictor class
+
+    def _get_pressure_impact(self, pressure):
+        """Calculate impact of pressure on solar radiation"""
+        try:
+            # Pressure thresholds based on analysis
+            if pressure <= 1005.0:  # Low pressure system
+                return 0.8
+            elif pressure >= 1015.0:  # High pressure system
+                return 1.2
+            else:
+                # Linear interpolation between thresholds
+                return 0.8 + (pressure - 1005.0) * 0.04 / 10.0
+                
+        except Exception as e:
+            print(f"Error in pressure impact calculation: {str(e)}")
+            return 1.0
+
+    def _get_humidity_impact(self, humidity, hour):
+        """Calculate impact of humidity on solar radiation"""
+        try:
+            # Different impacts based on time of day
+            if 6 <= hour <= 9:  # Morning hours
+                if humidity > 85:
+                    return 0.7
+                elif humidity > 70:
+                    return 0.85
+                else:
+                    return 1.0
+            elif 10 <= hour <= 14:  # Peak hours
+                if humidity > 80:
+                    return 0.8
+                elif humidity > 65:
+                    return 0.9
+                else:
+                    return 1.0
+            else:  # Other hours
+                if humidity > 75:
+                    return 0.85
+                else:
+                    return 1.0
+                
+        except Exception as e:
+            print(f"Error in humidity impact calculation: {str(e)}")
+            return 1.0
+
+    def _get_temperature_impact(self, temperature, hour):
+        """Calculate impact of temperature on solar radiation"""
+        try:
+            # Temperature thresholds vary by time of day
+            if 10 <= hour <= 14:  # Peak hours
+                if temperature > 32:
+                    return 0.9  # High temperatures can indicate cloud cover
+                elif temperature < 25:
+                    return 0.85  # Unusually cool suggests clouds
+                else:
+                    return 1.0
+            else:  # Non-peak hours
+                if temperature > 30:
+                    return 0.95
+                elif temperature < 23:
+                    return 0.9
+                else:
+                    return 1.0
+                
+        except Exception as e:
+            print(f"Error in temperature impact calculation: {str(e)}")
+            return 1.0
+
+    # Add this method to the AutomatedPredictor class
+    def _store_prediction_with_history(self, date, hour, predicted, actual, conditions):
+        """Store prediction with proper history tracking"""
+        try:
+            # Create prediction record
+            prediction_record = {
+                'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
+                'hour': hour,
+                'predicted': float(predicted) if predicted is not None else None,
+                'actual': float(actual) if actual is not None else None,
+                'conditions': conditions,
+                'timestamp': pd.Timestamp.now()
+            }
+            
+            # Calculate error metrics if actual value is available
+            if actual is not None and predicted is not None:
+                prediction_record['error'] = float(actual - predicted)
+                if actual != 0:
+                    prediction_record['error_percentage'] = (prediction_record['error'] / actual) * 100
+                else:
+                    prediction_record['error_percentage'] = 0.0 if predicted == 0 else 100.0
+            
+            # Store prediction
+            self.prediction_history.append(prediction_record)
+            
+            # Keep history size manageable
+            if len(self.prediction_history) > 1000:  # Keep last 1000 predictions
+                self.prediction_history = self.prediction_history[-1000:]
+                
+            print(f"\nStored prediction for {date}, hour {hour}:")
+            print(f"Predicted: {predicted:.2f}")
+            print(f"Actual: {actual if actual is not None else 'Not yet available'}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error storing prediction: {str(e)}")
+            traceback.print_exc()
+            return False
+
+    # Modify the predict_next_hour method to use the new storage function
+    def predict_next_hour(self, data, target_date, current_hour):
+        """Enhanced prediction with validation"""
+        try:
+            # Input validation
+            if not isinstance(current_hour, (int, float)) or not 0 <= current_hour <= 23:
+                raise ValueError(f"Invalid hour: {current_hour}")
+            
+            next_hour = (current_hour + 1) % 24
+            
+            # Get conditions with validation
+            conditions = self._get_current_conditions(data, target_date, current_hour)
+            if not conditions:
+                print("Failed to get current conditions")
+                return None
+            
+            # Get predictions with validation
+            predictions = self._get_all_predictions(data, target_date, current_hour, conditions)
+            if not predictions:
+                print("Failed to get predictions")
+                return None
+            
+            # Calculate adjustments
+            weather_adjustment = self._calculate_weather_adjustment(conditions, next_hour)
+            transition_adjustment = self._calculate_transition_adjustments(next_hour, conditions)
+            
+            # Get ensemble prediction
+            final_prediction = self._get_ensemble_prediction(predictions, next_hour, conditions)
+            
+            # Apply adjustments
+            final_prediction *= weather_adjustment * transition_adjustment
+            
+            # Validate final prediction
+            final_prediction = self._validate_prediction(final_prediction, next_hour, conditions)
+            
+            # Store prediction with proper history tracking
+            if final_prediction is not None:
+                success = self._store_prediction_with_history(
+                    target_date, 
+                    next_hour, 
+                    final_prediction, 
+                    None,  # Actual value will be updated later
+                    conditions
+                )
+                if not success:
+                    print("Failed to store prediction")
+            
+            return final_prediction
+            
+        except Exception as e:
+            print(f"Error in prediction: {str(e)}")
+            traceback.print_exc()
+            return None
+
+    # Add this method to the AutomatedPredictor class
+    def _get_max_expected(self, hour, conditions):
+        """Get maximum expected solar radiation with more conservative limits"""
+        try:
+            # Calculate clear sky radiation
+            clear_sky = calculate_clear_sky_radiation(
+                hour=hour,
+                latitude=ADDU_LATITUDE,
+                longitude=ADDU_LONGITUDE,
+                date=pd.Timestamp.now().date(),
+                temperature=conditions['temperature'],
+                humidity=conditions['humidity'],
+                pressure=conditions['pressure']
+            )
+            
+            # Get historical maximum with validation
+            hour_stats = self._get_hour_statistics(hour)
+            historical_max = hour_stats['max'] if hour_stats and 'max' in hour_stats else clear_sky
+            
+            # More conservative limits based on time of day
+            if hour <= 5 or hour >= 19:  # Night hours
+                return 0.0
+            elif 6 <= hour <= 8:  # Dawn
+                return min(clear_sky * 0.6, historical_max * 1.1)  # More conservative dawn limits
+            elif 16 <= hour <= 18:  # Dusk
+                return min(clear_sky * 0.4, historical_max * 1.0)  # More conservative dusk limits
+            else:  # Daytime
+                # Consider weather conditions
+                cloud_impact = self.weather_analyzer.analyze_conditions(conditions).get('cloud_cover', 0)
+                weather_factor = 1.0 - (cloud_impact * 0.8)  # Increased cloud impact
+                
+                # More conservative maximum
+                max_expected = min(
+                    clear_sky * weather_factor,  # No additional allowance above clear sky
+                    historical_max * 1.1  # Only 10% above historical maximum
+                )
+                
+                print(f"\nMaximum expected calculation for hour {hour}:")
+                print(f"Clear sky radiation: {clear_sky:.2f} W/m²")
+                print(f"Historical maximum: {historical_max:.2f} W/m²")
+                print(f"Weather factor: {weather_factor:.2f}")
+                print(f"Final max expected: {max_expected:.2f} W/m²")
+                
+                return float(max_expected)
+                
+        except Exception as e:
+            print(f"Error in _get_max_expected: {str(e)}")
+            traceback.print_exc()
+            return 1000.0  # More conservative fallback maximum
+
+    def _validate_prediction(self, prediction, hour, conditions):
+        """Validate prediction values with enhanced checks"""
+        try:
+            if prediction is None:
+                return None
+                
+            if not np.isfinite(prediction):
+                print("Non-finite prediction value")
+                return None
+                
+            # Get reasonable bounds
+            max_expected = self._get_max_expected(hour, conditions)
+            
+            # Basic range validation
+            if prediction < 0:
+                print(f"Negative prediction ({prediction:.2f}) corrected to 0")
+                return 0.0
+                
+            if prediction > max_expected:
+                print(f"Prediction ({prediction:.2f}) exceeded maximum expected ({max_expected:.2f})")
+                return max_expected
+                
+            # Validate against current conditions
+            current_value = conditions.get('solar_rad', 0)
+            if current_value > 0:
+                change_ratio = prediction / current_value
+                if change_ratio > 3:  # More than triple
+                    print(f"Excessive increase ({change_ratio:.1f}x) from current value")
+                    return min(current_value * 2, prediction)  # Limit to double
+                    
+            return float(prediction)
+            
+        except Exception as e:
+            print(f"Validation error: {str(e)}")
+            traceback.print_exc()
+            return None
 
 class TimeSeriesEnsemble:
     def __init__(self):
         # Base models with adjusted parameters
         self.lgb = LGBMRegressor(
-            n_estimators=50,  # Reduced from 100
-            learning_rate=0.1,  # Increased from 0.05
-            num_leaves=15,   # Reduced from 31
-            min_child_samples=20,  # Add minimum samples per leaf
+            n_estimators=50,
+            learning_rate=0.1,
+            num_leaves=15,
+            min_child_samples=20,
             feature_fraction=0.8,
             subsample=0.8,
-            reg_alpha=0.1,   # Add L1 regularization
-            reg_lambda=0.1,  # Add L2 regularization
-            verbose=-1       # Suppress warnings
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            verbose=-1
         )
         
         self.xgb = XGBRegressor(
-            n_estimators=50,  # Reduced from 100
-            learning_rate=0.1,  # Increased from 0.05
-            max_depth=4,     # Reduced from 6
+            n_estimators=50,
+            learning_rate=0.1,
+            max_depth=4,
             min_child_weight=3,
             subsample=0.8,
             colsample_bytree=0.8,
             reg_alpha=0.1,
             reg_lambda=0.1,
-            verbosity=0      # Suppress warnings
+            verbosity=0
         )
         
-        # Stacking ensemble with simpler final estimator
         self.ensemble = StackingRegressor(
             estimators=[
                 ('lgb', self.lgb),
                 ('xgb', self.xgb)
             ],
             final_estimator=LGBMRegressor(
-                n_estimators=25,  # Reduced from 50
+                n_estimators=25,
                 learning_rate=0.1,
-                num_leaves=7,     # Reduced complexity
+                num_leaves=7,
                 min_child_samples=20,
                 verbose=-1
             ),
-            n_jobs=-1  # Use all available cores
+            n_jobs=-1
         )
         
         self.hour_specific_models = {}
+        self.feature_columns = None  # Store feature columns used in training
+        self.model_status = {hour: {'trained': False, 'samples': 0} for hour in range(24)}
+        print("Initialized TimeSeriesEnsemble with base models")
 
-    def prepare_features(self, data, target_hour):
-        """Prepare features with temporal components"""
+    def prepare_features(self, data, hour):
+        """Prepare features with consistent column ordering"""
         try:
-            features = {
-                'hour_sin': np.sin(2 * np.pi * data['hour']/24),
-                'hour_cos': np.cos(2 * np.pi * data['hour']/24),
-                'temperature': data['Average Temperature'],
-                'humidity': data['Average Humidity'],
-                'pressure': data['Average Barometer'],
-                'uv': data['UV Index'],
-                'clear_sky_radiation': data['clear_sky_radiation'],
-                'rolling_mean_3h': data.groupby('date')['Solar Rad - W/m^2'].transform(
-                    lambda x: x.rolling(window=3, min_periods=1).mean()
-                )
-            }
+            # Define standard feature columns
+            feature_cols = [
+                'hour_sin', 'hour_cos', 
+                'temperature', 'humidity', 'pressure', 'uv',
+                'clear_sky_radiation', 'current_radiation'
+            ]
             
-            df = pd.DataFrame(features)
-            # Fill NaN values
-            df = df.fillna(method='ffill').fillna(method='bfill').fillna(0)
-            return df
+            # Create features DataFrame
+            if isinstance(data, pd.DataFrame):
+                features = pd.DataFrame()
+                features['hour_sin'] = np.sin(2 * np.pi * data['hour']/24)
+                features['hour_cos'] = np.cos(2 * np.pi * data['hour']/24)
+                features['temperature'] = data['Average Temperature']
+                features['humidity'] = data['Average Humidity']
+                features['pressure'] = data['Average Barometer']
+                features['uv'] = data['UV Index']
+                features['clear_sky_radiation'] = data['clear_sky_radiation']
+                features['current_radiation'] = data['Solar Rad - W/m^2']
+            else:
+                # Single prediction case
+                features = pd.DataFrame({
+                    'hour_sin': [np.sin(2 * np.pi * hour/24)],
+                    'hour_cos': [np.cos(2 * np.pi * hour/24)],
+                    'temperature': [data.get('temperature', 25)],
+                    'humidity': [data.get('humidity', 60)],
+                    'pressure': [data.get('pressure', 1013.25)],
+                    'uv': [data.get('uv', 0)],
+                    'clear_sky_radiation': [data.get('clear_sky_rad', 0)],
+                    'current_radiation': [data.get('solar_rad', 0)]
+                })
+            
+            # Ensure consistent column order
+            features = features[feature_cols]
+            
+            # Store feature columns if not already set
+            if self.feature_columns is None:
+                self.feature_columns = feature_cols
+            
+            return features
             
         except Exception as e:
             print(f"Error preparing features: {str(e)}")
+            traceback.print_exc()
             return None
 
     def fit(self, X, y, hour):
-        """Fit hour-specific model with handling for constant targets"""
-        if hour not in self.hour_specific_models:
-            # Check if all target values are the same or near-zero variance
-            if len(set(y)) <= 1 or y.std() < 1e-6:
-                self.hour_specific_models[hour] = {'type': 'constant', 'value': y.iloc[0]}
-                print(f"Using constant predictor for hour {hour} with value {y.iloc[0]}")
+        """Fit hour-specific model with consistent features"""
+        try:
+            if len(X) < 24:  # Need minimum data
+                print(f"Insufficient data for hour {hour:02d}")
                 return
-            
-            # For daytime hours, use the ensemble
+                
+            # Prepare features with consistent columns
+            features = self.prepare_features(X, hour)
+            if features is None:
+                return
+                
+            # Create new model instance for this hour
             self.hour_specific_models[hour] = deepcopy(self.ensemble)
             
-        if isinstance(self.hour_specific_models[hour], dict):
-            return
+            # Train the model
+            self.hour_specific_models[hour].fit(features, y)
+            self.model_status[hour]['trained'] = True
+            self.model_status[hour]['samples'] = len(y)
+            print(f"Trained model for hour {hour:02d} with {len(y)} samples")
             
-        # Add try-except for model fitting
-        try:
-            self.hour_specific_models[hour].fit(X, y)
         except Exception as e:
-            print(f"Error fitting model for hour {hour}: {str(e)}")
-            # Fallback to constant predictor
-            self.hour_specific_models[hour] = {'type': 'constant', 'value': y.mean()}
+            print(f"Error training model for hour {hour:02d}: {str(e)}")
+            traceback.print_exc()
 
     def predict(self, X, hour):
-        """Get prediction with validation"""
+        """Make prediction with proper feature preparation"""
         try:
             if hour not in self.hour_specific_models:
+                print(f"No model available for hour {hour:02d}")
                 return None
                 
-            model = self.hour_specific_models[hour]
-            if isinstance(model, dict) and model['type'] == 'constant':
-                # Return constant value for nighttime hours
-                return model['value']
+            # Prepare features with consistent columns
+            features = self.prepare_features(X, hour)
+            if features is None:
+                return None
                 
-            # Handle NaN values
-            X = X.fillna(method='ffill').fillna(method='bfill')
-            
-            return float(model.predict(X)[0])
+            # Ensure features match training columns
+            if set(features.columns) != set(self.feature_columns or []):
+                print(f"Feature mismatch for hour {hour:02d}")
+                return None
+                
+            # Make prediction
+            prediction = self.hour_specific_models[hour].predict(features)
+            return float(prediction[0])
             
         except Exception as e:
-            print(f"Error predicting for hour {hour}: {str(e)}")
+            print(f"Error in prediction for hour {hour:02d}: {str(e)}")
+            traceback.print_exc()
             return None
+
+    def get_training_status(self):
+        """Get training status summary"""
+        trained_hours = sum(1 for h in self.model_status if self.model_status[h]['trained'])
+        print("\nEnsemble Training Status:")
+        print(f"Total trained models: {trained_hours}/24 hours")
+        print("\nHourly Status:")
+        for hour in range(24):
+            status = self.model_status[hour]
+            if status['trained']:
+                print(f"Hour {hour:02d}: Trained with {status['samples']} samples")
+            else:
+                print(f"Hour {hour:02d}: Not trained")
 
 def main():
     try:
@@ -3477,7 +3974,7 @@ def main():
             print(f"\nProcessing date {date} ({date_idx + 1}/{len(dates)})")
             day_data = hourly_data[hourly_data['timestamp'].dt.date == date]
             
-            for hour in range(23):
+            for hour in range(23):  # Process up to hour 23
                 current_data = day_data[day_data['timestamp'].dt.hour == hour]
                 next_data = day_data[day_data['timestamp'].dt.hour == hour + 1]
                 
@@ -3488,74 +3985,78 @@ def main():
                 # Make prediction for next hour
                 prediction = predictor.predict_next_hour(hourly_data, date, hour)
                 
-                if prediction is not None:
-                    actual = next_data['Solar Rad - W/m^2'].iloc[0]
-                    error = abs(actual - prediction)
-                    total_error += error
-                    total_predictions += 1
+                # Get actual value for next hour
+                if not next_data.empty:
+                    actual = float(next_data['Solar Rad - W/m^2'].iloc[0])
+                    next_hour = hour + 1
                     
-                    # Update learning with actual value
-                    predictor.update_with_actual(date, hour + 1, actual)
+                    print(f"\nPrediction for hour {next_hour}:")
+                    print(f"Predicted: {prediction:.2f}")
+                    print(f"Actual: {actual:.2f}")
                     
-                    # Add to current batch
-                    current_batch.append({
-                        'date': date,
-                        'hour': hour + 1,
-                        'predicted': prediction,
-                        'actual': actual,
-                        'error': error,
-                        'error_percentage': (error/actual * 100) if actual != 0 else 0
-                    })
+                    # Update prediction with actual value
+                    if prediction is not None:
+                        predictor.update_with_actual(date, next_hour, actual)
+                        
+                        # Calculate error
+                        error = abs(actual - prediction)
+                        total_error += error
+                        total_predictions += 1
+                        
+                        # Calculate error percentage with proper handling of zero values
+                        if actual == 0:
+                            error_percentage = 0.0 if prediction == 0 else 100.0
+                        else:
+                            error_percentage = (error / actual) * 100
+                        
+                        # Add to current batch with proper timestamps
+                        current_batch.append({
+                            'date': date,
+                            'hour': next_hour,
+                            'timestamp': next_data['timestamp'].iloc[0],
+                            'predicted': prediction,
+                            'actual': actual,
+                            'error': error,
+                            'error_percentage': error_percentage
+                        })
+                        
+                        print(f"Error: {error:.2f}")
+                        print(f"Error %: {error_percentage:.2f}%")
+                else:
+                    print(f"No actual data available for next hour {hour + 1}")
+                
+                # Save state and evaluate periodically
+                if total_predictions % 24 == 0:
+                    predictor.save_state()
                     
-                    # Save batch when it reaches batch_size
                     if len(current_batch) >= batch_size:
+                        # Save batch with timestamp information
                         batch_df = pd.DataFrame(current_batch)
+                        batch_df['timestamp'] = pd.to_datetime(batch_df['timestamp'])
                         batch_file = os.path.join(
                             predictor.data_folder,
                             f'prediction_batch_{date}_{hour:02d}.csv'
                         )
                         batch_df.to_csv(batch_file, index=False)
                         current_batch = []
+                    
+                    predictor.evaluate_and_save_model()
             
-            # Generate daily report
-            if (date_idx + 1) % 7 == 0:  # Generate report every week
+            # Generate reports periodically
+            if (date_idx + 1) % 7 == 0:
                 predictor.generate_detailed_learning_report('week')
         
-        # Save any remaining batch data
-        if current_batch:
-            batch_df = pd.DataFrame(current_batch)
-            batch_file = os.path.join(
-                predictor.data_folder,
-                f'prediction_batch_final.csv'
-            )
-            batch_df.to_csv(batch_file, index=False)
-        
-        # Print overall performance
+        # Final evaluation and reporting
         if total_predictions > 0:
             avg_error = total_error / total_predictions
-            print(f"\nOverall Performance:")
+            print(f"\nFinal Performance Metrics:")
             print(f"Total predictions: {total_predictions}")
             print(f"Average error: {avg_error:.2f} W/m²")
-        
-        # Evaluate and save best model
-        print("\nEvaluating final model performance...")
-        predictor.evaluate_and_save_model()
-        
-        # Generate final learning analysis
-        print("\nGenerating final learning analysis...")
-        predictor.analyze_learning_performance()
-        
-        # Generate reports for different time periods
-        print("\nGenerating learning reports...")
-        for period in ['day', 'week', 'month', 'all']:
-            report_dir = predictor.generate_detailed_learning_report(period)
-            print(f"\nReport for {period} generated at:")
-            print(f"- {report_dir}")
-        
-        print("\nAnalysis complete. Reports generated in:")
-        print(f"Stats folder: {os.path.abspath(predictor.stats_folder)}")
-        print(f"Models folder: {os.path.abspath(predictor.models_folder)}")
             
+            predictor.analyze_learning_performance()
+            for period in ['day', 'week', 'month', 'all']:
+                predictor.generate_detailed_learning_report(period)
+                
     except Exception as e:
         print(f"Error in main: {str(e)}")
         traceback.print_exc()
