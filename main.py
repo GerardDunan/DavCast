@@ -602,19 +602,95 @@ class GHIPredictionSystem:
         )
 
     def adjust_learning_strategy(self, iteration):
-        """Dynamic learning strategy adjustment"""
-        if iteration % 5 == 0:
-            # Adjust model parameters based on iteration
+        """Dynamic learning strategy adjustment for Davao's climate"""
+        current_month = datetime.now().month
+        current_hour = datetime.now().hour
+        
+        # Base adjustments
+        base_params = {
+            'n_estimators': 100 + (50 * iteration),
+            'learning_rate': max(0.01, 0.1 / (1 + 0.1 * iteration)),
+            'max_depth': min(6 + iteration // 3, 15),
+            'subsample': max(0.6, 0.9 - 0.02 * iteration),
+            'colsample_bytree': max(0.6, 0.9 - 0.02 * iteration)
+        }
+        
+        # Seasonal adjustments for Davao
+        if current_month in [6, 7, 8, 9]:  # Rainy season (Habagat)
             self.model_params = {
-                'n_estimators': 100 + (50 * iteration),
-                'learning_rate': max(0.01, 0.1 / (1 + 0.1 * iteration)),
-                'max_depth': min(6 + iteration // 3, 15),
-                'subsample': max(0.6, 0.9 - 0.02 * iteration),
-                'colsample_bytree': max(0.6, 0.9 - 0.02 * iteration)
+                'xgb': {
+                    **base_params,
+                    'learning_rate': base_params['learning_rate'] * 0.8,
+                    'subsample': 0.7,
+                    'min_child_weight': 5
+                },
+                'lgb': {
+                    'num_leaves': 31 + iteration,
+                    'learning_rate': base_params['learning_rate'] * 0.8,
+                    'subsample': 0.7,
+                    'min_child_samples': 25
+                },
+                'cat': {
+                    'iterations': base_params['n_estimators'],
+                    'learning_rate': base_params['learning_rate'] * 0.8,
+                    'depth': min(6 + iteration // 3, 12),
+                    'subsample': 0.7
+                }
             }
-            
-            # Adjust training parameters
-            self.batch_size = min(1000, 100 * (iteration + 1))
+        elif current_month in [1, 2, 3, 4]:  # Dry season
+            self.model_params = {
+                'xgb': {
+                    **base_params,
+                    'learning_rate': base_params['learning_rate'] * 1.2,
+                    'subsample': 0.85,
+                    'min_child_weight': 3
+                },
+                'lgb': {
+                    'num_leaves': 31 + iteration,
+                    'learning_rate': base_params['learning_rate'] * 1.2,
+                    'subsample': 0.85,
+                    'min_child_samples': 15
+                },
+                'cat': {
+                    'iterations': base_params['n_estimators'],
+                    'learning_rate': base_params['learning_rate'] * 1.2,
+                    'depth': min(6 + iteration // 3, 12),
+                    'subsample': 0.85
+                }
+            }
+        else:  # Transitional period
+            self.model_params = {
+                'xgb': {
+                    **base_params,
+                    'learning_rate': base_params['learning_rate'],
+                    'subsample': 0.8,
+                    'min_child_weight': 4
+                },
+                'lgb': {
+                    'num_leaves': 31 + iteration,
+                    'learning_rate': base_params['learning_rate'],
+                    'subsample': 0.8,
+                    'min_child_samples': 20
+                },
+                'cat': {
+                    'iterations': base_params['n_estimators'],
+                    'learning_rate': base_params['learning_rate'],
+                    'depth': min(6 + iteration // 3, 12),
+                    'subsample': 0.8
+                }
+            }
+        
+        # Time of day adjustments
+        if current_hour in [13, 14, 15, 16]:  # Peak convection hours
+            for model in self.model_params.values():
+                model['learning_rate'] *= 0.9
+                model['subsample'] *= 0.9
+        
+        # Adjust batch size based on data patterns
+        self.batch_size = min(1000, 100 * (iteration + 1))
+        
+        logging.info(f"Adjusted learning strategy for {current_month=}, {current_hour=}")
+        logging.info(f"Updated model parameters: {json.dumps(self.model_params, indent=2)}")
 
     def increase_model_complexity(self):
         """Efficiently increase model complexity"""
@@ -1017,8 +1093,8 @@ class GHIPredictionSystem:
         df['mountain_effect'] = (
             (df.index.hour.isin([14, 15, 16, 17])) & 
             (df['wind_direction_10m'].between(45, 135))
-        ).astype(int)
-        
+        )
+    
     def calculate_solar_elevation(self, dates, latitude, longitude):
         """
         Calculate solar elevation angle for Davao's specific location
@@ -1627,7 +1703,7 @@ class GHIPredictionSystem:
         self.performance_history = []
 
     def check_convergence_criteria(self, metrics):
-        """Check if training should stop based on convergence criteria"""
+        """Enhanced convergence criteria for Davao's tropical climate"""
         if not hasattr(self, 'performance_history') or len(self.performance_history) < 3:
             return False
         
@@ -1635,8 +1711,27 @@ class GHIPredictionSystem:
         recent_metrics = self.performance_history[-3:]
         errors = [m.get('validation_error', float('inf')) for m in recent_metrics]
         
-        # Check for convergence conditions
-        error_threshold_met = errors[-1] <= self.target_error_threshold
+        # Get current month and hour for Davao-specific adjustments
+        current_month = datetime.now().month
+        current_hour = datetime.now().hour
+        
+        # Adjust target error threshold based on season
+        base_threshold = self.target_error_threshold
+        if current_month in [6, 7, 8, 9]:  # Rainy season (Habagat)
+            adjusted_threshold = base_threshold * 1.2  # More lenient during rainy season
+        elif current_month in [1, 2, 3, 4]:  # Dry season
+            adjusted_threshold = base_threshold * 0.9  # Stricter during dry season
+        else:  # Transitional periods
+            adjusted_threshold = base_threshold * 1.1
+        
+        # Further adjust for time of day
+        if current_hour in [13, 14, 15, 16]:  # Peak convection hours
+            adjusted_threshold *= 1.1  # More lenient during unstable afternoon periods
+        elif current_hour in [6, 7, 8, 9]:  # Morning hours
+            adjusted_threshold *= 0.95  # Stricter during typically stable morning periods
+        
+        # Check convergence conditions
+        error_threshold_met = errors[-1] <= adjusted_threshold
         
         # Calculate relative improvement
         improvements = [
@@ -1645,39 +1740,27 @@ class GHIPredictionSystem:
         ]
         
         # Check if improvements are diminishing
-        diminishing_returns = all(imp < 0.01 for imp in improvements)  # Less than 1% improvement
+        diminishing_returns = all(imp < 0.01 for imp in improvements)
         
         # Check iteration count
         max_iterations_reached = len(self.performance_history) >= self.max_iterations
         
-        # Log convergence status
-        logging.info("\nConvergence Check:")
+        # Enhanced logging for tropical conditions
+        logging.info("\nConvergence Check (Davao-specific):")
+        logging.info(f"  Current month: {current_month} ({'Rainy' if current_month in [6,7,8,9] else 'Dry' if current_month in [1,2,3,4] else 'Transitional'} season)")
+        logging.info(f"  Base threshold: {base_threshold:.4f}")
+        logging.info(f"  Adjusted threshold: {adjusted_threshold:.4f}")
+        logging.info(f"  Current error: {errors[-1]:.4f}")
         logging.info(f"  Error threshold met: {error_threshold_met}")
         logging.info(f"  Diminishing returns: {diminishing_returns}")
-        logging.info(f"  Max iterations reached: {max_iterations_reached}")
-        logging.info(f"  Recent errors: {errors}")
         logging.info(f"  Recent improvements: {improvements}")
         
-        # Additional checks for Davao-specific conditions
-        current_month = datetime.now().month
-        current_hour = datetime.now().hour
-        
-        # More stringent convergence during clear weather seasons
-        if current_month in [1, 2, 3, 4]:  # Dry season
-            error_threshold_met = errors[-1] <= self.target_error_threshold * 0.9
-        
-        # More relaxed convergence during wet season
-        elif current_month in [6, 7, 8, 9, 10, 11]:
-            error_threshold_met = errors[-1] <= self.target_error_threshold * 1.1
-        
-        # Adjust for time of day
-        if current_hour in [14, 15, 16, 17]:  # Afternoon convection period
-            error_threshold_met = errors[-1] <= self.target_error_threshold * 1.2
-        
-        # Save convergence status
+        # Save convergence status with enhanced information
         convergence_status = {
             'iteration': len(self.performance_history),
             'final_error': errors[-1],
+            'adjusted_threshold': adjusted_threshold,
+            'season': 'Rainy' if current_month in [6,7,8,9] else 'Dry' if current_month in [1,2,3,4] else 'Transitional',
             'error_threshold_met': error_threshold_met,
             'diminishing_returns': diminishing_returns,
             'max_iterations_reached': max_iterations_reached,
@@ -1688,7 +1771,6 @@ class GHIPredictionSystem:
         with open('convergence_history.txt', 'a') as f:
             f.write(f"\n{json.dumps(convergence_status)}")
         
-        # Return True if any stopping condition is met
         return error_threshold_met or (diminishing_returns and len(self.performance_history) > 5) or max_iterations_reached
 
     def initialize_convergence_params(self):
@@ -2094,6 +2176,91 @@ class GHIPredictionSystem:
         except Exception as e:
             print(f"Error during prediction: {str(e)}")
             raise
+
+    def monitor_seasonal_performance(self, predictions, actual, current_conditions):
+        """Monitor model performance across different seasonal conditions"""
+        performance_metrics = {
+            'habagat': {'rmse': [], 'mape': []},
+            'amihan': {'rmse': [], 'mape': []},
+            'transition': {'rmse': [], 'mape': []}
+        }
+        
+        # Calculate errors
+        errors = np.abs(predictions - actual)
+        percentage_errors = errors / actual * 100
+        
+        # Categorize errors by season
+        if current_conditions.get('is_habagat', 0) == 1:
+            performance_metrics['habagat']['rmse'].append(np.sqrt(np.mean(errors ** 2)))
+            performance_metrics['habagat']['mape'].append(np.mean(percentage_errors))
+        elif current_conditions.get('is_amihan', 0) == 1:
+            performance_metrics['amihan']['rmse'].append(np.sqrt(np.mean(errors ** 2)))
+            performance_metrics['amihan']['mape'].append(np.mean(percentage_errors))
+        else:
+            performance_metrics['transition']['rmse'].append(np.sqrt(np.mean(errors ** 2)))
+            performance_metrics['transition']['mape'].append(np.mean(percentage_errors))
+        
+        return performance_metrics
+
+    def adjust_predictions_for_tropical_conditions(self, predictions, current_conditions):
+        """Adjust predictions based on tropical weather conditions"""
+        adjusted_predictions = predictions.copy()
+        
+        # Adjust for heavy rainfall periods
+        if current_conditions.get('is_habagat', 0) == 1 and current_conditions.get('cloud_opacity', 0) > 0.8:
+            adjusted_predictions *= 0.85  # Reduce predictions during heavy rain
+        
+        # Adjust for clear sky conditions during Amihan
+        if current_conditions.get('is_amihan', 0) == 1 and current_conditions.get('cloud_opacity', 0) < 0.2:
+            adjusted_predictions *= 1.1  # Increase predictions during clear Amihan days
+        
+        # Adjust for afternoon convection
+        if current_conditions.get('is_peak_convection', 0) == 1:
+            adjusted_predictions *= 0.9  # Reduce predictions during peak convection
+        
+        # Adjust for Mt. Apo effect
+        if current_conditions.get('mt_apo_effect', 0) == 1:
+            adjusted_predictions *= 0.95  # Adjust for mountain-induced clouds
+        
+        return adjusted_predictions
+
+    def analyze_tropical_feature_importance(self, X, y):
+        """Analyze feature importance with focus on tropical weather patterns"""
+        # Initialize feature importance dictionary
+        feature_importance = {}
+        
+        # Train a base model for feature importance
+        base_model = xgb.XGBRegressor(
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            tree_method='hist'
+        )
+        
+        # Fit model and get feature importance
+        base_model.fit(X, y)
+        importance_scores = base_model.feature_importances_
+        
+        # Create feature importance dictionary
+        for feature, importance in zip(X.columns, importance_scores):
+            feature_importance[feature] = float(importance)
+        
+        # Group features by category
+        feature_groups = {
+            'seasonal': [f for f in X.columns if any(s in f.lower() for s in ['season', 'month', 'habagat', 'amihan'])],
+            'diurnal': [f for f in X.columns if any(s in f.lower() for s in ['hour', 'morning', 'afternoon'])],
+            'weather': [f for f in X.columns if any(s in f.lower() for s in ['cloud', 'humidity', 'temp'])],
+            'terrain': [f for f in X.columns if any(s in f.lower() for s in ['mt_apo', 'coastal'])]
+        }
+        
+        # Calculate group importance
+        group_importance = {}
+        for group, features in feature_groups.items():
+            group_importance[group] = sum(feature_importance[f] for f in features if f in feature_importance)
+        
+        return feature_importance, group_importance
 
 def main():
     predictor = GHIPredictionSystem('raw.csv', target_error=0.05)
