@@ -391,7 +391,7 @@ class GHIPredictionSystem:
             
             # Initialize variables for training
             iteration = 0
-            max_iterations = 20
+            max_iterations = 1000
             best_error = float('inf')
             best_models = None
             
@@ -1775,8 +1775,8 @@ class GHIPredictionSystem:
 
     def initialize_convergence_params(self):
         """Initialize convergence parameters"""
-        self.max_iterations = 20
-        self.target_error_threshold = 0.15  # 15% MAPE
+        self.max_iterations = 100
+        self.target_error_threshold = 0.05  # 5% MAPE
         self.min_improvement_threshold = 0.01  # 1% minimum improvement
         self.convergence_window = 3  # Number of iterations to check for convergence
         
