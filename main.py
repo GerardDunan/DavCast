@@ -1974,6 +1974,96 @@ def continue_training(predictor, model_dir):
         import traceback
         traceback.print_exc()
 
+def predict_next_hour(predictor, data_path, model_dir=None):
+    """Predict GHI for the next hour"""
+    try:
+        # Get model directory from user if not provided
+        if model_dir is None:
+            model_dir = input("Enter the trained model directory name: ")
+            
+        if os.path.exists(model_dir):
+            # Load ensemble model
+            ensemble_path = os.path.join(model_dir, 'ensemble.pkl')
+            if os.path.exists(ensemble_path):
+                with open(ensemble_path, 'rb') as f:
+                    ensemble = pickle.load(f)
+                predictor.best_model = ensemble
+            else:
+                print(f"Error: Ensemble model not found at {ensemble_path}")
+                return
+            
+            # Load scaler
+            scaler_path = os.path.join(model_dir, 'scaler.pkl')
+            if os.path.exists(scaler_path):
+                with open(scaler_path, 'rb') as f:
+                    predictor.scaler = pickle.load(f)
+                scaler_features = predictor.scaler.feature_names_in_
+            else:
+                print(f"Error: Scaler not found at {scaler_path}")
+                return
+        else:
+            print(f"Error: Model directory {model_dir} not found!")
+            return
+
+        # Load the data
+        df = pd.read_csv(data_path)
+        df['period_end'] = pd.to_datetime(df['period_end'])
+        
+        # Get the last row of data
+        last_data = df.iloc[-1:].copy()
+        
+        # Engineer features before setting the index
+        last_data = predictor.engineer_features(last_data)
+        
+        # Set the index after feature engineering
+        last_data.set_index('period_end', inplace=True)
+        
+        # Create all required features using the datetime index
+        last_data['day_of_year'] = last_data.index.dayofyear
+        last_data['is_dry_period'] = last_data.index.month.isin([1, 2, 3, 4]).astype(int)
+        last_data['is_transitional'] = last_data.index.month.isin([5, 6]).astype(int)
+        last_data['is_wet_period'] = last_data.index.month.isin([7, 8, 9, 10, 11, 12]).astype(int)
+        last_data['monsoon_influence'] = last_data.index.month.isin([6, 7, 8, 9, 10, 11]).astype(int)
+        last_data['cyclone_season'] = last_data.index.month.isin([10, 11, 12]).astype(int)
+        last_data['morning_convection'] = last_data.index.hour.isin([9, 10, 11]).astype(int)
+        last_data['afternoon_convection'] = last_data.index.hour.isin([14, 15, 16, 17]).astype(int)
+        last_data['solar_elevation'] = predictor.calculate_solar_elevation(last_data.index, 7.0711, 125.6134)
+        last_data['day_length'] = predictor.calculate_day_length(last_data.index, 7.0711)
+        last_data['absolute_humidity'] = predictor.calculate_absolute_humidity(
+            last_data['air_temp'], 
+            last_data['relative_humidity']
+        )
+        last_data['convection_potential'] = (
+            (last_data['air_temp'] > last_data['air_temp'].mean()) & 
+            (last_data['relative_humidity'] > 75)
+        ).astype(int)
+        last_data['mountain_effect'] = (
+            (last_data.index.hour.isin([14, 15, 16, 17])) & 
+            (last_data['wind_direction_10m'].between(45, 135))
+        ).astype(int)
+        
+        # Use the same features that the scaler was trained with
+        predictor.selected_features = scaler_features.tolist()
+        input_features = last_data[predictor.selected_features]
+        
+        # Scale features and make prediction
+        input_features_scaled = predictor.scaler.transform(input_features)
+        prediction = predictor.best_model.predict(input_features_scaled)
+        
+        # Get the timestamp for the prediction
+        last_timestamp = last_data.index[-1]
+        prediction_timestamp = last_timestamp + pd.Timedelta(hours=1)
+        
+        print("\n=== GHI Prediction Results ===")
+        print(f"Current Time: {last_timestamp}")
+        print(f"Prediction Time: {prediction_timestamp}")
+        print(f"Predicted GHI: {prediction[0]:.2f}")
+        
+    except Exception as e:
+        print(f"Error making prediction: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
 def main():
     data_path = 'raw.csv'
     predictor = GHIPredictionSystem(data_path, target_error=0.05)
@@ -1998,7 +2088,8 @@ def main():
             
         elif choice == '3':
             print("\nPredicting next hour GHI...")
-            predict_next_hour(predictor, data_path)
+            model_dir = input("Enter the trained model directory name: ").strip()
+            predict_next_hour(predictor, data_path, model_dir)
             
         elif choice == '4':
             print("\nExiting program...")
