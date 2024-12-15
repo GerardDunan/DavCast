@@ -47,24 +47,10 @@ class GHIPredictionSystem:
         )
 
     def engineer_features(self, df):
-        """Engineer features for the input dataframe"""
-        # Create a copy to avoid modifying the original
-        df = df.copy()
-        
-        # Set the index if not already set
-        if 'period_end' in df.columns:
-            df['period_end'] = pd.to_datetime(df['period_end'])
-            df.set_index('period_end', inplace=True)
-        
+        """Advanced feature engineering"""
         # Extract time components
-        df['hour'] = df.index.hour
-        df['month'] = df.index.month
-        df['day_of_year'] = df.index.dayofyear
-        
-        # Davao-specific seasons
-        df['is_dry_period'] = df.index.month.isin([1, 2, 3, 4]).astype(int)
-        df['is_transitional'] = df.index.month.isin([5, 6]).astype(int)
-        df['is_wet_period'] = df.index.month.isin([7, 8, 9, 10, 11, 12]).astype(int)
+        df['hour'] = df['period_end'].dt.hour
+        df['month'] = df['period_end'].dt.month
         
         # Time-based features
         df['hour_sin'] = np.sin(2 * np.pi * df['hour']/24)
@@ -72,93 +58,86 @@ class GHIPredictionSystem:
         df['month_sin'] = np.sin(2 * np.pi * df['month']/12)
         df['month_cos'] = np.cos(2 * np.pi * df['month']/12)
         
-        # Monsoon and seasonal features
-        df['monsoon_influence'] = df.index.month.isin([6, 7, 8, 9, 10, 11]).astype(int)
-        df['cyclone_season'] = df.index.month.isin([10, 11, 12]).astype(int)
+        # Weather interaction features
+        df['cloud_clearsky_interaction'] = df['cloud_opacity'] * df['clearsky_ghi']
+        df['temp_humidity_interaction'] = df['air_temp'] * df['relative_humidity']
         
-        # Diurnal patterns
-        df['morning_convection'] = df.index.hour.isin([9, 10, 11]).astype(int)
-        df['afternoon_convection'] = df.index.hour.isin([14, 15, 16, 17]).astype(int)
+        # Rolling statistics (3-hour window)
+        df['ghi_rolling_mean'] = df['ghi'].rolling(window=3, min_periods=1).mean()
+        df['ghi_rolling_std'] = df['ghi'].rolling(window=3, min_periods=1).std()
         
-        # Weather interaction features (if columns exist)
-        if 'cloud_opacity' in df.columns and 'clearsky_ghi' in df.columns:
-            df['cloud_clearsky_interaction'] = df['cloud_opacity'] * df['clearsky_ghi']
-        
-        if 'air_temp' in df.columns and 'relative_humidity' in df.columns:
-            df['temp_humidity_interaction'] = df['air_temp'] * df['relative_humidity']
-            
-            # Convection potential
-            df['convection_potential'] = (
-                (df['air_temp'] > df['air_temp'].rolling(24).mean()) & 
-                (df['relative_humidity'] > 75)
-            ).astype(int)
-        
-        # Mountain effect (if wind direction exists)
-        if 'wind_direction_10m' in df.columns:
-            df['mountain_effect'] = (
-                (df.index.hour.isin([14, 15, 16, 17])) & 
-                (df['wind_direction_10m'].between(45, 135))
-            ).astype(int)
-        
-        # Calculate clear sky index if possible
-        if 'ghi' in df.columns and 'clearsky_ghi' in df.columns:
-            df['clear_sky_index'] = df['ghi'] / df['clearsky_ghi'].where(df['clearsky_ghi'] > 0, 1)
-        
-        # Rolling statistics if GHI exists
-        if 'ghi' in df.columns:
-            df['ghi_rolling_mean'] = df['ghi'].rolling(window=3, min_periods=1).mean()
-            df['ghi_rolling_std'] = df['ghi'].rolling(window=3, min_periods=1).std()
+        # Clear sky index
+        df['clear_sky_index'] = np.where(df['clearsky_ghi'] > 0, 
+                                       df['ghi'] / df['clearsky_ghi'], 
+                                       0)
         
         return df
 
     def load_and_preprocess_data(self):
         """Load and preprocess the data"""
-        try:
-            # Load the data
-            df = pd.read_csv(self.data_path)
-            
-            # Convert period_end to datetime and set as index
-            df['period_end'] = pd.to_datetime(df['period_end'])
-            df.set_index('period_end', inplace=True)
-            
-            # Create target variable (next hour's GHI)
-            df['next_ghi'] = df['ghi'].shift(-1)
-            
-            # Drop the last row since it won't have a next_ghi value
-            df = df.dropna(subset=['next_ghi'])
-            
-            # Engineer features
-            df = self.engineer_features(df)
-            
-            # Get feature columns
-            feature_columns = self.get_initial_features()
-            
-            # Only keep features that exist in the dataframe
-            available_features = [f for f in feature_columns if f in df.columns]
-            
-            logging.info(f"Loaded data shape: {df.shape}")
-            logging.info(f"Available features: {len(available_features)}")
-            logging.info(f"Target variable: next_ghi")
-            
-            return df, available_features
-            
-        except Exception as e:
-            logging.error(f"Error loading data: {str(e)}")
-            raise
+        logging.info("Loading and preprocessing data...")
+        
+        # Load data
+        df = pd.read_csv(self.data_path)
+        logging.info(f"Available columns: {df.columns.tolist()}")
+        
+        # Convert period_end to datetime and set as index
+        df['period_end'] = pd.to_datetime(df['period_end'])
+        df.set_index('period_end', inplace=True)
+        
+        # Create target variable (next hour's GHI)
+        df['next_ghi'] = df['ghi'].shift(-1)
+        
+        # Extract time components
+        df['hour'] = df.index.hour
+        df['month'] = df.index.month
+        df['day_of_year'] = df.index.dayofyear
+        
+        # Create advanced features
+        df = self.create_advanced_features(df)
+        
+        # Get initial features
+        feature_columns = self.get_initial_features()
+        
+        # Verify all features exist
+        missing_features = [col for col in feature_columns if col not in df.columns]
+        if missing_features:
+            logging.warning(f"Missing features: {missing_features}")
+            feature_columns = [col for col in feature_columns if col in df.columns]
+        
+        # Drop rows with missing values
+        df.dropna(inplace=True)
+        
+        logging.info(f"Final features selected: {feature_columns}")
+        logging.info(f"Data shape after preprocessing: {df.shape}")
+        
+        return df, feature_columns
 
     def get_initial_features(self):
-        """Get the initial set of features for the model"""
+        """Get list of initial features to consider"""
         return [
-            'ghi', 'clearsky_ghi', 'cloud_opacity', 'air_temp',
-            'relative_humidity', 'wind_speed_10m', 'wind_direction_10m',
-            'surface_pressure', 'hour', 'month', 'day_of_year',
+            # Raw meteorological features
+            'air_temp', 'albedo', 'azimuth', 
+            'clearsky_dhi', 'clearsky_dni', 'clearsky_ghi', 'clearsky_gti',
+            'cloud_opacity', 'dewpoint_temp', 
+            'dhi', 'dni', 'ghi', 'gti',
+            'precipitable_water', 'precipitation_rate',
+            'relative_humidity', 'surface_pressure',
+            'wind_direction_100m', 'wind_direction_10m',
+            'wind_speed_100m', 'wind_speed_10m', 'zenith',
+            
+            # Time-based features
+            'hour', 'month', 'day_of_year',
             'hour_sin', 'hour_cos', 'month_sin', 'month_cos',
+            
+            # Engineered features
             'is_dry_period', 'is_transitional', 'is_wet_period',
             'monsoon_influence', 'cyclone_season',
             'morning_convection', 'afternoon_convection',
+            'solar_elevation', 'day_length', 'absolute_humidity',
             'cloud_clearsky_interaction', 'temp_humidity_interaction',
             'convection_potential', 'mountain_effect',
-            'clear_sky_index', 'ghi_rolling_mean', 'ghi_rolling_std'
+            'ghi_rolling_mean', 'ghi_rolling_std', 'clear_sky_index'
         ]
 
     def perform_comprehensive_feature_selection(self, X, y):
@@ -349,137 +328,121 @@ class GHIPredictionSystem:
 
     def train_and_optimize(self):
         """Enhanced training loop with adaptive learning"""
-        try:
-            # Load and preprocess data
-            logging.info("Loading and preprocessing data...")
-            df, feature_columns = self.load_and_preprocess_data()
+        # Initialize parameters first
+        self.initialize_convergence_params()
+        self.initialize_model_params()
+        
+        # Load and preprocess data
+        logging.info("Loading and preprocessing data...")
+        df, feature_columns = self.load_and_preprocess_data()
+        
+        # Store data and features
+        self.data = df
+        self.feature_columns = feature_columns
+        self.target_column = 'next_ghi'
+        
+        # Prepare features and target
+        X = self.data[self.feature_columns]
+        y = self.data[self.target_column]
+        
+        # Store original index
+        self.original_index = X.index
+        
+        # Scale features
+        self.scaler = StandardScaler()
+        X_scaled = pd.DataFrame(
+            self.scaler.fit_transform(X),
+            columns=X.columns
+        )
+        
+        # Split data - 70-30 split
+        train_idx, val_idx = train_test_split(
+            np.arange(len(X_scaled)), 
+            test_size=0.3,
+            random_state=42
+        )
+        
+        # Split using indices
+        X_train = X_scaled.iloc[train_idx]
+        X_val = X_scaled.iloc[val_idx]
+        y_train = y.iloc[train_idx]
+        y_val = y.iloc[val_idx]
+        
+        # Store validation indices for later use
+        self.val_idx = val_idx
+        
+        logging.info(f"Training set size: {len(X_train)} samples ({len(X_train)/len(X_scaled)*100:.1f}%)")
+        logging.info(f"Validation set size: {len(X_val)} samples ({len(X_val)/len(X_scaled)*100:.1f}%)")
+        
+        # Initialize sample weights
+        w_train = np.ones(len(y_train))
+        
+        # Training loop
+        iteration = 0
+        max_iterations = 100
+        best_error = float('inf')
+        best_models = None
+        
+        while iteration < max_iterations:
+            logging.info(f"\nIteration {iteration + 1}/{max_iterations}")
             
-            # Store data and features
-            self.data = df
-            self.feature_columns = feature_columns
-            self.target_column = 'next_ghi'
+            # Train models
+            models = self.train_weighted_models(X_train, y_train, w_train, iteration)
             
-            # Prepare features and target
-            X = self.data[self.feature_columns]
-            y = self.data[self.target_column]
+            # Create ensemble
+            ensemble = self.create_weighted_ensemble(models, X_val, y_val)
             
-            # Store original index
-            self.original_index = X.index
+            # Calculate metrics
+            metrics = self.calculate_detailed_metrics(ensemble, X_val, y_val)
             
-            # Scale features
-            self.scaler = StandardScaler()
-            X_scaled = pd.DataFrame(
-                self.scaler.fit_transform(X),
-                columns=X.columns
-            )
+            # Log metrics
+            self.log_detailed_metrics(metrics)
             
-            # Split data - 70-30 split
-            train_idx, val_idx = train_test_split(
-                np.arange(len(X_scaled)), 
-                test_size=0.3,
-                random_state=42
-            )
+            # Check if this is the best performance
+            current_error = metrics['Overall Performance']['Overall']['Mean Error']
+            if current_error < best_error:
+                best_error = current_error
+                best_models = copy.deepcopy(models)
+                self.save_best_models(models, ensemble, metrics, iteration)
+                logging.info(f"New best performance! Mean Error: {current_error:.2f}")
             
-            # Split using indices
-            X_train = X_scaled.iloc[train_idx]
-            X_val = X_scaled.iloc[val_idx]
-            y_train = y.iloc[train_idx]
-            y_val = y.iloc[val_idx]
+            # Analyze and adjust models based on metrics
+            models, ensemble = self.analyze_and_adjust_model(metrics, models, ensemble)
             
-            # Store validation indices for later use
-            self.val_idx = val_idx
+            # Update learning strategy
+            self.update_learning_strategy(metrics)
             
-            # Initialize variables for training
-            iteration = 0
-            max_iterations = 1000
-            best_error = float('inf')
-            best_models = None
+            # Check convergence
+            if self.check_convergence_criteria(metrics):
+                logging.info("Convergence criteria met. Stopping training.")
+                break
             
-            # Training loop
-            while iteration < max_iterations:
-                logging.info(f"\nIteration {iteration + 1}/{max_iterations}")
-                
-                # Train models
-                models = self.train_weighted_models(X_train, y_train, np.ones(len(y_train)), iteration)
-                
-                # Create ensemble
-                ensemble = self.create_weighted_ensemble(models, X_val, y_val)
-                
-                # Calculate metrics
-                metrics = self.calculate_detailed_metrics(ensemble, X_val, y_val)
-                
-                # Check if this is the best performance
-                current_error = metrics['Overall Performance']['Overall']['Mean Error']
-                if current_error < best_error:
-                    best_error = current_error
-                    best_models = copy.deepcopy(models)
-                    self.best_model = ensemble  # Store the best ensemble model
-                    self.selected_features = self.feature_columns  # Store selected features
-                    
-                    # Save both the archive and current model
-                    self.save_best_models(models, ensemble, metrics, iteration)
-                    success = self.save_trained_model()
-                    if not success:
-                        logging.error("Failed to save current model")
-                    
-                    logging.info(f"New best performance! Mean Error: {current_error:.2f}")
-                
-                # Update learning strategy and check convergence
-                if self.check_convergence_criteria(metrics):
-                    logging.info("Convergence criteria met. Stopping training.")
-                    break
-                
-                iteration += 1
-            
-            # Verify final model was saved
-            if not os.path.exists('models/current_model_ensemble.pkl'):
-                logging.error("Final model was not saved correctly")
-                
-            return best_models
-            
-        except Exception as e:
-            logging.error(f"Error in training: {str(e)}")
-            raise
+            iteration += 1
+        
+        return best_models
 
     def save_best_models(self, models, ensemble, metrics, iteration):
         """Save the best performing models and metrics"""
-        # Create models directory if it doesn't exist
-        if not os.path.exists('models'):
-            os.makedirs('models')
-        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = os.path.join('models', f'best_models_{timestamp}_iter_{iteration}')
+        save_dir = f'best_models_{timestamp}_iter_{iteration}'
         
         try:
             # Create directory if it doesn't exist
             os.makedirs(save_dir, exist_ok=True)
             
-            # Save individual models
-            for model_type, model in models.items():
-                with open(os.path.join(save_dir, f'{model_type}.pkl'), 'wb') as f:
-                    pickle.dump(model, f)
-            
             # Save ensemble model
-            with open(os.path.join(save_dir, 'ensemble.pkl'), 'wb') as f:
+            with open(f'{save_dir}/ensemble.pkl', 'wb') as f:
                 pickle.dump(ensemble, f)
             
             # Save scaler
-            with open(os.path.join(save_dir, 'scaler.pkl'), 'wb') as f:
+            with open(f'{save_dir}/scaler.pkl', 'wb') as f:
                 pickle.dump(self.scaler, f)
             
-            # Save metrics and configuration
-            config = {
-                'timestamp': timestamp,
-                'iteration': iteration,
-                'final_error': metrics['Overall Performance']['Overall']['Mean Error'],
-                'feature_importance': self.feature_importance if hasattr(self, 'feature_importance') else {},
-                'selected_features': self.selected_features if hasattr(self, 'selected_features') else []
-            }
+            # Save metrics
+            with open(f'{save_dir}/metrics.json', 'w') as f:
+                json.dump(metrics, f, indent=4)
             
-            with open(os.path.join(save_dir, 'config.json'), 'w') as f:
-                json.dump(config, f, indent=4)
-            
-            logging.info(f"Successfully saved best models and metrics to {save_dir}")
+            logging.info(f"Saved best models and metrics to {save_dir}")
             
         except Exception as e:
             logging.error(f"Error saving models: {str(e)}")
@@ -602,95 +565,19 @@ class GHIPredictionSystem:
         )
 
     def adjust_learning_strategy(self, iteration):
-        """Dynamic learning strategy adjustment for Davao's climate"""
-        current_month = datetime.now().month
-        current_hour = datetime.now().hour
-        
-        # Base adjustments
-        base_params = {
-            'n_estimators': 100 + (50 * iteration),
-            'learning_rate': max(0.01, 0.1 / (1 + 0.1 * iteration)),
-            'max_depth': min(6 + iteration // 3, 15),
-            'subsample': max(0.6, 0.9 - 0.02 * iteration),
-            'colsample_bytree': max(0.6, 0.9 - 0.02 * iteration)
-        }
-        
-        # Seasonal adjustments for Davao
-        if current_month in [6, 7, 8, 9]:  # Rainy season (Habagat)
+        """Dynamic learning strategy adjustment"""
+        if iteration % 5 == 0:
+            # Adjust model parameters based on iteration
             self.model_params = {
-                'xgb': {
-                    **base_params,
-                    'learning_rate': base_params['learning_rate'] * 0.8,
-                    'subsample': 0.7,
-                    'min_child_weight': 5
-                },
-                'lgb': {
-                    'num_leaves': 31 + iteration,
-                    'learning_rate': base_params['learning_rate'] * 0.8,
-                    'subsample': 0.7,
-                    'min_child_samples': 25
-                },
-                'cat': {
-                    'iterations': base_params['n_estimators'],
-                    'learning_rate': base_params['learning_rate'] * 0.8,
-                    'depth': min(6 + iteration // 3, 12),
-                    'subsample': 0.7
-                }
+                'n_estimators': 100 + (50 * iteration),
+                'learning_rate': max(0.01, 0.1 / (1 + 0.1 * iteration)),
+                'max_depth': min(6 + iteration // 3, 15),
+                'subsample': max(0.6, 0.9 - 0.02 * iteration),
+                'colsample_bytree': max(0.6, 0.9 - 0.02 * iteration)
             }
-        elif current_month in [1, 2, 3, 4]:  # Dry season
-            self.model_params = {
-                'xgb': {
-                    **base_params,
-                    'learning_rate': base_params['learning_rate'] * 1.2,
-                    'subsample': 0.85,
-                    'min_child_weight': 3
-                },
-                'lgb': {
-                    'num_leaves': 31 + iteration,
-                    'learning_rate': base_params['learning_rate'] * 1.2,
-                    'subsample': 0.85,
-                    'min_child_samples': 15
-                },
-                'cat': {
-                    'iterations': base_params['n_estimators'],
-                    'learning_rate': base_params['learning_rate'] * 1.2,
-                    'depth': min(6 + iteration // 3, 12),
-                    'subsample': 0.85
-                }
-            }
-        else:  # Transitional period
-            self.model_params = {
-                'xgb': {
-                    **base_params,
-                    'learning_rate': base_params['learning_rate'],
-                    'subsample': 0.8,
-                    'min_child_weight': 4
-                },
-                'lgb': {
-                    'num_leaves': 31 + iteration,
-                    'learning_rate': base_params['learning_rate'],
-                    'subsample': 0.8,
-                    'min_child_samples': 20
-                },
-                'cat': {
-                    'iterations': base_params['n_estimators'],
-                    'learning_rate': base_params['learning_rate'],
-                    'depth': min(6 + iteration // 3, 12),
-                    'subsample': 0.8
-                }
-            }
-        
-        # Time of day adjustments
-        if current_hour in [13, 14, 15, 16]:  # Peak convection hours
-            for model in self.model_params.values():
-                model['learning_rate'] *= 0.9
-                model['subsample'] *= 0.9
-        
-        # Adjust batch size based on data patterns
-        self.batch_size = min(1000, 100 * (iteration + 1))
-        
-        logging.info(f"Adjusted learning strategy for {current_month=}, {current_hour=}")
-        logging.info(f"Updated model parameters: {json.dumps(self.model_params, indent=2)}")
+            
+            # Adjust training parameters
+            self.batch_size = min(1000, 100 * (iteration + 1))
 
     def increase_model_complexity(self):
         """Efficiently increase model complexity"""
@@ -1093,8 +980,19 @@ class GHIPredictionSystem:
         df['mountain_effect'] = (
             (df.index.hour.isin([14, 15, 16, 17])) & 
             (df['wind_direction_10m'].between(45, 135))
-        )
-    
+        ).astype(int)
+        
+        # Rolling statistics (3-hour window)
+        df['ghi_rolling_mean'] = df['ghi'].rolling(window=3, min_periods=1).mean()
+        df['ghi_rolling_std'] = df['ghi'].rolling(window=3, min_periods=1).std()
+        
+        # Clear sky index
+        df['clear_sky_index'] = np.where(df['clearsky_ghi'] > 0, 
+                                       df['ghi'] / df['clearsky_ghi'], 
+                                       0)
+        
+        return df
+
     def calculate_solar_elevation(self, dates, latitude, longitude):
         """
         Calculate solar elevation angle for Davao's specific location
@@ -1703,75 +1601,22 @@ class GHIPredictionSystem:
         self.performance_history = []
 
     def check_convergence_criteria(self, metrics):
-        """Enhanced convergence criteria for Davao's tropical climate"""
-        if not hasattr(self, 'performance_history') or len(self.performance_history) < 3:
-            return False
+        """Check if training should stop based on current metrics"""
+        current_error = metrics['Overall Performance']['Overall']['Mean Error']
         
-        # Get recent performance metrics
-        recent_metrics = self.performance_history[-3:]
-        errors = [m.get('validation_error', float('inf')) for m in recent_metrics]
-        
-        # Get current month and hour for Davao-specific adjustments
-        current_month = datetime.now().month
-        current_hour = datetime.now().hour
-        
-        # Adjust target error threshold based on season
-        base_threshold = self.target_error_threshold
-        if current_month in [6, 7, 8, 9]:  # Rainy season (Habagat)
-            adjusted_threshold = base_threshold * 1.2  # More lenient during rainy season
-        elif current_month in [1, 2, 3, 4]:  # Dry season
-            adjusted_threshold = base_threshold * 0.9  # Stricter during dry season
-        else:  # Transitional periods
-            adjusted_threshold = base_threshold * 1.1
-        
-        # Further adjust for time of day
-        if current_hour in [13, 14, 15, 16]:  # Peak convection hours
-            adjusted_threshold *= 1.1  # More lenient during unstable afternoon periods
-        elif current_hour in [6, 7, 8, 9]:  # Morning hours
-            adjusted_threshold *= 0.95  # Stricter during typically stable morning periods
-        
-        # Check convergence conditions
-        error_threshold_met = errors[-1] <= adjusted_threshold
-        
-        # Calculate relative improvement
-        improvements = [
-            abs(errors[i] - errors[i-1]) / errors[i-1]
-            for i in range(1, len(errors))
-        ]
-        
-        # Check if improvements are diminishing
-        diminishing_returns = all(imp < 0.01 for imp in improvements)
+        # Check if error is below target threshold
+        error_threshold_met = current_error <= self.target_error_threshold
         
         # Check iteration count
-        max_iterations_reached = len(self.performance_history) >= self.max_iterations
+        max_iterations_reached = hasattr(self, 'current_iteration') and self.current_iteration >= self.max_iterations
         
-        # Enhanced logging for tropical conditions
-        logging.info("\nConvergence Check (Davao-specific):")
-        logging.info(f"  Current month: {current_month} ({'Rainy' if current_month in [6,7,8,9] else 'Dry' if current_month in [1,2,3,4] else 'Transitional'} season)")
-        logging.info(f"  Base threshold: {base_threshold:.4f}")
-        logging.info(f"  Adjusted threshold: {adjusted_threshold:.4f}")
-        logging.info(f"  Current error: {errors[-1]:.4f}")
+        # Log convergence status
+        logging.info("\nConvergence Check:")
+        logging.info(f"  Current error: {current_error:.4f}")
         logging.info(f"  Error threshold met: {error_threshold_met}")
-        logging.info(f"  Diminishing returns: {diminishing_returns}")
-        logging.info(f"  Recent improvements: {improvements}")
+        logging.info(f"  Max iterations reached: {max_iterations_reached}")
         
-        # Save convergence status with enhanced information
-        convergence_status = {
-            'iteration': len(self.performance_history),
-            'final_error': errors[-1],
-            'adjusted_threshold': adjusted_threshold,
-            'season': 'Rainy' if current_month in [6,7,8,9] else 'Dry' if current_month in [1,2,3,4] else 'Transitional',
-            'error_threshold_met': error_threshold_met,
-            'diminishing_returns': diminishing_returns,
-            'max_iterations_reached': max_iterations_reached,
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        # Save convergence status to file
-        with open('convergence_history.txt', 'a') as f:
-            f.write(f"\n{json.dumps(convergence_status)}")
-        
-        return error_threshold_met or (diminishing_returns and len(self.performance_history) > 5) or max_iterations_reached
+        return error_threshold_met or max_iterations_reached
 
     def initialize_convergence_params(self):
         """Initialize convergence parameters"""
@@ -1989,317 +1834,178 @@ class GHIPredictionSystem:
         logging.info(f"Detailed metrics saved to {metrics_file}")
         return metrics
 
-    def save_trained_model(self):
-        """Save the trained model and necessary components"""
-        try:
-            # Get the current working directory and create full path
-            current_dir = os.getcwd()
-            model_path = os.path.join(current_dir, 'models')
-            
-            # Create models directory if it doesn't exist
-            if not os.path.exists(model_path):
-                os.makedirs(model_path)
-            
-            # Verify we have a model to save
-            if not hasattr(self, 'best_model') or self.best_model is None:
-                logging.error("No model to save")
-                return False
-            
-            # Save the ensemble model
-            ensemble_path = os.path.join(model_path, 'ensemble.pkl')
-            with open(ensemble_path, 'wb') as f:
-                pickle.dump(self.best_model, f)
-            
-            # Save the scaler
-            scaler_path = os.path.join(model_path, 'scaler.pkl')
-            with open(scaler_path, 'wb') as f:
-                pickle.dump(self.scaler, f)
-            
-            # Ensure we have selected features
-            if not hasattr(self, 'selected_features'):
-                self.selected_features = self.feature_columns
-            
-            # Save feature list and other necessary components
-            model_info = {
-                'selected_features': self.selected_features,
-                'feature_importance': self.feature_importance if hasattr(self, 'feature_importance') else {},
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-            
-            info_path = os.path.join(model_path, 'info.json')
-            with open(info_path, 'w') as f:
-                json.dump(model_info, f)
-                
-            logging.info(f"Model saved successfully to {model_path}")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Error saving model: {str(e)}")
-            return False
+def display_menu():
+    """Display the main menu options"""
+    print("\n=== GHI Prediction System ===")
+    print("1. Train New Model")
+    print("2. Continue Previous Training")
+    print("3. Predict Next Hour")
+    print("4. Exit")
+    return input("\nSelect an option (1-4): ")
 
-    def load_trained_model(self):
-        """Load the trained model and necessary components"""
-        print("\nDEBUG - Starting model loading process...")
+def continue_training(predictor, model_dir):
+    """Continue training from a previously saved model"""
+    try:
+        print(f"Loading model from {model_dir}...")
         
-        try:
-            # Get paths
-            current_dir = os.getcwd()
-            model_path = os.path.join(current_dir, 'models')
+        # Initialize parameters first
+        predictor.initialize_convergence_params()  # Add this line
+        predictor.initialize_model_params()        # Add this line
+        
+        # Load essential components only
+        ensemble_path = os.path.join(model_dir, 'ensemble.pkl')
+        if not os.path.exists(ensemble_path):
+            print(f"Error: Ensemble model not found at {ensemble_path}")
+            return
             
-            print(f"\nCurrent working directory: {current_dir}")
-            print(f"Looking for models in: {model_path}")
+        scaler_path = os.path.join(model_dir, 'scaler.pkl')
+        if not os.path.exists(scaler_path):
+            print(f"Error: Scaler not found at {scaler_path}")
+            return
             
-            # Check if models directory exists
-            if not os.path.exists(model_path):
-                print(f"\nERROR: Models directory not found at {model_path}")
-                return False
-                
-            # List contents of models directory
-            print("\nContents of models directory:")
-            try:
-                files = os.listdir(model_path)
-                print(files)
-            except Exception as e:
-                print(f"Error listing directory contents: {str(e)}")
-            
-            # Check for required files
-            required_files = {
-                'ensemble': os.path.join(model_path, 'ensemble.pkl'),
-                'scaler': os.path.join(model_path, 'scaler.pkl'),
-                'info': os.path.join(model_path, 'info.json')
-            }
-            
-            print("\nChecking for required files:")
-            for file_type, file_path in required_files.items():
-                exists = os.path.exists(file_path)
-                print(f"{file_type}: {file_path}")
-                print(f"Exists: {exists}")
-                
-                if not exists:
-                    print(f"ERROR: Missing required file: {file_path}")
-                    return False
-            
-            print("\nAttempting to load model files...")
-            
-            # Load ensemble
-            try:
-                with open(required_files['ensemble'], 'rb') as f:
-                    self.best_model = pickle.load(f)
-                    print("Successfully loaded ensemble model")
-            except Exception as e:
-                print(f"Error loading ensemble model: {str(e)}")
-                return False
-            
-            # Load scaler
-            try:
-                with open(required_files['scaler'], 'rb') as f:
-                    self.scaler = pickle.load(f)
-                    print("Successfully loaded scaler")
-            except Exception as e:
-                print(f"Error loading scaler: {str(e)}")
-                return False
-            
-            # Load info
-            try:
-                with open(required_files['info'], 'r') as f:
-                    model_info = json.load(f)
-                    self.selected_features = model_info['selected_features']
-                    self.feature_importance = model_info.get('feature_importance', {})
-                    print("Successfully loaded model info")
-            except Exception as e:
-                print(f"Error loading model info: {str(e)}")
-                return False
-            
-            print("\nAll model components loaded successfully!")
-            return True
-            
-        except Exception as e:
-            print(f"\nUnexpected error in load_trained_model: {str(e)}")
-            return False
+        metrics_path = os.path.join(model_dir, 'metrics.json')
+        if not os.path.exists(metrics_path):
+            print(f"Error: Metrics not found at {metrics_path}")
+            return
 
-    def predict_next_hour(self, use_last_data=True):
-        """Predict GHI for the next hour using last available data"""
-        try:
-            print("\nDEBUG - Starting prediction process...")
-            
-            # Load model if not loaded
-            if not hasattr(self, 'best_model') or self.best_model is None:
-                load_success = self.load_trained_model()
-                if not load_success:
-                    raise ValueError("No trained model found. Please train a model first.")
-            
-            if use_last_data:
-                print("\nLoading last hour's data from raw.csv...")
-                try:
-                    # Load the raw data
-                    df = pd.read_csv('raw.csv')
-                    df['period_end'] = pd.to_datetime(df['period_end'])
-                    
-                    # Get the last row of data
-                    last_data = df.iloc[-1].to_dict()
-                    
-                    print(f"\nUsing data from: {last_data['period_end']}")
-                    print("Last hour's values:")
-                    print(f"GHI: {last_data['ghi']:.2f}")
-                    print(f"Clearsky GHI: {last_data['clearsky_ghi']:.2f}")
-                    print(f"Cloud Opacity: {last_data['cloud_opacity']:.2f}")
-                    print(f"Air Temperature: {last_data['air_temp']:.2f}°C")
-                    
-                    # Create input DataFrame
-                    X = pd.DataFrame([last_data])
-                    
-                    # Engineer features
-                    X = self.engineer_features(X)
-                    
-                    # Select features
-                    X_selected = X[self.selected_features]
-                    
-                    # Scale features
-                    X_scaled = self.scaler.transform(X_selected)
-                    
-                    # Make prediction
-                    prediction = self.best_model.predict(X_scaled)[0]
-                    
-                    print(f"\nPredicted GHI for next hour: {prediction:.2f}")
-                    
-                    # Calculate and print prediction time
-                    last_time = pd.to_datetime(last_data['period_end'])
-                    next_hour = last_time + pd.Timedelta(hours=1)
-                    print(f"Prediction for: {next_hour}")
-                    
-                    return prediction, next_hour
-                    
-                except Exception as e:
-                    print(f"Error processing last hour's data: {str(e)}")
-                    raise
-                
-        except Exception as e:
-            print(f"Error during prediction: {str(e)}")
-            raise
-
-    def monitor_seasonal_performance(self, predictions, actual, current_conditions):
-        """Monitor model performance across different seasonal conditions"""
-        performance_metrics = {
-            'habagat': {'rmse': [], 'mape': []},
-            'amihan': {'rmse': [], 'mape': []},
-            'transition': {'rmse': [], 'mape': []}
-        }
+        # Load the components
+        with open(ensemble_path, 'rb') as f:
+            predictor.best_model = pickle.load(f)
+        with open(scaler_path, 'rb') as f:
+            predictor.scaler = pickle.load(f)
+        with open(metrics_path, 'r') as f:
+            metrics = json.load(f)
         
-        # Calculate errors
-        errors = np.abs(predictions - actual)
-        percentage_errors = errors / actual * 100
+        # Extract iteration number from directory name
+        iter_num = int(model_dir.split('iter_')[-1])
+        predictor.current_iteration = iter_num  # Add this line
         
-        # Categorize errors by season
-        if current_conditions.get('is_habagat', 0) == 1:
-            performance_metrics['habagat']['rmse'].append(np.sqrt(np.mean(errors ** 2)))
-            performance_metrics['habagat']['mape'].append(np.mean(percentage_errors))
-        elif current_conditions.get('is_amihan', 0) == 1:
-            performance_metrics['amihan']['rmse'].append(np.sqrt(np.mean(errors ** 2)))
-            performance_metrics['amihan']['mape'].append(np.mean(percentage_errors))
-        else:
-            performance_metrics['transition']['rmse'].append(np.sqrt(np.mean(errors ** 2)))
-            performance_metrics['transition']['mape'].append(np.mean(percentage_errors))
+        print(f"Successfully loaded model from iteration {iter_num}")
+        print("Continuing training...")
         
-        return performance_metrics
-
-    def adjust_predictions_for_tropical_conditions(self, predictions, current_conditions):
-        """Adjust predictions based on tropical weather conditions"""
-        adjusted_predictions = predictions.copy()
+        # Load and preprocess data
+        df, feature_columns = predictor.load_and_preprocess_data()
         
-        # Adjust for heavy rainfall periods
-        if current_conditions.get('is_habagat', 0) == 1 and current_conditions.get('cloud_opacity', 0) > 0.8:
-            adjusted_predictions *= 0.85  # Reduce predictions during heavy rain
+        # Store data and features
+        predictor.data = df
+        predictor.feature_columns = feature_columns
+        predictor.target_column = 'next_ghi'
         
-        # Adjust for clear sky conditions during Amihan
-        if current_conditions.get('is_amihan', 0) == 1 and current_conditions.get('cloud_opacity', 0) < 0.2:
-            adjusted_predictions *= 1.1  # Increase predictions during clear Amihan days
+        # Prepare features and target
+        X = predictor.data[predictor.feature_columns]
+        y = predictor.data[predictor.target_column]
         
-        # Adjust for afternoon convection
-        if current_conditions.get('is_peak_convection', 0) == 1:
-            adjusted_predictions *= 0.9  # Reduce predictions during peak convection
+        # Store original index
+        predictor.original_index = X.index
         
-        # Adjust for Mt. Apo effect
-        if current_conditions.get('mt_apo_effect', 0) == 1:
-            adjusted_predictions *= 0.95  # Adjust for mountain-induced clouds
-        
-        return adjusted_predictions
-
-    def analyze_tropical_feature_importance(self, X, y):
-        """Analyze feature importance with focus on tropical weather patterns"""
-        # Initialize feature importance dictionary
-        feature_importance = {}
-        
-        # Train a base model for feature importance
-        base_model = xgb.XGBRegressor(
-            n_estimators=100,
-            learning_rate=0.1,
-            max_depth=6,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            tree_method='hist'
+        # Scale features using loaded scaler
+        X_scaled = pd.DataFrame(
+            predictor.scaler.transform(X),
+            columns=X.columns
         )
         
-        # Fit model and get feature importance
-        base_model.fit(X, y)
-        importance_scores = base_model.feature_importances_
+        # Split data - 70-30 split
+        train_idx, val_idx = train_test_split(
+            np.arange(len(X_scaled)), 
+            test_size=0.3,
+            random_state=42
+        )
         
-        # Create feature importance dictionary
-        for feature, importance in zip(X.columns, importance_scores):
-            feature_importance[feature] = float(importance)
+        # Split using indices
+        X_train = X_scaled.iloc[train_idx]
+        X_val = X_scaled.iloc[val_idx]
+        y_train = y.iloc[train_idx]
+        y_val = y.iloc[val_idx]
         
-        # Group features by category
-        feature_groups = {
-            'seasonal': [f for f in X.columns if any(s in f.lower() for s in ['season', 'month', 'habagat', 'amihan'])],
-            'diurnal': [f for f in X.columns if any(s in f.lower() for s in ['hour', 'morning', 'afternoon'])],
-            'weather': [f for f in X.columns if any(s in f.lower() for s in ['cloud', 'humidity', 'temp'])],
-            'terrain': [f for f in X.columns if any(s in f.lower() for s in ['mt_apo', 'coastal'])]
-        }
+        # Store validation indices
+        predictor.val_idx = val_idx
         
-        # Calculate group importance
-        group_importance = {}
-        for group, features in feature_groups.items():
-            group_importance[group] = sum(feature_importance[f] for f in features if f in feature_importance)
+        # Continue training from the last iteration
+        iteration = iter_num + 1
+        max_iterations = 100
+        best_error = float('inf')
         
-        return feature_importance, group_importance
+        while iteration < max_iterations:
+            logging.info(f"\nContinuing from Iteration {iteration}/{max_iterations}")
+            
+            # Initialize sample weights
+            w_train = np.ones(len(y_train))
+            
+            # Train models
+            models = predictor.train_weighted_models(X_train, y_train, w_train, iteration)
+            
+            # Create ensemble
+            ensemble = predictor.create_weighted_ensemble(models, X_val, y_val)
+            
+            # Calculate metrics
+            metrics = predictor.calculate_detailed_metrics(ensemble, X_val, y_val)
+            
+            # Log metrics
+            predictor.log_detailed_metrics(metrics)
+            
+            # Check if this is the best performance
+            current_error = metrics['Overall Performance']['Overall']['Mean Error']
+            if current_error < best_error:
+                best_error = current_error
+                predictor.save_best_models(models, ensemble, metrics, iteration)
+                logging.info(f"New best performance! Mean Error: {current_error:.2f}")
+            
+            # Update current iteration
+            predictor.current_iteration = iteration  # Add this line
+            
+            # Analyze and adjust models
+            models, ensemble = predictor.analyze_and_adjust_model(metrics, models, ensemble)
+            
+            # Update learning strategy
+            predictor.update_learning_strategy(metrics)
+            
+            # Check convergence
+            if predictor.check_convergence_criteria(metrics):
+                logging.info("Convergence criteria met. Stopping training.")
+                break
+            
+            iteration += 1
+            
+        print("\nContinued training completed!")
+        
+    except Exception as e:
+        print(f"Error continuing training: {str(e)}")
+        print("Debug: Full error traceback:")
+        import traceback
+        traceback.print_exc()
 
 def main():
-    predictor = GHIPredictionSystem('raw.csv', target_error=0.05)
+    data_path = 'raw.csv'
+    predictor = GHIPredictionSystem(data_path, target_error=0.05)
+    
+    print("Debug: GHI Prediction System initialized")
     
     while True:
-        print("\n=== GHI Prediction System Menu ===")
-        print("1. Train New Model")
-        print("2. Predict Next Hour GHI")
-        print("3. Exit")
-        print("===============================")
-        
-        choice = input("Enter your choice (1-3): ")
+        choice = display_menu()
         
         if choice == '1':
-            print("\nInitiating model training...")
-            try:
-                predictor.train_and_optimize()
-                predictor.save_trained_model()
-                print("Model training completed successfully!")
-                print("The trained model has been saved.")
-            except Exception as e:
-                print(f"Error during training: {str(e)}")
-                
+            print("\nTraining new model... This may take a while.")
+            predictor.train_and_optimize()
+            print("\nModel training completed!")
+            
         elif choice == '2':
-            print("\nPredicting next hour GHI...")
-            try:
-                prediction, next_hour = predictor.predict_next_hour(use_last_data=True)
-                print("\nPrediction Summary:")
-                print(f"Time: {next_hour}")
-                print(f"Predicted GHI: {prediction:.2f}")
-            except Exception as e:
-                print(f"Error during prediction: {str(e)}")
-                
+            print("\nEnter the directory name of the trained model to continue (e.g., best_models_20241215_023813_iter_19):")
+            model_dir = input().strip()
+            if os.path.exists(model_dir):
+                continue_training(predictor, model_dir)
+            else:
+                print(f"Error: Directory {model_dir} not found!")
+            
         elif choice == '3':
+            print("\nPredicting next hour GHI...")
+            predict_next_hour(predictor, data_path)
+            
+        elif choice == '4':
             print("\nExiting program...")
             break
             
         else:
-            print("\nInvalid choice. Please enter 1, 2, or 3.")
+            print("\nInvalid option. Please try again.")
 
 if __name__ == "__main__":
     main()
