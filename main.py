@@ -294,9 +294,10 @@ class GHIPredictionSystem:
             'min_child_weight': 1 + iteration // 4,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
-            'tree_method': 'hist',  # Faster histogram-based algorithm
+            'tree_method': 'hist',  # Use 'hist' instead of 'gpu_hist'
             'n_jobs': n_jobs,
-            'random_state': 42 + iteration
+            'random_state': 42 + iteration,
+            'predictor': 'cpu_predictor'  # Add this line to force CPU usage
         }
         
         lgb_params = {
@@ -1208,9 +1209,10 @@ class GHIPredictionSystem:
                 max_depth=min(6 + iteration // 3, 12),
                 subsample=0.8,
                 colsample_bytree=0.8,
-                tree_method='hist',
+                tree_method='hist',  # Use 'hist' instead of 'gpu_hist'
                 n_jobs=-1,
-                random_state=42 + iteration
+                random_state=42 + iteration,
+                predictor='cpu_predictor'  # Add this line to force CPU usage
             ),
             'lgb': LGBMRegressor(
                 n_estimators=100 + (25 * iteration),
