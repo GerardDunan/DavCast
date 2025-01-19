@@ -1,2104 +1,1519 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
+import tensorflow as tf
+tf.config.set_visible_devices([], 'GPU')  # Disable GPU detection
+
+# Part 1: Data Preprocessing and Setup
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
-from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import SelectKBest, mutual_info_regression, f_regression, SelectFromModel, RFE, RFECV, VarianceThreshold
-from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
+from sklearn.preprocessing import MinMaxScaler, RobustScaler
+from datetime import datetime, timedelta
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Add, Input
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 import xgboost as xgb
-from datetime import datetime
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import warnings
+import traceback
 import joblib
-import os
-import logging
 import json
-from sklearn.ensemble import VotingRegressor
-from lightgbm import LGBMRegressor
-from catboost import CatBoostRegressor
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import Lasso, LassoCV
-import matplotlib.pyplot as plt
-import numpy as np
-from sklearn.metrics import confusion_matrix
-from collections import defaultdict
-import pickle
-import copy
-plt.style.use('default')
+warnings.filterwarnings('ignore')
 
-class GHIPredictionSystem:
-    def __init__(self, data_path, target_error=0.05):
-        self.data_path = data_path
-        self.target_error = target_error
-        self.best_model = None
-        self.best_error = float('inf')
-        self.scaler = StandardScaler()
-        self.feature_selector = None
-        self.selected_features = None
-        self.setup_logging()
-        
-    def setup_logging(self):
-        if not os.path.exists('models'):
-            os.makedirs('models')
-        if not os.path.exists('logs'):
-            os.makedirs('logs')
-            
-        logging.basicConfig(
-            filename=f'logs/training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log',
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
-
-    def engineer_features(self, df):
-        """Advanced feature engineering"""
-        # Extract time components
-        df['hour'] = df['period_end'].dt.hour
-        df['month'] = df['period_end'].dt.month
-        
-        # Time-based features
-        df['hour_sin'] = np.sin(2 * np.pi * df['hour']/24)
-        df['hour_cos'] = np.cos(2 * np.pi * df['hour']/24)
-        df['month_sin'] = np.sin(2 * np.pi * df['month']/12)
-        df['month_cos'] = np.cos(2 * np.pi * df['month']/12)
-        
-        # Weather interaction features
-        df['cloud_clearsky_interaction'] = df['cloud_opacity'] * df['clearsky_ghi']
-        df['temp_humidity_interaction'] = df['air_temp'] * df['relative_humidity']
-        
-        # Rolling statistics (3-hour window)
-        df['ghi_rolling_mean'] = df['ghi'].rolling(window=3, min_periods=1).mean()
-        df['ghi_rolling_std'] = df['ghi'].rolling(window=3, min_periods=1).std()
-        
-        # Clear sky index
-        df['clear_sky_index'] = np.where(df['clearsky_ghi'] > 0, 
-                                       df['ghi'] / df['clearsky_ghi'], 
-                                       0)
-        
-        return df
-
-    def load_and_preprocess_data(self):
-        """Load and preprocess the data"""
-        logging.info("Loading and preprocessing data...")
-        
-        # Load data
-        df = pd.read_csv(self.data_path)
-        logging.info(f"Available columns: {df.columns.tolist()}")
-        
-        # Convert period_end to datetime and set as index
-        df['period_end'] = pd.to_datetime(df['period_end'])
-        df.set_index('period_end', inplace=True)
-        
-        # Create target variable (next hour's GHI)
-        df['next_ghi'] = df['ghi'].shift(-1)
-        
-        # Extract time components
-        df['hour'] = df.index.hour
-        df['month'] = df.index.month
-        df['day_of_year'] = df.index.dayofyear
-        
-        # Create advanced features
-        df = self.create_advanced_features(df)
-        
-        # Get initial features
-        feature_columns = self.get_initial_features()
-        
-        # Verify all features exist
-        missing_features = [col for col in feature_columns if col not in df.columns]
-        if missing_features:
-            logging.warning(f"Missing features: {missing_features}")
-            feature_columns = [col for col in feature_columns if col in df.columns]
-        
-        # Drop rows with missing values
-        df.dropna(inplace=True)
-        
-        logging.info(f"Final features selected: {feature_columns}")
-        logging.info(f"Data shape after preprocessing: {df.shape}")
-        
-        return df, feature_columns
-
-    def get_initial_features(self):
-        """Get list of initial features to consider"""
-        return [
-            # Raw meteorological features
-            'air_temp', 'albedo', 'azimuth', 
-            'clearsky_dhi', 'clearsky_dni', 'clearsky_ghi', 'clearsky_gti',
-            'cloud_opacity', 'dewpoint_temp', 
-            'dhi', 'dni', 'ghi', 'gti',
-            'precipitable_water', 'precipitation_rate',
-            'relative_humidity', 'surface_pressure',
-            'wind_direction_100m', 'wind_direction_10m',
-            'wind_speed_100m', 'wind_speed_10m', 'zenith',
-            
-            # Time-based features
-            'hour', 'month', 'day_of_year',
-            'hour_sin', 'hour_cos', 'month_sin', 'month_cos',
-            
-            # Engineered features
-            'is_dry_period', 'is_transitional', 'is_wet_period',
-            'monsoon_influence', 'cyclone_season',
-            'morning_convection', 'afternoon_convection',
-            'solar_elevation', 'day_length', 'absolute_humidity',
-            'cloud_clearsky_interaction', 'temp_humidity_interaction',
-            'convection_potential', 'mountain_effect',
-            'ghi_rolling_mean', 'ghi_rolling_std', 'clear_sky_index'
-        ]
-
-    def perform_comprehensive_feature_selection(self, X, y):
-        """Comprehensive feature selection using multiple methods"""
-        # Check if saved feature selection results exist
-        feature_selection_path = 'models/feature_selection_results.json'
-        if os.path.exists(feature_selection_path):
-            logging.info("Loading saved feature selection results...")
-            with open(feature_selection_path, 'r') as f:
-                saved_results = json.load(f)
-                self.selected_features = saved_results['selected_features']
-                self.feature_importance = saved_results['feature_importance']
-                logging.info(f"Loaded {len(self.selected_features)} pre-selected features")
-                return self.selected_features
-        
-        logging.info("Performing comprehensive feature selection...")
-        
-        # Scale the features for better convergence
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        X_scaled = pd.DataFrame(X_scaled, columns=X.columns)
-        
-        selected_features_dict = {}
-        
-        # 1. Variance Threshold (fast)
-        logging.info("Running Variance Threshold selection...")
-        selector = VarianceThreshold(threshold=0.01)
-        selector.fit(X_scaled)
-        variance_features = X.columns[selector.get_support()].tolist()
-        selected_features_dict['variance'] = variance_features
-        
-        # 2. Mutual Information (moderate speed)
-        logging.info("Running Mutual Information selection...")
-        mi_selector = SelectKBest(score_func=mutual_info_regression, k=min(15, X.shape[1]))
-        mi_selector.fit(X_scaled, y)
-        mi_scores = mi_selector.scores_
-        mi_features = X.columns[mi_selector.get_support()].tolist()
-        selected_features_dict['mutual_info'] = mi_features
-        
-        # 3. F-regression (fast)
-        logging.info("Running F-regression selection...")
-        f_selector = SelectKBest(score_func=f_regression, k=min(15, X.shape[1]))
-        f_selector.fit(X_scaled, y)
-        f_scores = f_selector.scores_
-        f_features = X.columns[f_selector.get_support()].tolist()
-        selected_features_dict['f_regression'] = f_features
-        
-        # 4. Lasso with adjusted parameters (moderate speed)
-        logging.info("Running Lasso selection...")
-        lasso = LassoCV(
-            cv=3,  # Reduced from 5
-            random_state=42,
-            max_iter=1000,
-            tol=1e-2,
-            n_jobs=-1,
-            selection='random'
-        )
-        lasso.fit(X_scaled, y)
-        lasso_selector = SelectFromModel(lasso, prefit=True, max_features=15)
-        lasso_features = X.columns[lasso_selector.get_support()].tolist()
-        selected_features_dict['lasso'] = lasso_features
-        
-        # 5. Random Forest Importance (faster configuration)
-        logging.info("Running Random Forest selection...")
-        rf = RandomForestRegressor(
-            n_estimators=50,  # Reduced from 100
-            random_state=42,
-            n_jobs=-1,
-            max_depth=8,
-            max_features='sqrt'
-        )
-        rf.fit(X_scaled, y)
-        rf_selector = SelectFromModel(rf, prefit=True, max_features=15)
-        rf_features = X.columns[rf_selector.get_support()].tolist()
-        selected_features_dict['random_forest'] = rf_features
-        
-        # Skip RFECV as it's too slow and replace with a simpler approach
-        logging.info("Running simplified feature ranking...")
-        # Combine scores from different methods
-        feature_scores = {}
-        for feature in X.columns:
-            score = (
-                mi_scores[X.columns.get_loc(feature)] +
-                f_scores[X.columns.get_loc(feature)] +
-                abs(lasso.coef_[X.columns.get_loc(feature)]) +
-                rf.feature_importances_[X.columns.get_loc(feature)]
-            )
-            feature_scores[feature] = score
-        
-        # Select top features based on combined scores
-        top_features = sorted(feature_scores.items(), key=lambda x: x[1], reverse=True)[:15]
-        selected_features_dict['combined_ranking'] = [f[0] for f in top_features]
-        
-        # Combine results and select features that appear in multiple methods
-        all_selected_features = []
-        for features in selected_features_dict.values():
-            all_selected_features.extend(features)
-        
-        # Count occurrences of each feature
-        feature_counts = {}
-        for feature in all_selected_features:
-            feature_counts[feature] = all_selected_features.count(feature)
-        
-        # Select features that appear in at least 2 methods (reduced from 3)
-        final_features = [feature for feature, count in feature_counts.items() 
-                         if count >= 2]
-        
-        # Ensure we have at least 8 features
-        if len(final_features) < 8:
-            remaining_features = [f for f, _ in top_features if f not in final_features]
-            final_features.extend(remaining_features[:8 - len(final_features)])
-        
-        # Log feature selection results
-        logging.info("Feature selection results:")
-        for method, features in selected_features_dict.items():
-            logging.info(f"{method}: {len(features)} features")
-        logging.info(f"Final selected features ({len(final_features)}): {final_features}")
-        
-        # Store feature importance scores
-        self.feature_importance = {feature: feature_scores[feature] for feature in final_features}
-        
-        # Save feature selection results
-        results_to_save = {
-            'selected_features': final_features,
-            'feature_importance': self.feature_importance,
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'method_results': {
-                method: features 
-                for method, features in selected_features_dict.items()
-            }
+class WeatherPredictor:
+    # Constants that should be configurable
+    DEFAULT_LAT = 7.0707  # Davao City
+    DEFAULT_LON = 125.6113  # Davao City
+    DEFAULT_ELEVATION = 7  # meters
+    SOLAR_CONSTANT = 1361  # W/m²
+    FORECAST_HOURS = 4
+    TRAIN_SIZE = 0.7
+    VALIDATION_SIZE = 0.15
+    
+    # Model parameters
+    MODEL_PARAMS = {
+        'xgboost': {
+            'n_estimators': 3500,
+            'max_depth': 7,
+            'learning_rate': 0.002,
+            'min_child_weight': 4,
+            'subsample': 0.9,
+            'colsample_bytree': 0.9,
+            'gamma': 0.15,
+            'reg_alpha': 0.4,
+            'reg_lambda': 1.2,
+            'objective': 'reg:squarederror',
+            'tree_method': 'hist',
+            'random_state': 42,
+            'early_stopping_rounds': 200,
+            'n_jobs': -1
         }
+    }
+    
+    FILE_PATHS = {
+        'xgboost_model': 'best_xgboost_model_hour_{}.json'
+    }
+    
+    FEATURE_COLUMNS = [
+        'Barometer - hPa', 
+        'Temp - Â°C',
+        'Hum - %',
+        'Dew Point - Â°C',
+        'Wet Bulb - Â°C',
+        'Avg Wind Speed - km/h',
+        'Wind Run - km',
+        'UV Index',
+        'Day of Year',
+        'Hour of Day',
+        'Solar Zenith Angle',
+        'Solar Elevation Angle',
+        'Clearness Index'
+    ]
+    
+    TIME_FEATURES = ['Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos']
+    
+    def __init__(self, lat=DEFAULT_LAT, lon=DEFAULT_LON, elevation=DEFAULT_ELEVATION,
+                 model_params=None, file_paths=None):
+        """
+        Initialize with configurable parameters
+        """
+        self.lat = lat
+        self.lon = lon
+        self.elevation = elevation
+        self.solar_constant = self.SOLAR_CONSTANT
+        self.features_scaler = MinMaxScaler()
+        self.target_scaler = MinMaxScaler()
+        self.feature_columns = self.FEATURE_COLUMNS.copy()
         
-        with open(feature_selection_path, 'w') as f:
-            json.dump(results_to_save, f, indent=4)
-        logging.info(f"Saved feature selection results to {feature_selection_path}")
+        # Use provided model parameters or defaults
+        self.model_params = model_params or self.MODEL_PARAMS
+        self.file_paths = file_paths or self.FILE_PATHS
         
-        return final_features
+        # Initialize model storage
+        self.xgb_models = []
 
-    def create_optimized_ensemble(self, iteration, n_jobs):
-        """Create an optimized ensemble model"""
-        # Optimize base parameters
-        base_estimators = 100
-        base_learning_rate = 0.1
-        
-        # Efficient parameter adjustment
-        n_estimators = base_estimators + (25 * iteration)  # Reduced from 50 to 25
-        learning_rate = base_learning_rate / (1 + 0.05 * iteration)  # Slower decay
-        max_depth = min(6 + iteration // 3, 12)  # More controlled depth increase
-        
-        xgb_params = {
-            'n_estimators': n_estimators,
-            'learning_rate': learning_rate,
-            'max_depth': max_depth,
-            'min_child_weight': 1 + iteration // 4,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'tree_method': 'hist',  # Use 'hist' instead of 'gpu_hist'
-            'n_jobs': n_jobs,
-            'random_state': 42 + iteration,
-            'predictor': 'cpu_predictor'  # Add this line to force CPU usage
-        }
-        
-        lgb_params = {
-            'n_estimators': n_estimators,
-            'learning_rate': learning_rate,
-            'num_leaves': 31 + iteration,
-            'n_jobs': n_jobs,
-            'random_state': 42 + iteration,
-            'force_row_wise': True  # More efficient computation
-        }
-        
-        cat_params = {
-            'iterations': n_estimators,
-            'learning_rate': learning_rate,
-            'depth': max_depth,
-            'thread_count': n_jobs,
-            'random_state': 42 + iteration,
-            'verbose': False,
-            'bootstrap_type': 'Bernoulli'  # More efficient bootstrapping
-        }
-        
-        estimators = [
-            ('xgb', xgb.XGBRegressor(**xgb_params)),
-            ('lgb', LGBMRegressor(**lgb_params)),
-            ('cat', CatBoostRegressor(**cat_params))
-        ]
-        
-        return VotingRegressor(estimators=estimators)
-
-    def train_and_optimize(self):
-        """Enhanced training loop with adaptive learning"""
-        # Initialize parameters first
-        self.initialize_convergence_params()
-        self.initialize_model_params()
-        
-        # Load and preprocess data
-        logging.info("Loading and preprocessing data...")
-        df, feature_columns = self.load_and_preprocess_data()
-        
-        # Store data and features
-        self.data = df
-        self.feature_columns = feature_columns
-        self.target_column = 'next_ghi'
-        
-        # Prepare features and target
-        X = self.data[self.feature_columns]
-        y = self.data[self.target_column]
-        
-        # Store original index
-        self.original_index = X.index
-        
-        # Scale features
-        self.scaler = StandardScaler()
-        X_scaled = pd.DataFrame(
-            self.scaler.fit_transform(X),
-            columns=X.columns
-        )
-        
-        # Split data - 70-30 split
-        train_idx, val_idx = train_test_split(
-            np.arange(len(X_scaled)), 
-            test_size=0.3,
-            random_state=42
-        )
-        
-        # Split using indices
-        X_train = X_scaled.iloc[train_idx]
-        X_val = X_scaled.iloc[val_idx]
-        y_train = y.iloc[train_idx]
-        y_val = y.iloc[val_idx]
-        
-        # Store validation indices for later use
-        self.val_idx = val_idx
-        
-        logging.info(f"Training set size: {len(X_train)} samples ({len(X_train)/len(X_scaled)*100:.1f}%)")
-        logging.info(f"Validation set size: {len(X_val)} samples ({len(X_val)/len(X_scaled)*100:.1f}%)")
-        
-        # Initialize sample weights
-        w_train = np.ones(len(y_train))
-        
-        # Training loop
-        iteration = 0
-        max_iterations = 100
-        best_error = float('inf')
-        best_models = None
-        
-        while iteration < max_iterations:
-            logging.info(f"\nIteration {iteration + 1}/{max_iterations}")
-            
-            # Train models
-            models = self.train_weighted_models(X_train, y_train, w_train, iteration)
-            
-            # Create ensemble
-            ensemble = self.create_weighted_ensemble(models, X_val, y_val)
-            
-            # Calculate metrics
-            metrics = self.calculate_detailed_metrics(ensemble, X_val, y_val)
-            
-            # Log metrics
-            self.log_detailed_metrics(metrics)
-            
-            # Check if this is the best performance
-            current_error = metrics['Overall Performance']['Overall']['Mean Error']
-            if current_error < best_error:
-                best_error = current_error
-                best_models = copy.deepcopy(models)
-                self.save_best_models(models, ensemble, metrics, iteration)
-                logging.info(f"New best performance! Mean Error: {current_error:.2f}")
-            
-            # Analyze and adjust models based on metrics
-            models, ensemble = self.analyze_and_adjust_model(metrics, models, ensemble)
-            
-            # Update learning strategy
-            self.update_learning_strategy(metrics)
-            
-            # Check convergence
-            if self.check_convergence_criteria(metrics):
-                logging.info("Convergence criteria met. Stopping training.")
-                break
-            
-            iteration += 1
-        
-        return best_models
-
-    def save_best_models(self, models, ensemble, metrics, iteration):
-        """Save the best performing models and metrics"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = f'best_models_{timestamp}_iter_{iteration}'
-        
+    def compute_solar_parameters(self, df):
+        """
+        Compute all solar-related parameters for the dataset
+        """
         try:
-            # Create directory if it doesn't exist
-            os.makedirs(save_dir, exist_ok=True)
+            # Create a copy to avoid modifying original
+            df = df.copy()
             
-            # Save ensemble model
-            with open(f'{save_dir}/ensemble.pkl', 'wb') as f:
-                pickle.dump(ensemble, f)
+            # Convert date and time to datetime
+            df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Start_period'])
             
-            # Save scaler
-            with open(f'{save_dir}/scaler.pkl', 'wb') as f:
-                pickle.dump(self.scaler, f)
+            # Compute basic time parameters
+            df['Day of Year'] = df['datetime'].apply(lambda x: x.timetuple().tm_yday)
+            df['Hour of Day'] = df['datetime'].apply(lambda x: x.hour + x.minute/60)
             
-            # Save metrics
-            with open(f'{save_dir}/metrics.json', 'w') as f:
-                json.dump(metrics, f, indent=4)
+            def compute_declination(day_of_year):
+                return np.radians(23.45 * np.sin(np.radians(360/365 * (day_of_year + 284))))
             
-            logging.info(f"Saved best models and metrics to {save_dir}")
+            def compute_solar_angles(row):
+                # Calculate declination
+                declination = compute_declination(row['Day of Year'])
+                
+                # Calculate hour angle
+                hour_angle = np.radians(15 * (row['Hour of Day'] - 12))
+                
+                # Convert latitude to radians
+                latitude_rad = np.radians(self.lat)
+                
+                # Compute solar elevation angle
+                solar_elevation_angle = np.arcsin(
+                    np.sin(latitude_rad) * np.sin(declination) +
+                    np.cos(latitude_rad) * np.cos(declination) * np.cos(hour_angle)
+                )
+                
+                # Compute solar zenith angle
+                solar_zenith_angle = np.pi/2 - solar_elevation_angle
+                
+                return pd.Series({
+                    'Solar Zenith Angle': np.degrees(solar_zenith_angle),
+                    'Solar Elevation Angle': np.degrees(solar_elevation_angle)
+                })
+            
+            # Compute solar angles
+            solar_angles = df.apply(compute_solar_angles, axis=1)
+            df['Solar Zenith Angle'] = solar_angles['Solar Zenith Angle']
+            df['Solar Elevation Angle'] = solar_angles['Solar Elevation Angle']
+            
+            # Compute clearness index
+            df['Clearness Index'] = df.apply(
+                lambda row: row['GHI - W/m^2']/self.SOLAR_CONSTANT 
+                if row['GHI - W/m^2'] <= self.SOLAR_CONSTANT and row['GHI - W/m^2'] > 0
+                else np.nan,
+                axis=1
+            )
+            
+            # Fill NaN values with 0 for nighttime
+            night_mask = df['Solar Elevation Angle'] <= 0
+            df.loc[night_mask, ['Clearness Index']] = 0
+            
+            return df
             
         except Exception as e:
-            logging.error(f"Error saving models: {str(e)}")
+            print(f"Error in compute_solar_parameters: {str(e)}")
+            print("DataFrame columns:", df.columns.tolist())
             raise
 
-    def calculate_temporal_weights(self, df):
-        """Calculate sample weights based on temporal importance"""
-        current_year = df.index.max().year
-        years_diff = (df.index.year - df.index.min().year + 1)
+    def calculate_solar_zenith(self, date):
+        """Calculate solar zenith angle"""
+        from pvlib import solarposition
         
-        # Base temporal weights
-        temporal_weights = 1 + np.log1p(years_diff)
-        
-        # Seasonal pattern weights
-        season_weights = np.sin(2 * np.pi * df.index.dayofyear / 365) + 2
-        
-        # Weather pattern weights
-        clear_sky_ratio = df['ghi'] / df['clearsky_ghi'].where(df['clearsky_ghi'] > 0, 1)
-        weather_weights = 1 + abs(1 - clear_sky_ratio)
-        
-        # Combine weights
-        combined_weights = temporal_weights * season_weights * weather_weights
-        
-        # Normalize weights
-        return combined_weights / combined_weights.mean()
-
-    def analyze_prediction_errors(self, ensemble, X_val, y_val, 
-                                seasonal_errors, weather_errors, time_errors):
-        """Analyze prediction errors in detail"""
-        y_pred = ensemble.predict(X_val)
-        errors = np.abs(y_val - y_pred)
-        
-        # Seasonal analysis
-        seasons = {
-            'dry_period': X_val.index.month.isin([1, 2, 3, 4]),
-            'transitional': X_val.index.month.isin([5, 6]),
-            'wet_period': X_val.index.month.isin([7, 8, 9, 10, 11, 12])
-        }
-        
-        for season, mask in seasons.items():
-            seasonal_errors[season].extend(errors[mask])
-        
-        # Weather condition analysis
-        weather_conditions = {
-            'clear_sky': X_val['cloud_opacity'] < 0.2,
-            'partly_cloudy': (X_val['cloud_opacity'] >= 0.2) & (X_val['cloud_opacity'] < 0.8),
-            'overcast': X_val['cloud_opacity'] >= 0.8
-        }
-        
-        for condition, mask in weather_conditions.items():
-            weather_errors[condition].extend(errors[mask])
-        
-        # Time of day analysis
-        time_periods = {
-            'morning': (X_val.index.hour >= 6) & (X_val.index.hour < 12),
-            'afternoon': (X_val.index.hour >= 12) & (X_val.index.hour < 18),
-            'evening': (X_val.index.hour >= 18) | (X_val.index.hour < 6)
-        }
-        
-        for period, mask in time_periods.items():
-            time_errors[period].extend(errors[mask])
-
-    def update_learning_strategy(self, error_analysis):
-        """Update learning strategy based on error patterns"""
-        logging.info("Updating learning strategy...")
-        
-        # Check if we need to increase model complexity
-        if self.check_model_complexity_needs():
-            self.increase_model_complexity()
-        
-        # Adjust for seasonal patterns
-        if error_analysis.get('seasonal_bias', False):
-            self.adjust_seasonal_weights()
-        
-        # Adjust for weather patterns
-        if error_analysis.get('weather_bias', False):
-            self.adjust_weather_weights()
-        
-        # Adjust for time of day patterns
-        if error_analysis.get('time_bias', False):
-            self.adjust_time_weights()
-        
-        # Update learning rate based on performance
-        if hasattr(self, 'performance_history') and len(self.performance_history) > 0:
-            recent_performance = self.performance_history[-1].get('validation_error', float('inf'))
-            if recent_performance > self.target_error_threshold:
-                # Decrease learning rate if error is high
-                for model_name in self.model_params:
-                    current_lr = self.model_params[model_name].get('learning_rate', 0.1)
-                    self.model_params[model_name]['learning_rate'] = current_lr * 0.9
-        
-        logging.info("Learning strategy updated")
-
-    def create_xgboost_model(self, iteration):
-        return xgb.XGBRegressor(
-            n_estimators=100 + (25 * iteration),
-            learning_rate=0.1 / (1 + 0.05 * iteration),
-            max_depth=min(6 + iteration // 3, 12),
-            random_state=42 + iteration,
-            n_jobs=-1
+        # Get solar position
+        solar_position = solarposition.get_solarposition(
+            time=date,
+            latitude=self.lat,
+            longitude=self.lon,
+            altitude=self.elevation
         )
+        
+        return solar_position.zenith.iloc[0]
 
-    def create_lightgbm_model(self, iteration):
-        return LGBMRegressor(
-            n_estimators=100 + (25 * iteration),
-            learning_rate=0.1 / (1 + 0.05 * iteration),
-            num_leaves=31 + iteration,
-            random_state=42 + iteration,
-            n_jobs=-1
+    def calculate_extraterrestrial_radiation(self, date):
+        """Calculate extraterrestrial radiation"""
+        from pvlib import irradiance
+        
+        # Get solar position
+        solar_position = solarposition.get_solarposition(
+            time=date,
+            latitude=self.lat,
+            longitude=self.lon,
+            altitude=self.elevation
         )
+        
+        # Calculate extraterrestrial radiation
+        extra_radiation = irradiance.get_extra_radiation(date)
+        
+        # Adjust for solar zenith angle
+        dni_extra = extra_radiation * np.cos(np.radians(solar_position.zenith.iloc[0]))
+        
+        return max(0, dni_extra)
 
-    def create_catboost_model(self, iteration):
-        return CatBoostRegressor(
-            iterations=100 + (25 * iteration),
-            learning_rate=0.1 / (1 + 0.05 * iteration),
-            depth=min(6 + iteration // 3, 12),
-            random_state=42 + iteration,
-            verbose=False,
-            thread_count=-1
-        )
-
-    def adjust_learning_strategy(self, iteration):
-        """Dynamic learning strategy adjustment"""
-        if iteration % 5 == 0:
-            # Adjust model parameters based on iteration
-            self.model_params = {
-                'n_estimators': 100 + (50 * iteration),
-                'learning_rate': max(0.01, 0.1 / (1 + 0.1 * iteration)),
-                'max_depth': min(6 + iteration // 3, 15),
-                'subsample': max(0.6, 0.9 - 0.02 * iteration),
-                'colsample_bytree': max(0.6, 0.9 - 0.02 * iteration)
-            }
-            
-            # Adjust training parameters
-            self.batch_size = min(1000, 100 * (iteration + 1))
-
-    def increase_model_complexity(self):
-        """Efficiently increase model complexity"""
-        if not hasattr(self, 'complexity_level'):
-            self.complexity_level = 0
-        self.complexity_level += 1
-        
-        # Adjust parameters based on complexity level
-        self.current_params = {
-            'n_estimators': 100 + (25 * self.complexity_level),
-            'max_depth': min(6 + self.complexity_level, 12)
-        }
-
-    def optimize_features(self):
-        """Optimize feature selection"""
-        if hasattr(self, 'feature_importance'):
-            # Use feature importance to select top features
-            top_features = sorted(self.feature_importance.items(), 
-                                key=lambda x: x[1], 
-                                reverse=True)[:8]
-            self.selected_features = [f[0] for f in top_features]
-
-    def reset_learning_strategy(self):
-        """Reset learning strategy when maximum iterations reached"""
-        logging.info("Resetting learning strategy...")
-        
-        # Reset scalers and feature selectors
-        self.scaler = StandardScaler()
-        
-        # Optionally force new feature selection
-        feature_selection_path = 'models/feature_selection_results.json'
-        if os.path.exists(feature_selection_path):
-            os.rename(feature_selection_path, 
-                     f'models/feature_selection_results_old_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
-            logging.info("Archived old feature selection results")
-        
-        # Perform new feature selection
-        self.perform_comprehensive_feature_selection(self.X, self.y)
-
-    def custom_mape(self, y_true, y_pred):
-        """Calculate MAPE while handling zero values"""
-        y_true, y_pred = np.array(y_true), np.array(y_pred)
-        non_zero = y_true != 0
-        return np.mean(np.abs((y_true[non_zero] - y_pred[non_zero]) / y_true[non_zero])) * 100
-
-    def save_model(self, iteration, mape, rmse):
-        # Save model
-        model_path = f'models/ghi_model_iteration_{iteration}.joblib'
-        joblib.dump(self.best_model, model_path)
-        
-        # Save model metadata
-        metadata = {
-            'iteration': iteration,
-            'mape': float(mape),
-            'rmse': float(rmse),
-            'selected_features': self.selected_features,
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        with open(f'models/model_metadata_{iteration}.json', 'w') as f:
-            json.dump(metadata, f, indent=4)
-        
-        logging.info(f"Model saved: {model_path}")
-
-    def predict(self, input_data):
-        if self.best_model is None:
-            raise ValueError("Model has not been trained yet!")
-        
-        # Prepare input data
-        input_scaled = self.scaler.transform(input_data[self.selected_features])
-        
-        # Make prediction
-        prediction = self.best_model.predict(input_scaled)
-        return prediction
-
-    def save_final_report(self, df, y_pred, training_history):
-        """Save comprehensive final report and predictions"""
-        logging.info("Generating final report and saving predictions...")
-        
-        # Create reports directory if it doesn't exist
-        if not os.path.exists('reports'):
-            os.makedirs('reports')
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # 1. Save predictions to CSV
-        predictions_df = df.copy()
-        predictions_df['predicted_next_ghi'] = y_pred
-        predictions_df['prediction_error'] = abs(predictions_df['next_ghi'] - predictions_df['predicted_next_ghi'])
-        predictions_df['prediction_error_percent'] = (predictions_df['prediction_error'] / predictions_df['next_ghi']) * 100
-        
-        predictions_df.to_csv(f'reports/predictions_{timestamp}.csv', index=False)
-        
-        # 2. Generate performance metrics
-        performance_metrics = {
-            'overall_mape': float(self.best_error),
-            'rmse': float(np.sqrt(mean_squared_error(predictions_df['next_ghi'], predictions_df['predicted_next_ghi']))),
-            'mean_error': float(predictions_df['prediction_error'].mean()),
-            'max_error': float(predictions_df['prediction_error'].max()),
-            'min_error': float(predictions_df['prediction_error'].min()),
-            'std_error': float(predictions_df['prediction_error'].std()),
-            'predictions_within_5_percent': float((predictions_df['prediction_error_percent'] <= 5).mean() * 100),
-            'total_training_iterations': len(training_history),
-            'training_duration_minutes': (datetime.now() - self.training_start_time).total_seconds() / 60
-        }
-        
-        # 3. Generate hourly performance analysis
-        hourly_performance = predictions_df.groupby('hour').agg({
-            'prediction_error_percent': ['mean', 'std', 'count']
-        }).round(2)
-        
-        # 4. Generate monthly performance analysis
-        monthly_performance = predictions_df.groupby('month').agg({
-            'prediction_error_percent': ['mean', 'std', 'count']
-        }).round(2)
-        
-        # 5. Create comprehensive report
-        report = {
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'model_version': timestamp,
-            'performance_metrics': performance_metrics,
-            'feature_importance': self.feature_importance,
-            'selected_features': self.selected_features,
-            'training_history': training_history,
-            'hourly_performance': hourly_performance.to_dict(),
-            'monthly_performance': monthly_performance.to_dict(),
-            'model_parameters': self.best_model.get_params(),
-        }
-        
-        # Save report as JSON
-        with open(f'reports/final_report_{timestamp}.json', 'w') as f:
-            json.dump(report, f, indent=4)
-        
-        # 6. Generate HTML report
-        html_report = f"""
-        <html>
-        <head>
-            <title>GHI Prediction System Report</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-                th {{ background-color: #f2f2f2; }}
-            </style>
-        </head>
-        <body>
-            <h1>GHI Prediction System Report</h1>
-            <h2>Performance Summary</h2>
-            <table>
-                <tr><th>Metric</th><th>Value</th></tr>
-                <tr><td>Overall MAPE</td><td>{performance_metrics['overall_mape']:.2f}%</td></tr>
-                <tr><td>RMSE</td><td>{performance_metrics['rmse']:.2f}</td></tr>
-                <tr><td>Predictions within 5%</td><td>{performance_metrics['predictions_within_5_percent']:.2f}%</td></tr>
-                <tr><td>Training Duration</td><td>{performance_metrics['training_duration_minutes']:.2f} minutes</td></tr>
-            </table>
-            
-            <h2>Feature Importance</h2>
-            <table>
-                <tr><th>Feature</th><th>Importance Score</th></tr>
-                {''.join(f"<tr><td>{k}</td><td>{v:.4f}</td></tr>" for k, v in sorted(self.feature_importance.items(), key=lambda x: x[1], reverse=True))}
-            </table>
-            
-            <h2>Training History</h2>
-            <table>
-                <tr><th>Iteration</th><th>MAPE</th><th>RMSE</th></tr>
-                {''.join(f"<tr><td>{i+1}</td><td>{hist['mape']:.2f}%</td><td>{hist['rmse']:.2f}</td></tr>" for i, hist in enumerate(training_history))}
-            </table>
-        </body>
-        </html>
+    def load_and_prepare_data(self, csv_path):
         """
-        
-        with open(f'reports/final_report_{timestamp}.html', 'w') as f:
-            f.write(html_report)
-        
-        logging.info(f"Final report saved: reports/final_report_{timestamp}.html")
-        logging.info(f"Predictions saved: reports/predictions_{timestamp}.csv")
-        
-        # Print summary to console
-        print("\n=== Final Model Performance ===")
-        print(f"Overall MAPE: {performance_metrics['overall_mape']:.2f}%")
-        print(f"RMSE: {performance_metrics['rmse']:.2f}")
-        print(f"Predictions within 5%: {performance_metrics['predictions_within_5_percent']:.2f}%")
-        print(f"Training Duration: {performance_metrics['training_duration_minutes']:.2f} minutes")
-        print("\nReports have been saved in the 'reports' directory.")
-        
-        # Generate and save performance figures
-        self.save_performance_figures(df, y_pred, training_history)
-        
-        # Add figures to HTML report
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        html_report += f"""
-            <h2>Performance Visualizations</h2>
-            <div>
-                <h3>Training History</h3>
-                <img src="figures/training_history_{timestamp}.png" style="max-width:100%">
-                
-                <h3>Actual vs Predicted Values</h3>
-                <img src="figures/actual_vs_predicted_{timestamp}.png" style="max-width:100%">
-                
-                <h3>Error Distribution</h3>
-                <img src="figures/error_distribution_{timestamp}.png" style="max-width:100%">
-                
-                <h3>Feature Importance</h3>
-                <img src="figures/feature_importance_{timestamp}.png" style="max-width:100%">
-                
-                <h3>Hourly Performance</h3>
-                <img src="figures/hourly_performance_{timestamp}.png" style="max-width:100%">
-                
-                <h3>Monthly Performance</h3>
-                <img src="figures/monthly_performance_{timestamp}.png" style="max-width:100%">
-                
-                <h3>Error Heatmap</h3>
-                <img src="figures/error_heatmap_{timestamp}.png" style="max-width:100%">
-            </div>
+        Load and prepare data from CSV file with solar parameter computations
         """
-        
-        # ... (rest of existing report generation code) ...
-
-    def save_performance_figures(self, df, y_pred, training_history):
-        """Generate and save performance visualization figures"""
-        logging.info("Generating performance figures...")
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        figures_dir = 'reports/figures'
-        if not os.path.exists(figures_dir):
-            os.makedirs(figures_dir)
-        
-        # Set style for all plots
-        plt.style.use('default')
-        
-        # 1. Training History Plot
-        plt.figure(figsize=(12, 6))
-        epochs = [h['iteration'] for h in training_history]
-        mapes = [h['mape'] for h in training_history]
-        rmses = [h['rmse'] for h in training_history]
-        
-        plt.subplot(1, 2, 1)
-        plt.plot(epochs, mapes, 'b-', label='MAPE')
-        plt.title('Training MAPE History')
-        plt.xlabel('Iteration')
-        plt.ylabel('MAPE (%)')
-        plt.grid(True)
-        
-        plt.subplot(1, 2, 2)
-        plt.plot(epochs, rmses, 'r-', label='RMSE')
-        plt.title('Training RMSE History')
-        plt.xlabel('Iteration')
-        plt.ylabel('RMSE')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(f'{figures_dir}/training_history_{timestamp}.png')
-        plt.close()
-        
-        # 2. Actual vs Predicted Plot
-        plt.figure(figsize=(10, 6))
-        plt.scatter(df['next_ghi'], y_pred, alpha=0.5)
-        plt.plot([df['next_ghi'].min(), df['next_ghi'].max()], 
-                 [df['next_ghi'].min(), df['next_ghi'].max()], 
-                 'r--', label='Perfect Prediction')
-        plt.xlabel('Actual GHI')
-        plt.ylabel('Predicted GHI')
-        plt.title('Actual vs Predicted GHI Values')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(f'{figures_dir}/actual_vs_predicted_{timestamp}.png')
-        plt.close()
-        
-        # 3. Error Distribution Plot
-        plt.figure(figsize=(10, 6))
-        error_percent = (y_pred - df['next_ghi']) / df['next_ghi'] * 100
-        plt.hist(error_percent, bins=50, alpha=0.75)
-        plt.title('Prediction Error Distribution')
-        plt.xlabel('Percentage Error')
-        plt.ylabel('Count')
-        plt.axvline(x=0, color='r', linestyle='--')
-        plt.savefig(f'{figures_dir}/error_distribution_{timestamp}.png')
-        plt.close()
-        
-        # 4. Feature Importance Plot
-        plt.figure(figsize=(12, 6))
-        feature_imp = pd.Series(self.feature_importance).sort_values(ascending=True)
-        feature_imp.plot(kind='barh')
-        plt.title('Feature Importance')
-        plt.xlabel('Importance Score')
-        plt.tight_layout()
-        plt.savefig(f'{figures_dir}/feature_importance_{timestamp}.png')
-        plt.close()
-        
-        # 5. Hourly Performance Plot
-        hourly_errors = df.groupby('hour')['prediction_error_percent'].mean()
-        plt.figure(figsize=(12, 6))
-        hourly_errors.plot(kind='bar')
-        plt.title('Average Prediction Error by Hour')
-        plt.xlabel('Hour of Day')
-        plt.ylabel('Average Error (%)')
-        plt.tight_layout()
-        plt.savefig(f'{figures_dir}/hourly_performance_{timestamp}.png')
-        plt.close()
-        
-        # 6. Monthly Performance Plot
-        monthly_errors = df.groupby('month')['prediction_error_percent'].mean()
-        plt.figure(figsize=(12, 6))
-        monthly_errors.plot(kind='bar')
-        plt.title('Average Prediction Error by Month')
-        plt.xlabel('Month')
-        plt.ylabel('Average Error (%)')
-        plt.tight_layout()
-        plt.savefig(f'{figures_dir}/monthly_performance_{timestamp}.png')
-        plt.close()
-        
-        # 7. Error Heatmap by Hour and Month
-        pivot_table = df.pivot_table(
-            values='prediction_error_percent',
-            index='hour',
-            columns='month',
-            aggfunc='mean'
-        )
-        
-        plt.figure(figsize=(12, 8))
-        plt.imshow(pivot_table, cmap='YlOrRd', aspect='auto')
-        plt.colorbar(label='Error %')
-        plt.title('Prediction Error (%) by Hour and Month')
-        plt.xlabel('Month')
-        plt.ylabel('Hour')
-        for i in range(len(pivot_table.index)):
-            for j in range(len(pivot_table.columns)):
-                plt.text(j, i, f'{pivot_table.iloc[i, j]:.1f}', 
-                        ha='center', va='center')
-        plt.tight_layout()
-        plt.savefig(f'{figures_dir}/error_heatmap_{timestamp}.png')
-        plt.close()
-        
-        logging.info(f"Performance figures saved in {figures_dir}")
-
-    def get_location_specific_features(self):
-        """Add Davao City-specific features"""
-        return {
-            'latitude': 7.0711,  # Davao City latitude (near equator)
-            'longitude': 125.6134,  # Davao City longitude
-            'elevation': 22.0,  # meters above sea level for Davao City
-            'timezone': 'Asia/Manila',  # UTC+8
-            'climate_type': 'tropical_rainforest',  # Köppen climate classification: Af
-            'annual_rainfall': 1830,  # mm/year (average)
-            'avg_temperature': 27.5,  # °C (annual average)
-            'avg_humidity': 80  # % (annual average)
-        }
-
-    def create_advanced_features(self, df):
-        """Enhanced feature engineering for Davao's tropical climate"""
-        # Davao-specific seasons (more nuanced than simple wet/dry)
-        # Relatively dry: January to April
-        # Transitional: May to June
-        # Wet: July to December
-        df['is_dry_period'] = df.index.month.isin([1, 2, 3, 4]).astype(int)
-        df['is_transitional'] = df.index.month.isin([5, 6]).astype(int)
-        df['is_wet_period'] = df.index.month.isin([7, 8, 9, 10, 11, 12]).astype(int)
-        
-        # Time-based features
-        df['hour_sin'] = np.sin(2 * np.pi * df['hour']/24)
-        df['hour_cos'] = np.cos(2 * np.pi * df['hour']/24)
-        df['month_sin'] = np.sin(2 * np.pi * df['month']/12)
-        df['month_cos'] = np.cos(2 * np.pi * df['month']/12)
-        
-        # Monsoon effects (Davao is less affected by monsoons due to location)
-        df['monsoon_influence'] = df.index.month.isin([6, 7, 8, 9, 10, 11]).astype(int)
-        
-        # Tropical cyclone exposure (Davao is relatively sheltered)
-        df['cyclone_season'] = df.index.month.isin([10, 11, 12]).astype(int)
-        
-        # Diurnal patterns (typical for equatorial region)
-        df['morning_convection'] = df.index.hour.isin([9, 10, 11]).astype(int)
-        df['afternoon_convection'] = df.index.hour.isin([14, 15, 16, 17]).astype(int)
-        
-        # Solar position calculations (very important near equator)
-        df['solar_elevation'] = self.calculate_solar_elevation(
-            df.index, 
-            latitude=7.0711, 
-            longitude=125.6134
-        )
-        df['day_length'] = self.calculate_day_length(df.index, latitude=7.0711)
-        
-        # Enhanced humidity features (crucial in Davao's climate)
-        df['absolute_humidity'] = self.calculate_absolute_humidity(
-            df['air_temp'], 
-            df['relative_humidity']
-        )
-        
-        # Weather interaction features
-        df['cloud_clearsky_interaction'] = df['cloud_opacity'] * df['clearsky_ghi']
-        df['temp_humidity_interaction'] = df['air_temp'] * df['relative_humidity']
-        
-        # Local convection indicators
-        df['convection_potential'] = (
-            (df['air_temp'] > df['air_temp'].rolling(24).mean()) & 
-            (df['relative_humidity'] > 75)
-        ).astype(int)
-        
-        # Terrain influence (Davao's geography)
-        df['mountain_effect'] = (
-            (df.index.hour.isin([14, 15, 16, 17])) & 
-            (df['wind_direction_10m'].between(45, 135))
-        ).astype(int)
-        
-        # Rolling statistics (3-hour window)
-        df['ghi_rolling_mean'] = df['ghi'].rolling(window=3, min_periods=1).mean()
-        df['ghi_rolling_std'] = df['ghi'].rolling(window=3, min_periods=1).std()
-        
-        # Clear sky index
-        df['clear_sky_index'] = np.where(df['clearsky_ghi'] > 0, 
-                                       df['ghi'] / df['clearsky_ghi'], 
-                                       0)
-        
-        return df
-
-    def calculate_solar_elevation(self, dates, latitude, longitude):
-        """
-        Calculate solar elevation angle for Davao's specific location
-        More accurate than generic calculations
-        """
-        # Time equation parameters
-        day_of_year = dates.dayofyear
-        
-        # Solar declination for latitude near equator
-        declination = 23.45 * np.sin(np.radians(360/365 * (day_of_year - 81)))
-        
-        # Calculate day length in hours
-        lat_rad = np.radians(latitude)
-        decl_rad = np.radians(declination)
-        
-        cos_hour_angle = -np.tan(lat_rad) * np.tan(decl_rad)
-        cos_hour_angle = np.clip(cos_hour_angle, -1, 1)
-        hour_angle = np.arccos(cos_hour_angle)
-        
-        day_length = 2 * np.degrees(hour_angle) / 15  # Convert to hours
-        return day_length
-
-    def calculate_absolute_humidity(self, temperature, relative_humidity):
-        """
-        Calculate absolute humidity for tropical conditions
-        More relevant for Davao's climate
-        """
-        # Constants for tropical conditions
-        A = 17.27
-        B = 237.7  # °C
-        
-        # Calculate saturation vapor pressure
-        temp_celsius = temperature
-        alpha = ((A * temp_celsius) / (B + temp_celsius)) + np.log(relative_humidity/100.0)
-        
-        # Calculate absolute humidity (g/m³)
-        abs_humidity = 216.7 * (relative_humidity/100.0 * 6.112 * 
-                           np.exp(A * temp_celsius/(B + temp_celsius)) / 
-                           (273.15 + temp_celsius))
-        
-        return abs_humidity
-
-    def calculate_day_length(self, dates, latitude):
-        """Calculate day length for given dates and latitude"""
-        # Convert dates to day of year
-        day_of_year = dates.dayofyear
-        
-        # Calculate solar declination
-        declination = 23.45 * np.sin(np.radians(360/365 * (day_of_year - 81)))
-        
-        # Calculate day length in hours
-        lat_rad = np.radians(latitude)
-        decl_rad = np.radians(declination)
-        
-        cos_hour_angle = -np.tan(lat_rad) * np.tan(decl_rad)
-        cos_hour_angle = np.clip(cos_hour_angle, -1, 1)  # Ensure valid range
-        hour_angle = np.arccos(cos_hour_angle)
-        
-        # Convert to hours (2 * hour_angle / 15 degrees per hour)
-        day_length = 2 * np.degrees(hour_angle) / 15
-        
-        return day_length
-
-    def calculate_solar_elevation(self, dates, latitude, longitude):
-        """Calculate solar elevation angle for Davao's specific location"""
-        # Time equation parameters
-        day_of_year = dates.dayofyear
-        
-        # Solar declination for latitude near equator
-        declination = 23.45 * np.sin(np.radians(360/365 * (day_of_year - 81)))
-        
-        # Hour angle calculation for Davao
-        local_solar_time = dates.hour + dates.minute/60
-        hour_angle = (local_solar_time - 12) * 15
-        
-        # Convert to radians
-        lat_rad = np.radians(latitude)
-        decl_rad = np.radians(declination)
-        hour_rad = np.radians(hour_angle)
-        
-        # Calculate solar elevation
-        sin_elevation = (np.sin(lat_rad) * np.sin(decl_rad) + 
-                        np.cos(lat_rad) * np.cos(decl_rad) * np.cos(hour_rad))
-        elevation = np.degrees(np.arcsin(sin_elevation))
-        
-        return elevation
-
-    def calculate_absolute_humidity(self, temperature, relative_humidity):
-        """Calculate absolute humidity for tropical conditions"""
-        # Constants for tropical conditions
-        A = 17.27
-        B = 237.7  # °C
-        
-        # Calculate saturation vapor pressure
-        temp_celsius = temperature
-        alpha = ((A * temp_celsius) / (B + temp_celsius)) + np.log(relative_humidity/100.0)
-        
-        # Calculate absolute humidity (g/m³)
-        abs_humidity = 216.7 * (relative_humidity/100.0 * 6.112 * 
-                           np.exp(A * temp_celsius/(B + temp_celsius)) / 
-                           (273.15 + temp_celsius))
-        
-        return abs_humidity
-
-    def adjust_learning_strategy(self, iteration):
-        """Adjust learning strategy for Davao's specific climate patterns"""
-        current_month = datetime.now().month
-        current_hour = datetime.now().hour
-        
-        # Base adjustments
-        if current_month in [1, 2, 3, 4]:  # Relatively dry period
-            self.model_params.update({
-                'subsample': 0.85,
-                'colsample_bytree': 0.85,
-                'min_child_weight': 3
-            })
-        elif current_month in [5, 6]:  # Transitional period
-            self.model_params.update({
-                'subsample': 0.8,
-                'colsample_bytree': 0.8,
-                'min_child_weight': 4
-            })
-        else:  # Wet period
-            self.model_params.update({
-                'subsample': 0.75,
-                'colsample_bytree': 0.75,
-                'min_child_weight': 5
-            })
-        
-        # Diurnal adjustments
-        if current_hour in [14, 15, 16, 17]:  # Afternoon convection period
-            self.model_params.update({
-                'max_depth': min(6, self.model_params['max_depth']),
-                'learning_rate': self.model_params['learning_rate'] * 0.8
-            })
-
-    def pretrain_on_historical_data(self, X_historical, y_historical, w_historical):
-        """Pre-train models on historical data"""
-        logging.info("Pre-training on historical data...")
-        
-        # Scale features
-        X_historical_scaled = self.scaler.fit_transform(X_historical)
-        
-        # Initialize base models for pre-training
-        base_models = {
-            'xgb': xgb.XGBRegressor(
-                n_estimators=100,
-                learning_rate=0.1,
-                max_depth=6,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                tree_method='hist',
-                n_jobs=-1,
-                random_state=42
-            ),
-            'lgb': LGBMRegressor(
-                n_estimators=100,
-                learning_rate=0.1,
-                num_leaves=31,
-                n_jobs=-1,
-                random_state=42
-            ),
-            'cat': CatBoostRegressor(
-                iterations=100,
-                learning_rate=0.1,
-                depth=6,
-                thread_count=-1,
-                random_state=42,
-                verbose=False
-            )
-        }
-        
-        # Pre-train each model
-        for name, model in base_models.items():
-            logging.info(f"Pre-training {name} model...")
-            try:
-                if name == 'cat':
-                    model.fit(
-                        X_historical_scaled, 
-                        y_historical,
-                        sample_weight=w_historical,
-                        verbose=False
-                    )
-                else:
-                    model.fit(
-                        X_historical_scaled, 
-                        y_historical,
-                        sample_weight=w_historical
-                    )
-                
-                # Calculate and log performance metrics
-                y_pred = model.predict(X_historical_scaled)
-                mape = mean_absolute_percentage_error(y_historical, y_pred)
-                rmse = np.sqrt(mean_squared_error(y_historical, y_pred))
-                logging.info(f"{name} pre-training metrics - MAPE: {mape:.4f}, RMSE: {rmse:.4f}")
-                
-            except Exception as e:
-                logging.error(f"Error pre-training {name} model: {str(e)}")
-        
-        # Store pre-trained models
-        self.pretrained_models = base_models
-        logging.info("Pre-training completed")
-
-    def train_weighted_models(self, X_train_scaled, y_train, w_train, iteration):
-        """Train models with sample weights"""
-        models = {}
-        
-        # Create new model instances with updated parameters
-        base_models = {
-            'xgb': xgb.XGBRegressor(
-                n_estimators=100 + (25 * iteration),
-                learning_rate=0.1 / (1 + 0.05 * iteration),
-                max_depth=min(6 + iteration // 3, 12),
-                subsample=0.8,
-                colsample_bytree=0.8,
-                tree_method='hist',  # Use 'hist' instead of 'gpu_hist'
-                n_jobs=-1,
-                random_state=42 + iteration,
-                predictor='cpu_predictor'  # Add this line to force CPU usage
-            ),
-            'lgb': LGBMRegressor(
-                n_estimators=100 + (25 * iteration),
-                learning_rate=0.1 / (1 + 0.05 * iteration),
-                num_leaves=31 + iteration,
-                n_jobs=-1,
-                random_state=42 + iteration,
-                force_row_wise=True  # Add this to avoid the warning
-            ),
-            'cat': CatBoostRegressor(
-                iterations=100 + (25 * iteration),
-                learning_rate=0.1 / (1 + 0.05 * iteration),
-                depth=min(6 + iteration // 3, 12),
-                thread_count=-1,
-                random_state=42 + iteration,
-                verbose=False
-            )
-        }
-        
-        # Train models with weights
-        for name, model in base_models.items():
-            try:
-                if name == 'cat':
-                    model.fit(X_train_scaled, y_train, 
-                             sample_weight=w_train, verbose=False)
-                else:
-                    model.fit(X_train_scaled, y_train, 
-                             sample_weight=w_train)
-                models[name] = model
-                
-                # Log training metrics
-                y_pred = model.predict(X_train_scaled)
-                mape = mean_absolute_percentage_error(y_train, y_pred)
-                rmse = np.sqrt(mean_squared_error(y_train, y_pred))
-                logging.info(f"{name} training metrics - MAPE: {mape:.4f}, RMSE: {rmse:.4f}")
-                
-            except Exception as e:
-                logging.error(f"Error training {name} model: {str(e)}")
-        
-        return models
-
-    def create_weighted_ensemble(self, models, X_val_scaled, y_val):
-        """Create a weighted ensemble from the trained models"""
-        logging.info("Creating weighted ensemble...")
-        
-        # Calculate weights based on validation performance
-        model_weights = {}
-        predictions = {}
-        
-        for name, model in models.items():
-            try:
-                # Get predictions
-                y_pred = model.predict(X_val_scaled)
-                predictions[name] = y_pred
-                
-                # Calculate metrics
-                mape = mean_absolute_percentage_error(y_val, y_pred)
-                rmse = np.sqrt(mean_squared_error(y_val, y_pred))
-                logging.info(f"{name} validation metrics - MAPE: {mape:.4f}, RMSE: {rmse:.4f}")
-                
-                # Calculate weight (inverse of error)
-                weight = 1 / (mape + 0.1)  # Add small constant to avoid division by zero
-                model_weights[name] = weight
-                
-            except Exception as e:
-                logging.error(f"Error evaluating {name} model: {str(e)}")
-                model_weights[name] = 0
-        
-        # Normalize weights
-        total_weight = sum(model_weights.values())
-        if total_weight > 0:
-            model_weights = {name: w/total_weight for name, w in model_weights.items()}
-        else:
-            # If all weights are 0, use equal weights
-            model_weights = {name: 1/len(models) for name in models}
-        
-        logging.info(f"Initial model weights: {model_weights}")
-        
-        # Create VotingRegressor with weighted models
-        estimators = [(name, model) for name, model in models.items()]
-        weights = [model_weights[name] for name, _ in estimators]
-        
-        ensemble = VotingRegressor(
-            estimators=estimators,
-            weights=weights
-        )
-        
-        # Fit ensemble on validation data
-        ensemble.fit(X_val_scaled, y_val)
-        
-        # Calculate ensemble performance
-        y_pred_ensemble = ensemble.predict(X_val_scaled)
-        ensemble_mape = mean_absolute_percentage_error(y_val, y_pred_ensemble)
-        ensemble_rmse = np.sqrt(mean_squared_error(y_val, y_pred_ensemble))
-        
-        logging.info(f"Ensemble metrics - MAPE: {ensemble_mape:.4f}, RMSE: {ensemble_rmse:.4f}")
-        
-        return ensemble
-
-    def calculate_adaptive_thresholds(self, seasonal_errors, weather_errors, time_errors):
-        """Calculate adaptive error thresholds based on different conditions"""
-        logging.info("Calculating adaptive thresholds...")
-        
-        thresholds = {}
-        
-        # Calculate seasonal thresholds
-        seasonal_thresholds = {}
-        for season, errors in seasonal_errors.items():
-            if errors:  # Check if we have errors for this season
-                # Use percentile-based thresholds
-                seasonal_thresholds[season] = {
-                    'base': np.median(errors),
-                    'strict': np.percentile(errors, 25),
-                    'relaxed': np.percentile(errors, 75)
-                }
-        thresholds['seasonal'] = seasonal_thresholds
-        
-        # Calculate weather condition thresholds
-        weather_thresholds = {}
-        for condition, errors in weather_errors.items():
-            if errors:
-                # Adjust thresholds based on weather conditions
-                base_threshold = np.median(errors)
-                if condition == 'clear_sky':
-                    # Stricter thresholds for clear sky conditions
-                    weather_thresholds[condition] = {
-                        'base': base_threshold * 0.9,
-                        'strict': base_threshold * 0.7,
-                        'relaxed': base_threshold * 1.2
-                    }
-                elif condition == 'partly_cloudy':
-                    # Moderate thresholds for partly cloudy conditions
-                    weather_thresholds[condition] = {
-                        'base': base_threshold,
-                        'strict': base_threshold * 0.8,
-                        'relaxed': base_threshold * 1.3
-                    }
-                else:  # overcast
-                    # More relaxed thresholds for overcast conditions
-                    weather_thresholds[condition] = {
-                        'base': base_threshold * 1.1,
-                        'strict': base_threshold * 0.9,
-                        'relaxed': base_threshold * 1.4
-                    }
-        thresholds['weather'] = weather_thresholds
-        
-        # Calculate time of day thresholds
-        time_thresholds = {}
-        for period, errors in time_errors.items():
-            if errors:
-                base_threshold = np.median(errors)
-                if period == 'morning':
-                    # Account for morning transition
-                    time_thresholds[period] = {
-                        'base': base_threshold * 1.1,
-                        'strict': base_threshold * 0.9,
-                        'relaxed': base_threshold * 1.3
-                    }
-                elif period == 'afternoon':
-                    # Account for afternoon convection
-                    time_thresholds[period] = {
-                        'base': base_threshold * 1.2,
-                        'strict': base_threshold * 0.95,
-                        'relaxed': base_threshold * 1.4
-                    }
-                else:  # evening
-                    # More relaxed thresholds for evening
-                    time_thresholds[period] = {
-                        'base': base_threshold * 1.15,
-                        'strict': base_threshold * 0.9,
-                        'relaxed': base_threshold * 1.35
-                    }
-        thresholds['time'] = time_thresholds
-        
-        # Log threshold summaries
-        logging.info("Calculated adaptive thresholds:")
-        for category, category_thresholds in thresholds.items():
-            logging.info(f"\n{category.capitalize()} thresholds:")
-            for condition, values in category_thresholds.items():
-                logging.info(f"  {condition}: {values}")
-        
-        return thresholds
-
-    def update_model_weights(self, ensemble, error_analysis):
-        """Update model weights based on error analysis"""
-        if not hasattr(self, 'model_weights_history'):
-            self.model_weights_history = []
-        
-        # Get current weights from the ensemble
-        current_weights = np.array(ensemble.weights) if ensemble.weights is not None else \
-                         np.ones(len(ensemble.estimators)) / len(ensemble.estimators)
-        
-        # Calculate adjustment factors based on error analysis
-        adjustments = np.ones_like(current_weights)
-        
-        # Apply adjustments based on error patterns
-        for i, estimator in enumerate(ensemble.estimators):
-            # Get model name from the estimator type
-            name = type(estimator).__name__
-            
-            # Seasonal adjustment
-            if error_analysis.get('seasonal_bias', False):
-                adjustments[i] *= 0.95
-            
-            # Weather condition adjustment
-            if error_analysis.get('weather_bias', False):
-                adjustments[i] *= 0.9
-            
-            # Time of day adjustment
-            if error_analysis.get('time_bias', False):
-                adjustments[i] *= 0.95
-        
-        # Update weights
-        new_weights = current_weights * adjustments
-        new_weights = new_weights / new_weights.sum()  # Normalize
-        
-        # Store weights history
-        self.model_weights_history.append({
-            'weights': new_weights,
-            'adjustments': adjustments
-        })
-        
-        # Update ensemble weights
-        ensemble.weights = list(new_weights)  # Convert to list for VotingRegressor
-        
-        # Log the updates
-        weight_dict = dict(zip([type(est).__name__ for est in ensemble.estimators], new_weights))
-        logging.info(f"Updated model weights: {weight_dict}")
-        
-        return ensemble
-
-    def log_detailed_metrics(self, metrics):
-        """Log detailed performance metrics"""
-        logging.info("\n=== Detailed Performance Metrics ===")
-        
-        # Seasonal performance
-        logging.info("\nSeasonal Performance:")
-        for season, values in metrics['Seasonal Performance'].items():
-            logging.info(f"\n{season}:")
-            for metric, value in values.items():
-                logging.info(f"  {metric}: {value:.2f}")
-        
-        # Weather condition performance
-        logging.info("\nWeather Condition Performance:")
-        for condition, values in metrics['Weather Condition Performance'].items():
-            logging.info(f"\n{condition}:")
-            for metric, value in values.items():
-                logging.info(f"  {metric}: {value:.2f}")
-        
-        # Time of day performance
-        logging.info("\nTime of Day Performance:")
-        for period, values in metrics['Time of Day Performance'].items():
-            logging.info(f"\n{period}:")
-            for metric, value in values.items():
-                logging.info(f"  {metric}: {value:.2f}")
-        
-        # Overall performance
-        logging.info("\nOverall Performance:")
-        for metric, value in metrics['Overall Performance']['Overall'].items():
-            logging.info(f"  {metric}: {value:.2f}")
-        
-        # Save metrics to file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        metrics_file = f'metrics_{timestamp}.txt'
-        
-        with open(metrics_file, 'w') as f:
-            f.write("=== Detailed Performance Metrics ===\n")
-            
-            # Write seasonal performance
-            f.write("\nSeasonal Performance:\n")
-            for season, values in metrics['Seasonal Performance'].items():
-                f.write(f"\n{season}:\n")
-                for metric, value in values.items():
-                    f.write(f"  {metric}: {value:.2f}\n")
-            
-            # Write weather condition performance
-            f.write("\nWeather Condition Performance:\n")
-            for condition, values in metrics['Weather Condition Performance'].items():
-                f.write(f"\n{condition}:\n")
-                for metric, value in values.items():
-                    f.write(f"  {metric}: {value:.2f}\n")
-            
-            # Write time of day performance
-            f.write("\nTime of Day Performance:\n")
-            for period, values in metrics['Time of Day Performance'].items():
-                f.write(f"\n{period}:\n")
-                for metric, value in values.items():
-                    f.write(f"  {metric}: {value:.2f}\n")
-            
-            # Write overall performance
-            f.write("\nOverall Performance:\n")
-            for metric, value in metrics['Overall Performance']['Overall'].items():
-                f.write(f"  {metric}: {value:.2f}\n")
-        
-        logging.info(f"\nDetailed metrics saved to {metrics_file}")
-
-    def check_model_complexity_needs(self):
-        """Check if model complexity needs to be increased"""
-        if not hasattr(self, 'performance_history'):
-            return False
-        
-        # Get recent performance metrics
-        recent_metrics = self.performance_history[-3:]  # Last 3 iterations
-        
-        if len(recent_metrics) < 3:
-            return False
-        
-        # Check for plateauing performance
-        errors = [m.get('validation_error', float('inf')) for m in recent_metrics]
-        
-        # Calculate if performance is plateauing
-        is_plateauing = all(
-            abs(errors[i] - errors[i-1]) < 0.01 * errors[i-1]  # Less than 1% improvement
-            for i in range(1, len(errors)))
-        
-        # Check if error is still above acceptable threshold
-        error_too_high = errors[-1] > self.target_error_threshold
-        
-        return is_plateauing and error_too_high
-
-    def increase_model_complexity(self):
-        """Increase model complexity based on performance analysis"""
-        logging.info("Increasing model complexity...")
-        
-        # Update XGBoost parameters
-        self.model_params['xgb'].update({
-            'max_depth': min(self.model_params['xgb']['max_depth'] + 1, 12),
-            'n_estimators': self.model_params['xgb']['n_estimators'] + 50,
-            'min_child_weight': max(self.model_params['xgb']['min_child_weight'] - 1, 1)
-        })
-        
-        # Update LightGBM parameters
-        self.model_params['lgb'].update({
-            'num_leaves': min(self.model_params['lgb']['num_leaves'] * 2, 127),
-            'n_estimators': self.model_params['lgb']['n_estimators'] + 50,
-            'min_child_samples': max(self.model_params['lgb']['min_child_samples'] - 2, 5)
-        })
-        
-        # Update CatBoost parameters
-        self.model_params['cat'].update({
-            'depth': min(self.model_params['cat']['depth'] + 1, 10),
-            'iterations': self.model_params['cat']['iterations'] + 50,
-            'min_data_in_leaf': max(self.model_params['cat']['min_data_in_leaf'] - 1, 1)
-        })
-        
-        logging.info("Updated model parameters:")
-        for model_name, params in self.model_params.items():
-            logging.info(f"{model_name}: {params}")
-
-    def initialize_model_params(self):
-        """Initialize model parameters"""
-        self.model_params = {
-            'xgb': {
-                'max_depth': 6,
-                'n_estimators': 100,
-                'learning_rate': 0.1,
-                'min_child_weight': 3,
-                'subsample': 0.8,
-                'colsample_bytree': 0.8,
-                'tree_method': 'hist',
-                'n_jobs': -1,
-                'random_state': 42
-            },
-            'lgb': {
-                'num_leaves': 31,
-                'n_estimators': 100,
-                'learning_rate': 0.1,
-                'min_child_samples': 20,
-                'n_jobs': -1,
-                'random_state': 42,
-                'force_col_wise': True
-            },
-            'cat': {
-                'depth': 6,
-                'iterations': 100,
-                'learning_rate': 0.1,
-                'min_data_in_leaf': 20,
-                'thread_count': -1,
-                'random_state': 42,
-                'verbose': False
-            }
-        }
-        
-        # Initialize target error threshold
-        self.target_error_threshold = 0.15  # 15% MAPE
-        
-        # Initialize performance history
-        self.performance_history = []
-
-    def check_convergence_criteria(self, metrics):
-        """Check if training should stop based on current metrics"""
-        current_error = metrics['Overall Performance']['Overall']['Mean Error']
-        
-        # Check if error is below target threshold
-        error_threshold_met = current_error <= self.target_error_threshold
-        
-        # Check iteration count
-        max_iterations_reached = hasattr(self, 'current_iteration') and self.current_iteration >= self.max_iterations
-        
-        # Log convergence status
-        logging.info("\nConvergence Check:")
-        logging.info(f"  Current error: {current_error:.4f}")
-        logging.info(f"  Error threshold met: {error_threshold_met}")
-        logging.info(f"  Max iterations reached: {max_iterations_reached}")
-        
-        return error_threshold_met or max_iterations_reached
-
-    def initialize_convergence_params(self):
-        """Initialize convergence parameters"""
-        self.max_iterations = 100
-        self.target_error_threshold = 0.05  # 5% MAPE
-        self.min_improvement_threshold = 0.01  # 1% minimum improvement
-        self.convergence_window = 3  # Number of iterations to check for convergence
-        
-        # Initialize performance history if not exists
-        if not hasattr(self, 'performance_history'):
-            self.performance_history = []
-
-    def load_best_model(self, model_path):
-        """Load the best saved model"""
         try:
-            # Load configuration
-            with open(f'{model_path}_config.json', 'r') as f:
-                config = json.load(f)
-            logging.info(f"Loaded configuration with error: {config['final_error']:.4f}")
+            # Check if file exists
+            if not os.path.exists(csv_path):
+                raise FileNotFoundError(f"Dataset file not found: {csv_path}")
             
-            # Load individual models
-            models = {}
-            for model_type in ['xgb', 'lgb', 'cat']:
-                with open(f'{model_path}_{model_type}.pkl', 'rb') as f:
-                    models[model_type] = pickle.load(f)
+            # Load the dataset
+            print(f"Loading dataset from {csv_path}...")
+            df = pd.read_csv(csv_path)
             
-            # Load ensemble
-            with open(f'{model_path}_ensemble.pkl', 'rb') as f:
-                ensemble = pickle.load(f)
+            # Print initial dataset info
+            print("\nInitial dataset info:")
+            print(f"Shape: {df.shape}")
+            print("Columns:", df.columns.tolist())
             
-            # Load scaler
-            with open(f'{model_path}_scaler.pkl', 'rb') as f:
-                self.scaler = pickle.load(f)
+            # Compute solar parameters
+            print("\nComputing solar parameters...")
+            df = self.compute_solar_parameters(df)
             
-            logging.info("Successfully loaded best model and components")
-            return models, ensemble
+            # Prepare features and target
+            print("\nPreparing features and target...")
+            X_scaled, y_scaled, df = self.prepare_data_for_training(df)
+            
+            return X_scaled, y_scaled, df
             
         except Exception as e:
-            logging.error(f"Error loading best model: {str(e)}")
-            return None, None
+            print(f"\nError in load_and_prepare_data: {str(e)}")
+            raise
 
-    def analyze_and_adjust_model(self, metrics, models, ensemble):
-        """Analyze metrics and make targeted improvements"""
-        logging.info("Analyzing metrics and making adjustments...")
+    def prepare_xgboost_data(self, X_scaled, y_scaled):
+        """Prepare data for XGBoost with proper handling of time series data"""
+        try:
+            # Convert to numpy arrays
+            X = np.array(X_scaled)
+            y = np.array(y_scaled).reshape(-1)  # Ensure 1D array
+            
+            # Calculate split indices
+            train_idx = int(len(X) * self.TRAIN_SIZE)
+            val_idx = train_idx + int(len(X) * self.VALIDATION_SIZE)
+            
+            # Create target sequences for each forecast hour
+            y_train_split = []
+            y_val_split = []
+            y_test_split = []
+            
+            # Adjust X and y for each forecast horizon
+            X_train_list = []
+            X_val_list = []
+            X_test_list = []
+            
+            for i in range(self.FORECAST_HOURS):
+                # Create shifted targets with adjusted shift for each hour
+                # Hour 1: shift by 1, Hour 2: shift by 2, etc.
+                shift = i + 1
+                y_shifted = y[shift:]  # Remove first shift entries
+                X_shifted = X[:-shift]  # Remove last shift entries
+                
+                # Ensure X and y have same length
+                min_len = min(len(y_shifted), len(X_shifted))
+                y_shifted = y_shifted[:min_len]
+                X_shifted = X_shifted[:min_len]
+                
+                # Calculate new split points based on shortened data
+                train_idx_i = int(min_len * self.TRAIN_SIZE)
+                val_idx_i = train_idx_i + int(min_len * self.VALIDATION_SIZE)
+                
+                # Split data
+                y_train = y_shifted[:train_idx_i]
+                y_val = y_shifted[train_idx_i:val_idx_i]
+                y_test = y_shifted[val_idx_i:]
+                
+                X_train = X_shifted[:train_idx_i]
+                X_val = X_shifted[train_idx_i:val_idx_i]
+                X_test = X_shifted[val_idx_i:]
+                
+                # Store splits
+                y_train_split.append(y_train)
+                y_val_split.append(y_val)
+                y_test_split.append(y_test)
+                
+                X_train_list.append(X_train)
+                X_val_list.append(X_val)
+                X_test_list.append(X_test)
+            
+            return X_train_list, y_train_split, X_val_list, y_val_split, X_test_list, y_test_split
+            
+        except Exception as e:
+            print(f"Error in prepare_xgboost_data: {str(e)}")
+            raise
+    
+    def train_xgboost(self, X_train_list, y_train_split, X_val_list, y_val_split):
+        """Train XGBoost models with improved parameters and quantile predictions"""
+        self.xgb_models = []
+        self.xgb_models_lower = []
+        self.xgb_models_upper = []
         
-        # Extract key performance indicators
-        time_performance = {
-            'morning': metrics['Time of Day Performance']['Morning']['Mean Error'],
-            'afternoon': metrics['Time of Day Performance']['Afternoon']['Mean Error'],
-            'evening': metrics['Time of Day Performance']['Evening']['Mean Error']
+        # Enhanced base parameters for better accuracy
+        base_params = {
+            'n_estimators': 4000,  # Increased from 3500
+            'max_depth': 8,        # Increased from 7
+            'learning_rate': 0.001, # Decreased for better stability
+            'min_child_weight': 3,  # Decreased for better granularity
+            'subsample': 0.85,      # Adjusted for better stability
+            'colsample_bytree': 0.85,
+            'gamma': 0.2,          # Increased to reduce overfitting
+            'reg_alpha': 0.5,      # Increased L1 regularization
+            'reg_lambda': 1.5,     # Increased L2 regularization
+            'tree_method': 'hist',
+            'random_state': 42,
+            'n_jobs': -1
         }
         
-        weather_performance = {
-            'clear_sky': metrics['Weather Condition Performance']['Clear_sky']['Mean Error'],
-            'partly_cloudy': metrics['Weather Condition Performance']['Partly_cloudy']['Mean Error'],
-            'overcast': metrics['Weather Condition Performance']['Overcast']['Mean Error']
-        }
+        # Keep original quantile ranges
+        quantile_params_lower = base_params.copy()
+        quantile_params_lower['objective'] = 'reg:quantileerror'
+        quantile_params_lower['quantile_alpha'] = 0.25  # Keep at 25th percentile
         
-        # Identify areas needing improvement
-        adjustments = {}
+        quantile_params_upper = base_params.copy()
+        quantile_params_upper['objective'] = 'reg:quantileerror'
+        quantile_params_upper['quantile_alpha'] = 0.75  # Keep at 75th percentile
         
-        # Adjust for time of day performance
-        if time_performance['afternoon'] > 250:  # High afternoon errors
-            adjustments['afternoon'] = {
-                'learning_rate': self.model_params['xgb']['learning_rate'] * 0.9,
-                'max_depth': min(self.model_params['xgb']['max_depth'] + 1, 12),
-                'min_child_weight': max(self.model_params['xgb']['min_child_weight'] - 1, 1)
-            }
-        
-        # Adjust for weather conditions
-        if weather_performance['clear_sky'] > 270:  # High clear sky errors
-            adjustments['clear_sky'] = {
-                'subsample': min(self.model_params['xgb']['subsample'] + 0.1, 1.0),
-                'colsample_bytree': min(self.model_params['xgb']['colsample_bytree'] + 0.1, 1.0)
-            }
-        
-        # Apply adjustments to models
-        for condition, params in adjustments.items():
-            logging.info(f"Applying adjustments for {condition}: {params}")
-            self.update_model_parameters(models, params, condition)
-        
-        return models, ensemble
+        for i in range(self.FORECAST_HOURS):
+            print(f"\nTraining XGBoost model for {i+1}-hour ahead prediction")
+            
+            # Adjust parameters based on forecast horizon
+            horizon_params = base_params.copy()
+            if i > 0:
+                # Increase trees and decrease learning rate for longer horizons
+                horizon_params['n_estimators'] += i * 500
+                horizon_params['learning_rate'] *= 0.9
+                horizon_params['subsample'] *= 0.95  # Reduce variance for longer horizons
+            
+            # Add sample weights for better handling of edge cases
+            weights = self._calculate_sample_weights(y_train_split[i], X_train_list[i])
+            
+            # Train median model with sample weights
+            model = xgb.XGBRegressor(**horizon_params)
+            model.fit(
+                X_train_list[i], 
+                y_train_split[i],
+                sample_weight=weights,
+                eval_set=[(X_val_list[i], y_val_split[i])],
+                verbose=True
+            )
+            
+            # Adjust quantile parameters based on horizon
+            q_params_lower = quantile_params_lower.copy()
+            q_params_upper = quantile_params_upper.copy()
+            if i > 0:
+                # Widen prediction intervals for longer horizons, but maintain 25-75 range
+                q_params_lower['learning_rate'] *= 0.9 ** i  # Adjust learning rate instead
+                q_params_upper['learning_rate'] *= 0.9 ** i
+            
+            # Train lower bound model
+            model_lower = xgb.XGBRegressor(**q_params_lower)
+            model_lower.fit(
+                X_train_list[i], 
+                y_train_split[i],
+                sample_weight=weights,
+                eval_set=[(X_val_list[i], y_val_split[i])],
+                verbose=True
+            )
+            
+            # Train upper bound model
+            model_upper = xgb.XGBRegressor(**q_params_upper)
+            model_upper.fit(
+                X_train_list[i], 
+                y_train_split[i],
+                sample_weight=weights,
+                eval_set=[(X_val_list[i], y_val_split[i])],
+                verbose=True
+            )
+            
+            self.xgb_models.append(model)
+            self.xgb_models_lower.append(model_lower)
+            self.xgb_models_upper.append(model_upper)
+            
+            # Print feature importance
+            importance = pd.DataFrame({
+                'feature': self.feature_columns,
+                'importance': model.feature_importances_
+            })
+            importance = importance.sort_values('importance', ascending=False)
+            print(f"\nTop 10 important features for hour {i+1}:")
+            print(importance.head(10))
+    
+    def _calculate_sample_weights(self, y, X):
+        """Calculate sample weights to focus on important cases"""
+        try:
+            # Get solar elevation from features - using Sin_Solar_Elevation instead
+            solar_elevation_idx = self.feature_columns.index('Sin_Solar_Elevation')
+            sin_solar_elevation = X[:, solar_elevation_idx]
+            # Convert from sin to actual angle
+            solar_elevation = np.arcsin(np.clip(sin_solar_elevation, -1, 1)) * 180 / np.pi
+            
+            # Initialize base weights
+            weights = np.ones_like(y)
+            
+            # Upweight transition periods (sunrise/sunset)
+            transition_mask = (solar_elevation > -5) & (solar_elevation < 15)
+            weights[transition_mask] *= 1.5
+            
+            # Upweight high GHI periods
+            high_ghi_mask = y > np.percentile(y[y > 0], 75)
+            weights[high_ghi_mask] *= 1.3
+            
+            # Upweight rapid changes
+            if hasattr(self, 'historical_values'):
+                y_series = pd.Series(y)
+                changes = y_series.diff().abs()
+                rapid_change_mask = changes > np.percentile(changes, 90)
+                weights[rapid_change_mask] *= 1.4
+            
+            # Normalize weights
+            weights = weights / weights.mean()
+            
+            return weights
+            
+        except Exception as e:
+            print(f"Error in _calculate_sample_weights: {str(e)}")
+            return np.ones_like(y)
 
-    def update_model_parameters(self, models, new_params, condition):
-        """Update model parameters based on performance analysis"""
-        for model_name, model in models.items():
-            if model_name == 'xgb':
-                # XGBoost specific adjustments
-                if hasattr(model, 'get_params'):
-                    current_params = model.get_params()
-                    for param, value in new_params.items():
-                        if param in current_params:
-                            current_params[param] = value
-                    model.set_params(**current_params)
+    def predict_xgboost(self, X):
+        """Enhanced prediction with improved physical constraints and confidence intervals"""
+        try:
+            # Get base predictions
+            predictions = np.column_stack([
+                model.predict(X) for model in self.xgb_models
+            ])
             
-            elif model_name == 'lgb':
-                # LightGBM specific adjustments
-                if condition == 'afternoon':
-                    model.set_params(
-                        num_leaves=min(model.get_params()['num_leaves'] + 4, 127),
-                        min_child_samples=max(model.get_params()['min_child_samples'] - 2, 5))
+            predictions_lower = np.column_stack([
+                model.predict(X) for model in self.xgb_models_lower
+            ])
             
-            elif model_name == 'cat':
-                # CatBoost specific adjustments
-                if condition == 'clear_sky':
-                    model.set_params(
-                        depth=min(model.get_params()['depth'] + 1, 10),
-                        min_data_in_leaf=max(model.get_params()['min_data_in_leaf'] - 1, 1))
+            predictions_upper = np.column_stack([
+                model.predict(X) for model in self.xgb_models_upper
+            ])
+            
+            # Get solar parameters using Sin_Solar_Elevation
+            solar_elevation_idx = self.feature_columns.index('Sin_Solar_Elevation')
+            sin_solar_elevation = X[:, solar_elevation_idx]
+            # Convert from sin to actual angle
+            solar_elevation = np.arcsin(np.clip(sin_solar_elevation, -1, 1)) * 180 / np.pi
+            
+            # Calculate theoretical clear sky GHI with improved atmospheric model
+            clear_sky_ghi = self.SOLAR_CONSTANT * np.sin(np.radians(solar_elevation))
+            
+            # Apply physical constraints with horizon-dependent adjustments
+            predictions_median = self.target_scaler.inverse_transform(predictions)
+            predictions_lower = self.target_scaler.inverse_transform(predictions_lower)
+            predictions_upper = self.target_scaler.inverse_transform(predictions_upper)
+            
+            for i in range(self.FORECAST_HOURS):
+                # Wider bounds for longer horizons
+                horizon_factor = 1 + (i * 0.1)  # 10% increase per hour
+                
+                # Adjust upper bounds based on clear sky
+                max_bound = clear_sky_ghi[:, np.newaxis] * horizon_factor
+                predictions_upper[:, i] = np.minimum(predictions_upper[:, i], max_bound[:, 0])
+                
+                # Ensure lower bound doesn't exceed median
+                predictions_lower[:, i] = np.minimum(predictions_lower[:, i], predictions_median[:, i])
+                
+                # Adjust interval width based on solar elevation
+                interval_width = predictions_upper[:, i] - predictions_lower[:, i]
+                elevation_factor = np.clip(solar_elevation / 45.0, 0.5, 2.0)  # Scale based on elevation
+                predictions_upper[:, i] = predictions_median[:, i] + (interval_width * elevation_factor * 0.5)
+                predictions_lower[:, i] = predictions_median[:, i] - (interval_width * elevation_factor * 0.5)
+            
+            # Set night values to 0 with smooth transition
+            night_mask = solar_elevation <= -5
+            transition_mask = (solar_elevation > -5) & (solar_elevation <= 0)
+            
+            # Smooth transition for night periods
+            transition_factor = np.zeros_like(solar_elevation)
+            transition_factor[transition_mask] = (solar_elevation[transition_mask] + 5) / 5
+            
+            for i in range(predictions_median.shape[1]):
+                predictions_median[night_mask, i] = 0
+                predictions_lower[night_mask, i] = 0
+                predictions_upper[night_mask, i] = 0
+                
+                # Apply smooth transition
+                predictions_median[transition_mask, i] *= transition_factor[transition_mask]
+                predictions_lower[transition_mask, i] *= transition_factor[transition_mask]
+                predictions_upper[transition_mask, i] *= transition_factor[transition_mask]
+            
+            return predictions_median, predictions_lower, predictions_upper
+            
+        except Exception as e:
+            print(f"Error in predict_xgboost: {str(e)}")
+            raise
 
-    def calculate_detailed_metrics(self, ensemble, X_val, y_val):
-        """Calculate detailed performance metrics"""
-        logging.info("Calculating detailed metrics...")
+    def evaluate_model(self, X_data, y_data):
+        """Evaluate XGBoost models with enhanced validation metrics"""
+        print("\nEvaluating XGBoost models (55-minute averages):")
         
-        # Get predictions
-        y_pred = ensemble.predict(X_val)
+        all_metrics = []
         
-        # Initialize metrics dictionary
-        metrics = {
-            'Seasonal Performance': {},
-            'Weather Condition Performance': {},
-            'Time of Day Performance': {},
-            'Overall Performance': {}
-        }
-        
-        # Get time components using validation indices
-        time_index = self.original_index[self.val_idx]
-        hour = pd.DatetimeIndex(time_index).hour
-        month = pd.DatetimeIndex(time_index).month
-        
-        # Convert y_val and y_pred to numpy arrays for calculations
-        y_val_np = y_val.to_numpy()
-        y_pred_np = np.array(y_pred)
-        
-        # Seasonal analysis
-        seasons = {
-            'Dry_period': [1, 2, 3, 4],
-            'Transitional': [5, 6],
-            'Wet_period': [7, 8, 9, 10, 11, 12]
-        }
-        
-        for season, months in seasons.items():
-            mask = np.isin(month, months)
-            errors = np.abs(y_val_np[mask] - y_pred_np[mask])
-            if len(errors) > 0:
-                metrics['Seasonal Performance'][season] = {
-                    'Mean Error': float(np.mean(errors)),
-                    'Std Dev': float(np.std(errors)),
-                    'Median Error': float(np.median(errors)),
-                    '90th Percentile': float(np.percentile(errors, 90))
-                }
-        
-        # Weather condition analysis
-        X_val_np = X_val.to_numpy()
-        cloud_opacity = X_val['cloud_opacity'].to_numpy()
-        
-        weather_conditions = {
-            'Clear_sky': cloud_opacity < 0.2,
-            'Partly_cloudy': (cloud_opacity >= 0.2) & (cloud_opacity < 0.8),
-            'Overcast': cloud_opacity >= 0.8
-        }
-        
-        for condition, mask in weather_conditions.items():
-            errors = np.abs(y_val_np[mask] - y_pred_np[mask])
-            if len(errors) > 0:
-                metrics['Weather Condition Performance'][condition] = {
-                    'Mean Error': float(np.mean(errors)),
-                    'Std Dev': float(np.std(errors)),
-                    'Median Error': float(np.median(errors)),
-                    '90th Percentile': float(np.percentile(errors, 90))
-                }
-        
-        # Time of day analysis
-        time_periods = {
-            'Morning': (hour >= 6) & (hour < 12),
-            'Afternoon': (hour >= 12) & (hour < 18),
-            'Evening': (hour >= 18) | (hour < 6)
-        }
-        
-        for period, mask in time_periods.items():
-            errors = np.abs(y_val_np[mask] - y_pred_np[mask])
-            if len(errors) > 0:
-                metrics['Time of Day Performance'][period] = {
-                    'Mean Error': float(np.mean(errors)),
-                    'Std Dev': float(np.std(errors)),
-                    'Median Error': float(np.median(errors)),
-                    '90th Percentile': float(np.percentile(errors, 90))
-                }
-        
-        # Overall performance
-        overall_errors = np.abs(y_val_np - y_pred_np)
-        metrics['Overall Performance'] = {
-            'Overall': {  # Added nested dictionary for consistency
-                'Mean Error': float(np.mean(overall_errors)),
-                'Std Dev': float(np.std(overall_errors)),
-                'Median Error': float(np.median(overall_errors)),
-                '90th Percentile': float(np.percentile(overall_errors, 90))
-            }
-        }
-        
-        # Save metrics to file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        metrics_file = f'metrics_{timestamp}.txt'
-        
-        with open(metrics_file, 'w') as f:
-            f.write("=== Detailed Performance Metrics ===\n\n")
+        for i in range(self.FORECAST_HOURS):
+            print(f"\nEvaluating {i+1}-hour ahead predictions")
+            print(f"(XX:05 to (XX+1):00 averages)")
             
-            for category, subcategories in metrics.items():
-                f.write(f"{category}:\n\n")
-                for subcategory, metrics_dict in subcategories.items():
-                    f.write(f"{subcategory}:\n")
-                    for metric_name, metric_value in metrics_dict.items():
-                        f.write(f"  {metric_name}: {metric_value:.2f}\n")
-                    f.write("\n")
-        
-        logging.info(f"Detailed metrics saved to {metrics_file}")
-        return metrics
-
-def display_menu():
-    """Display the main menu options"""
-    print("\n=== GHI Prediction System ===")
-    print("1. Train New Model")
-    print("2. Continue Previous Training")
-    print("3. Predict Next Hour")
-    print("4. Exit")
-    return input("\nSelect an option (1-4): ")
-
-def continue_training(predictor, model_dir):
-    """Continue training from a previously saved model"""
-    try:
-        print(f"Loading model from {model_dir}...")
-        
-        # Initialize parameters first
-        predictor.initialize_convergence_params()  # Add this line
-        predictor.initialize_model_params()        # Add this line
-        
-        # Load essential components only
-        ensemble_path = os.path.join(model_dir, 'ensemble.pkl')
-        if not os.path.exists(ensemble_path):
-            print(f"Error: Ensemble model not found at {ensemble_path}")
-            return
+            # Get corresponding data for this horizon
+            X = X_data[i]
+            y_true = y_data[i]
             
-        scaler_path = os.path.join(model_dir, 'scaler.pkl')
-        if not os.path.exists(scaler_path):
-            print(f"Error: Scaler not found at {scaler_path}")
-            return
+            # Make predictions with all models
+            y_pred = self.xgb_models[i].predict(X)
+            y_pred_lower = self.xgb_models_lower[i].predict(X)
+            y_pred_upper = self.xgb_models_upper[i].predict(X)
             
-        metrics_path = os.path.join(model_dir, 'metrics.json')
-        if not os.path.exists(metrics_path):
-            print(f"Error: Metrics not found at {metrics_path}")
-            return
-
-        # Load the components
-        with open(ensemble_path, 'rb') as f:
-            predictor.best_model = pickle.load(f)
-        with open(scaler_path, 'rb') as f:
-            predictor.scaler = pickle.load(f)
-        with open(metrics_path, 'r') as f:
-            metrics = json.load(f)
-        
-        # Extract iteration number from directory name
-        iter_num = int(model_dir.split('iter_')[-1])
-        predictor.current_iteration = iter_num  # Add this line
-        
-        print(f"Successfully loaded model from iteration {iter_num}")
-        print("Continuing training...")
-        
-        # Load and preprocess data
-        df, feature_columns = predictor.load_and_preprocess_data()
-        
-        # Store data and features
-        predictor.data = df
-        predictor.feature_columns = feature_columns
-        predictor.target_column = 'next_ghi'
-        
-        # Prepare features and target
-        X = predictor.data[predictor.feature_columns]
-        y = predictor.data[predictor.target_column]
-        
-        # Store original index
-        predictor.original_index = X.index
-        
-        # Scale features using loaded scaler
-        X_scaled = pd.DataFrame(
-            predictor.scaler.transform(X),
-            columns=X.columns
-        )
-        
-        # Split data - 70-30 split
-        train_idx, val_idx = train_test_split(
-            np.arange(len(X_scaled)), 
-            test_size=0.3,
-            random_state=42
-        )
-        
-        # Split using indices
-        X_train = X_scaled.iloc[train_idx]
-        X_val = X_scaled.iloc[val_idx]
-        y_train = y.iloc[train_idx]
-        y_val = y.iloc[val_idx]
-        
-        # Store validation indices
-        predictor.val_idx = val_idx
-        
-        # Continue training from the last iteration
-        iteration = iter_num + 1
-        max_iterations = 100
-        best_error = float('inf')
-        
-        while iteration < max_iterations:
-            logging.info(f"\nContinuing from Iteration {iteration}/{max_iterations}")
+            # Inverse transform predictions and true values
+            y_true = self.target_scaler.inverse_transform(y_true.reshape(-1, 1)).reshape(-1)
+            y_pred = self.target_scaler.inverse_transform(y_pred.reshape(-1, 1)).reshape(-1)
+            y_pred_lower = self.target_scaler.inverse_transform(y_pred_lower.reshape(-1, 1)).reshape(-1)
+            y_pred_upper = self.target_scaler.inverse_transform(y_pred_upper.reshape(-1, 1)).reshape(-1)
             
-            # Initialize sample weights
-            w_train = np.ones(len(y_train))
+            # Calculate standard metrics
+            metrics = self.calculate_metrics(y_true, y_pred)
             
-            # Train models
-            models = predictor.train_weighted_models(X_train, y_train, w_train, iteration)
+            # Add interval metrics
+            metrics['interval_coverage'] = np.mean((y_true >= y_pred_lower) & (y_true <= y_pred_upper))
+            metrics['avg_interval_width'] = np.mean(y_pred_upper - y_pred_lower)
             
-            # Create ensemble
-            ensemble = predictor.create_weighted_ensemble(models, X_val, y_val)
-            
-            # Calculate metrics
-            metrics = predictor.calculate_detailed_metrics(ensemble, X_val, y_val)
-            
-            # Log metrics
-            predictor.log_detailed_metrics(metrics)
-            
-            # Check if this is the best performance
-            current_error = metrics['Overall Performance']['Overall']['Mean Error']
-            if current_error < best_error:
-                best_error = current_error
-                predictor.save_best_models(models, ensemble, metrics, iteration)
-                logging.info(f"New best performance! Mean Error: {current_error:.2f}")
-            
-            # Update current iteration
-            predictor.current_iteration = iteration  # Add this line
-            
-            # Analyze and adjust models
-            models, ensemble = predictor.analyze_and_adjust_model(metrics, models, ensemble)
-            
-            # Update learning strategy
-            predictor.update_learning_strategy(metrics)
-            
-            # Check convergence
-            if predictor.check_convergence_criteria(metrics):
-                logging.info("Convergence criteria met. Stopping training.")
-                break
-            
-            iteration += 1
-            
-        print("\nContinued training completed!")
-        
-    except Exception as e:
-        print(f"Error continuing training: {str(e)}")
-        print("Debug: Full error traceback:")
-        import traceback
-        traceback.print_exc()
-
-def predict_next_hour(predictor, data_path, model_dir=None):
-    """Predict GHI for the next hour"""
-    try:
-        # Get model directory from user if not provided
-        if model_dir is None:
-            model_dir = input("Enter the trained model directory name: ")
-            
-        if os.path.exists(model_dir):
-            # Load ensemble model
-            ensemble_path = os.path.join(model_dir, 'ensemble.pkl')
-            if os.path.exists(ensemble_path):
-                with open(ensemble_path, 'rb') as f:
-                    ensemble = pickle.load(f)
-                predictor.best_model = ensemble
+            # High GHI cases (> 300 W/m²)
+            high_mask = y_true > 300
+            if np.any(high_mask):
+                metrics['high_ghi_rmse'] = np.sqrt(mean_squared_error(y_true[high_mask], y_pred[high_mask]))
+                high_coverage = (y_true[high_mask] >= y_pred_lower[high_mask]) & (y_true[high_mask] <= y_pred_upper[high_mask])
+                metrics['high_ghi_coverage'] = np.mean(high_coverage)
             else:
-                print(f"Error: Ensemble model not found at {ensemble_path}")
+                metrics['high_ghi_rmse'] = np.nan
+                metrics['high_ghi_coverage'] = np.nan
+            
+            # Low GHI cases (< 10 W/m²)
+            low_mask = y_true < 10
+            if np.any(low_mask):
+                metrics['low_ghi_rmse'] = np.sqrt(mean_squared_error(y_true[low_mask], y_pred[low_mask]))
+                low_coverage = (y_true[low_mask] >= y_pred_lower[low_mask]) & (y_true[low_mask] <= y_pred_upper[low_mask])
+                metrics['low_ghi_coverage'] = np.mean(low_coverage)
+            else:
+                metrics['low_ghi_rmse'] = np.nan
+                metrics['low_ghi_coverage'] = np.nan
+            
+            # Rapid change metrics
+            changes = np.abs(np.diff(y_true))
+            rapid_change_mask = np.zeros_like(y_true, dtype=bool)
+            rapid_change_mask[1:] = changes > 50  # Define rapid change as >50 W/m² between consecutive measurements
+            
+            if np.any(rapid_change_mask):
+                metrics['rapid_change_rmse'] = np.sqrt(mean_squared_error(
+                    y_true[rapid_change_mask],
+                    y_pred[rapid_change_mask]
+                ))
+                rapid_coverage = (y_true[rapid_change_mask] >= y_pred_lower[rapid_change_mask]) & (y_true[rapid_change_mask] <= y_pred_upper[rapid_change_mask])
+                metrics['rapid_change_coverage'] = np.mean(rapid_coverage)
+            else:
+                metrics['rapid_change_rmse'] = np.nan
+                metrics['rapid_change_coverage'] = np.nan
+            
+            # Transition period metrics (sunrise/sunset)
+            transition_mask = (y_true > 0) & (y_true < 50)
+            if np.any(transition_mask):
+                metrics['transition_rmse'] = np.sqrt(mean_squared_error(
+                    y_true[transition_mask],
+                    y_pred[transition_mask]
+                ))
+                transition_coverage = (y_true[transition_mask] >= y_pred_lower[transition_mask]) & (y_true[transition_mask] <= y_pred_upper[transition_mask])
+                metrics['transition_coverage'] = np.mean(transition_coverage)
+            else:
+                metrics['transition_rmse'] = np.nan
+                metrics['transition_coverage'] = np.nan
+            
+            all_metrics.append(metrics)
+            
+            print(f"\nPerformance for the next {i+1}-hour prediction:")
+            self.print_metrics(metrics)
+            print(f"Interval Coverage: {metrics['interval_coverage']*100:.2f}%")
+            print(f"Average Interval Width: {metrics['avg_interval_width']:.2f} W/m²")
+            
+            # Print extreme case metrics
+            print("\nExtreme Case Performance:")
+            print(f"High GHI (>300 W/m²) RMSE: {metrics['high_ghi_rmse']:.2f} W/m²")
+            print(f"High GHI Coverage: {metrics['high_ghi_coverage']*100:.2f}%")
+            print(f"Low GHI (<10 W/m²) RMSE: {metrics['low_ghi_rmse']:.2f} W/m²")
+            print(f"Low GHI Coverage: {metrics['low_ghi_coverage']*100:.2f}%")
+            print(f"Rapid Change RMSE: {metrics['rapid_change_rmse']:.2f} W/m²")
+            print(f"Rapid Change Coverage: {metrics['rapid_change_coverage']*100:.2f}%")
+            print(f"Transition Period RMSE: {metrics['transition_rmse']:.2f} W/m²")
+            print(f"Transition Period Coverage: {metrics['transition_coverage']*100:.2f}%")
+        
+        return all_metrics
+
+    def calculate_metrics(self, y_true, y_pred):
+        """Calculate all evaluation metrics"""
+        try:
+            # Basic metrics
+            r2 = r2_score(y_true, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+            mae = mean_absolute_error(y_true, y_pred)
+            mbe = np.mean(y_pred - y_true)
+            nse = 1 - np.sum((y_pred - y_true) ** 2) / np.sum((y_true - np.mean(y_true)) ** 2)
+            
+            # Calculate MAPE for daytime values only
+            day_mask = y_true > 0
+            y_true_day = y_true[day_mask]
+            y_pred_day = y_pred[day_mask]
+            
+            if len(y_true_day) > 0:
+                mape = np.mean(np.abs((y_true_day - y_pred_day) / y_true_day)) * 100
+                # Weighted MAPE
+                weights = y_true_day / np.mean(y_true_day)
+                wmape = np.average(np.abs((y_true_day - y_pred_day) / y_true_day), weights=weights) * 100
+            else:
+                mape = np.nan
+                wmape = np.nan
+            
+            return {
+                'r2': r2,
+                'rmse': rmse,
+                'mae': mae,
+                'mape': mape,
+                'wmape': wmape,
+                'mbe': mbe,
+                'nse': nse
+            }
+            
+        except Exception as e:
+            print(f"Error calculating metrics: {str(e)}")
+            return None
+
+    def print_metrics(self, metrics):
+        """Print formatted metrics"""
+        if metrics is None:
+            print("No metrics available")
+            return
+        
+        print("Primary Metrics:")
+        print(f"  R² Score: {metrics['r2']:.4f}")
+        print(f"  RMSE: {metrics['rmse']:.2f} W/m²")
+        print(f"  MAE: {metrics['mae']:.2f} W/m²")
+        print("\nPercentage Errors:")
+        print(f"  MAPE (daytime only): {metrics['mape']:.2f}%")
+        print(f"  Weighted MAPE: {metrics['wmape']:.2f}%")
+        print("\nBias Metrics:")
+        print(f"  Mean Bias Error: {metrics['mbe']:.2f} W/m²")
+        print(f"  Nash-Sutcliffe Efficiency: {metrics['nse']:.4f}")
+
+    def get_user_input(self, timestamp):
+        """Get input values from user"""
+        # Get the time period from the timestamp
+        end_time = timestamp.replace(minute=0) + timedelta(hours=1)
+        print(f"\nEnter values for {timestamp.strftime('%H:%M')} - {end_time.strftime('%H:%M')}:")
+        print("(55-minute averages)")
+        
+        input_values = {}
+        prompts = {
+            'Temp - Â°C': 'Average Temperature (°C): ',
+            'Hum - %': 'Average Humidity (%): ',
+            'Dew Point - Â°C': 'Average Dew Point (°C): ',
+            'Wet Bulb - Â°C': 'Average Wet Bulb (°C): ',
+            'Avg Wind Speed - km/h': 'Average Wind Speed (km/h): ',
+            'Wind Run - km': 'Wind Run (km): ',
+            'UV Index': 'Average UV Index: ',
+            'Barometer - hPa': 'Average Barometric Pressure (hPa): ',
+            'GHI - W/m^2': 'Average GHI (W/m^2): '
+        }
+        
+        for key, prompt in prompts.items():
+            while True:
+                try:
+                    value = float(input(prompt))
+                    input_values[key] = value
+                    break
+                except ValueError:
+                    print("Please enter a valid number.")
+        
+        return input_values
+
+    def get_last_timestamp(self):
+        """Get the last timestamp and next start time from the dataset"""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        dataset_path = os.path.join(script_dir, 'dataset.csv')
+        df = pd.read_csv(dataset_path)
+        
+        # Get the last row
+        last_row = df.iloc[-1]
+        
+        # Parse the last timestamp with flexible format
+        last_date = last_row['Date']
+        last_end = last_row['End_period']
+        last_timestamp = pd.to_datetime(f"{last_date} {last_end}", format='mixed')
+        
+        # Calculate next start time (5 minutes after the hour)
+        next_start = last_timestamp + timedelta(minutes=5)
+        
+        return next_start
+
+    def prepare_prediction_data(self, input_values):
+        """Prepare input data for prediction"""
+        try:
+            # Get next start time from dataset
+            next_start = self.get_last_timestamp()
+            next_end = next_start.replace(minute=0) + timedelta(hours=1)
+            
+            # Create a DataFrame with the input values
+            df = pd.DataFrame([input_values])
+            
+            # Add date and time information
+            df['Date'] = next_start.strftime('%Y-%m-%d')
+            df['Start_period'] = next_start.strftime('%H:%M')  # Will be XX:05
+            df['End_period'] = next_end.strftime('%H:%M')  # Will be (XX+1):00
+            
+            # Add solar parameters for the middle of the averaging period
+            # Use XX:32 (middle of XX:05 to XX+1:00) for solar calculations
+            calculation_time = next_start + timedelta(minutes=27)
+            df['Day of Year'] = calculation_time.timetuple().tm_yday
+            df['Hour of Day'] = calculation_time.hour + calculation_time.minute/60
+            
+            # Calculate solar parameters
+            df = self.compute_solar_parameters(df)
+            
+            # Add Clear_Sky_GHI_Adjusted
+            df['Air_Mass'] = 1 / (df['Sin_Solar_Elevation'].clip(0.001, 1))
+            df['Air_Mass'] = df['Air_Mass'].clip(1, 38)
+            
+            # Temperature-adjusted atmospheric attenuation
+            temp_factor = (df['Temp - Â°C'] + 273.15) / 298.15  # Normalize to 25°C
+            humidity_factor = 1 + (df['Hum - %'] / 100) * 0.1  # Humidity effect
+            df['Atmospheric_Attenuation'] = (0.7 ** (df['Air_Mass'] * humidity_factor)) * temp_factor
+            df['Clear_Sky_GHI_Adjusted'] = df['Clear_Sky_GHI'] * df['Atmospheric_Attenuation']
+            
+            # Ensure all required features are present
+            for feature in self.feature_columns:
+                if feature not in df.columns:
+                    print(f"Warning: Missing feature {feature}, setting to 0")
+                    df[feature] = 0
+            
+            # Extract features in correct order
+            X = df[self.feature_columns].values
+            
+            # Scale features
+            X_scaled = self.features_scaler.transform(X)
+            
+            return X_scaled
+            
+        except Exception as e:
+            print(f"Error in prepare_prediction_data: {str(e)}")
+            print("DataFrame columns:", df.columns.tolist())
+            print("Required features:", self.feature_columns)
+            raise
+
+    def make_prediction_from_input(self):
+        """Enhanced prediction with better feature handling and interval predictions"""
+        try:
+            # Check if models are trained
+            if not self.xgb_models:
+                print("Error: Models not trained. Please train the models first (Option 1).")
                 return
             
-            # Load scaler
-            scaler_path = os.path.join(model_dir, 'scaler.pkl')
-            if os.path.exists(scaler_path):
-                with open(scaler_path, 'rb') as f:
-                    predictor.scaler = pickle.load(f)
-                scaler_features = predictor.scaler.feature_names_in_
+            # Get input data
+            new_row = self.get_input_data()
+            
+            # Create DataFrame with input
+            df_pred = pd.DataFrame([new_row])
+            
+            # Apply same feature engineering as training
+            df_pred['datetime'] = pd.to_datetime(df_pred['Date'] + ' ' + df_pred['Start_period'])
+            df_pred.set_index('datetime', inplace=True)
+            
+            # Add time features
+            df_pred['Hour_Sin'] = np.sin(2 * np.pi * df_pred['Hour of Day'] / 24)
+            df_pred['Hour_Cos'] = np.cos(2 * np.pi * df_pred['Hour of Day'] / 24)
+            df_pred['Day_Sin'] = np.sin(2 * np.pi * df_pred['Day of Year'] / 365)
+            df_pred['Day_Cos'] = np.cos(2 * np.pi * df_pred['Day of Year'] / 365)
+            
+            # Solar position features
+            solar_angles = df_pred.apply(self.compute_solar_angles, axis=1)
+            df_pred['Solar Zenith Angle'] = solar_angles['Solar Zenith Angle']
+            df_pred['Solar Elevation Angle'] = solar_angles['Solar Elevation Angle']
+            df_pred['Cos_Hour_Angle'] = np.cos(np.radians(15 * (df_pred['Hour of Day'] - 12)))
+            df_pred['Sin_Solar_Elevation'] = np.sin(np.radians(df_pred['Solar Elevation Angle']))
+            df_pred['Clear_Sky_GHI'] = self.SOLAR_CONSTANT * df_pred['Sin_Solar_Elevation']
+            
+            # Add Clear_Sky_GHI_Adjusted calculation
+            df_pred['Air_Mass'] = 1 / (df_pred['Sin_Solar_Elevation'].clip(0.001, 1))
+            df_pred['Air_Mass'] = df_pred['Air_Mass'].clip(1, 38)
+            
+            # Temperature-adjusted atmospheric attenuation
+            temp_factor = (df_pred['Temp - Â°C'] + 273.15) / 298.15  # Normalize to 25°C
+            humidity_factor = 1 + (df_pred['Hum - %'] / 100) * 0.1  # Humidity effect
+            df_pred['Atmospheric_Attenuation'] = (0.7 ** (df_pred['Air_Mass'] * humidity_factor)) * temp_factor
+            df_pred['Clear_Sky_GHI_Adjusted'] = df_pred['Clear_Sky_GHI'] * df_pred['Atmospheric_Attenuation']
+            
+            # Weather interaction features
+            df_pred['GHI_Clear_Sky_Ratio'] = np.where(
+                df_pred['Clear_Sky_GHI'] > 0,
+                df_pred['GHI - W/m^2'] / df_pred['Clear_Sky_GHI'],
+                0
+            )
+            df_pred['GHI_Clear_Sky_Ratio'] = df_pred['GHI_Clear_Sky_Ratio'].clip(0, 1.2)
+            
+            # Weather condition indicators
+            df_pred['Is_Clear'] = (df_pred['GHI_Clear_Sky_Ratio'] > 0.8).astype(int)
+            df_pred['Is_Mostly_Clear'] = ((df_pred['GHI_Clear_Sky_Ratio'] > 0.6) & 
+                                        (df_pred['GHI_Clear_Sky_Ratio'] <= 0.8)).astype(int)
+            df_pred['Is_Partly_Cloudy'] = ((df_pred['GHI_Clear_Sky_Ratio'] > 0.4) & 
+                                         (df_pred['GHI_Clear_Sky_Ratio'] <= 0.6)).astype(int)
+            df_pred['Is_Mostly_Cloudy'] = ((df_pred['GHI_Clear_Sky_Ratio'] > 0.2) & 
+                                         (df_pred['GHI_Clear_Sky_Ratio'] <= 0.4)).astype(int)
+            df_pred['Is_Overcast'] = (df_pred['GHI_Clear_Sky_Ratio'] <= 0.2).astype(int)
+            
+            # Transition period detection
+            df_pred['Is_Transition'] = (
+                (df_pred['Solar Elevation Angle'] > -5) & 
+                (df_pred['Solar Elevation Angle'] < 15)
+            ).astype(int)
+            
+            # Change and variability features
+            if hasattr(self, 'historical_values'):
+                hist_ghi = pd.concat([self.historical_values['GHI - W/m^2'], df_pred['GHI - W/m^2']])
+                df_pred['GHI_Change'] = hist_ghi.diff().iloc[-1]
+                df_pred['Recent_Variability'] = hist_ghi.tail(5).std()
+                df_pred['Recent_Trend'] = hist_ghi.tail(5).diff().mean()
+                df_pred['Is_Rapid_Change'] = (abs(df_pred['GHI_Change'] / df_pred['Clear_Sky_GHI_Adjusted'].clip(1, None)) > 0.1).astype(int)
+                
+                # Add volatility features
+                for window in [3, 6, 12]:
+                    df_pred[f'GHI_Volatility_{window}h'] = (
+                        hist_ghi.tail(window).diff().std() / 
+                        df_pred['Clear_Sky_GHI_Adjusted'].clip(1, None)
+                    ).iloc[0]
             else:
-                print(f"Error: Scaler not found at {scaler_path}")
-                return
-        else:
-            print(f"Error: Model directory {model_dir} not found!")
-            return
+                # Default values if no historical data
+                df_pred['GHI_Change'] = 0
+                df_pred['Recent_Variability'] = 0
+                df_pred['Recent_Trend'] = 0
+                df_pred['Is_Rapid_Change'] = 0
+                for window in [3, 6, 12]:
+                    df_pred[f'GHI_Volatility_{window}h'] = 0
+            
+            # Add Clear_Sky_Humidity_Interaction
+            df_pred['Clear_Sky_Humidity_Interaction'] = df_pred['Clear_Sky_GHI_Adjusted'] * humidity_factor
+            
+            # Add GHI rate of change features
+            if hasattr(self, 'historical_values'):
+                hist_ghi = pd.concat([self.historical_values['GHI - W/m^2'], df_pred['GHI - W/m^2']])
+                df_pred['GHI_Change_Rate'] = hist_ghi.diff().iloc[-1] / pd.Timedelta('1H').total_seconds()
+                df_pred['GHI_Acceleration'] = hist_ghi.diff().diff().iloc[-1] / pd.Timedelta('1H').total_seconds()
+                
+                # Add exponential moving averages
+                for window in [3, 6, 12]:
+                    df_pred[f'GHI_EMA_{window}h'] = hist_ghi.ewm(span=window*2, adjust=False, min_periods=1).mean().iloc[-1]
+                    
+                    hist_ratio = pd.concat([self.historical_values['GHI_Clear_Sky_Ratio'], df_pred['GHI_Clear_Sky_Ratio']])
+                    df_pred[f'GHI_Ratio_EMA_{window}h'] = hist_ratio.ewm(span=window*2, adjust=False, min_periods=1).mean().iloc[-1]
+                
+                # Add lag features
+                for lag in [1, 2, 3]:
+                    df_pred[f'GHI_{lag}h_lag'] = self.historical_values['GHI - W/m^2'].iloc[-lag]
+                    df_pred[f'Clear_Sky_Ratio_{lag}h_lag'] = self.historical_values['GHI_Clear_Sky_Ratio'].iloc[-lag]
+                    df_pred[f'Clear_Sky_GHI_{lag}h_lag'] = self.historical_values['Clear_Sky_GHI_Adjusted'].iloc[-lag]
+            else:
+                # Default values if no historical data
+                df_pred['GHI_Change_Rate'] = 0
+                df_pred['GHI_Acceleration'] = 0
+                
+                for window in [3, 6, 12]:
+                    df_pred[f'GHI_EMA_{window}h'] = df_pred['GHI - W/m^2']
+                    df_pred[f'GHI_Ratio_EMA_{window}h'] = df_pred['GHI_Clear_Sky_Ratio']
+                
+                for lag in [1, 2, 3]:
+                    df_pred[f'GHI_{lag}h_lag'] = df_pred['GHI - W/m^2']
+                    df_pred[f'Clear_Sky_Ratio_{lag}h_lag'] = df_pred['GHI_Clear_Sky_Ratio']
+                    df_pred[f'Clear_Sky_GHI_{lag}h_lag'] = df_pred['Clear_Sky_GHI_Adjusted']
+            
+            # Add interaction features
+            df_pred['GHI_UV_Interaction'] = df_pred['GHI - W/m^2'] * df_pred['UV Index']
+            df_pred['Temp_Humidity_Interaction'] = df_pred['Temp - Â°C'] * df_pred['Hum - %']
+            df_pred['GHI_Temp_Interaction'] = df_pred['GHI - W/m^2'] * df_pred['Temp - Â°C']
+            df_pred['GHI_Wind_Interaction'] = df_pred['GHI - W/m^2'] * np.log1p(df_pred['Avg Wind Speed - km/h'])
+            
+            # Ensure all required features are present
+            missing_features = [col for col in self.feature_columns if col not in df_pred.columns]
+            if missing_features:
+                print("Warning: Missing features:", missing_features)
+                for feature in missing_features:
+                    df_pred[feature] = 0  # Add missing features with default values
+            
+            # Get features in correct order
+            X_pred = df_pred[self.feature_columns].values
+            
+            # Scale features
+            X_pred_scaled = self.features_scaler.transform(X_pred)
+            
+            # Make predictions with intervals
+            predictions_median, predictions_lower, predictions_upper = self.predict_xgboost(X_pred_scaled)
+            
+            # Print predictions for all 4 hours with intervals
+            print("\nPredicted GHI values with confidence intervals:")
+            for hour in range(self.FORECAST_HOURS):
+                print(f"\nHour {hour+1}:")
+                print(f"Upper bound (75th percentile): {predictions_upper[0][hour]:.2f} W/m²")
+                print(f"Expected (median): {predictions_median[0][hour]:.2f} W/m²")
+                print(f"Lower bound (25th percentile): {predictions_lower[0][hour]:.2f} W/m²")
+            
+            # Save input data and predictions to CSV
+            self.save_to_csv(new_row, predictions_median)
+            
+            return predictions_median, predictions_lower, predictions_upper
+            
+        except Exception as e:
+            print(f"Error in prediction: {str(e)}")
+            print("Available columns:", df_pred.columns.tolist())
+            print("Required features:", self.feature_columns)
+            raise
 
-        # Load the data
-        df = pd.read_csv(data_path)
-        df['period_end'] = pd.to_datetime(df['period_end'])
+    def save_to_csv(self, input_data, predictions):
+        """Save only input data to CSV file with proper time handling"""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            csv_path = os.path.join(script_dir, 'dataset.csv')
+            
+            # Read existing CSV
+            df = pd.read_csv(csv_path)
+            
+            # Determine the date format from existing data
+            sample_date = df['Date'].iloc[0]
+            date_format = '%Y-%m-%d' if '-' in sample_date else '%m/%d/%Y'
+            
+            # Convert input date to match the format in CSV
+            input_date = datetime.strptime(input_data['Date'], '%Y-%m-%d')
+            formatted_date = input_date.strftime(date_format)
+            
+            # Create new row with input data using the correct date format
+            new_row = {
+                'Date': formatted_date,
+                'Start_period': input_data['Start_period'],
+                'End_period': input_data['End_period'],
+                'Barometer - hPa': input_data['Barometer - hPa'],
+                'Temp - Â°C': input_data['Temp - Â°C'],
+                'Hum - %': input_data['Hum - %'],
+                'Dew Point - Â°C': input_data['Dew Point - Â°C'],
+                'Wet Bulb - Â°C': input_data['Wet Bulb - Â°C'],
+                'Avg Wind Speed - km/h': input_data['Avg Wind Speed - km/h'],
+                'Wind Run - km': input_data['Wind Run - km'],
+                'UV Index': input_data['UV Index'],
+                'GHI - W/m^2': input_data['GHI - W/m^2'],
+                'Solar Zenith Angle': input_data['Solar Zenith Angle'],
+                'Solar Elevation Angle': input_data['Solar Elevation Angle'],
+                'Clearness Index': input_data['Clearness Index'],
+                'Hour of Day': input_data['Hour of Day'],
+                'Day of Year': input_data['Day of Year']
+            }
+            
+            # Create DataFrame from new row
+            new_df = pd.DataFrame([new_row])
+            
+            # Append new row to existing DataFrame
+            df = pd.concat([df, new_df], ignore_index=True)
+            
+            # Sort by date and time
+            # Convert dates to datetime for sorting, handling both formats
+            def parse_date(date_str, time_str):
+                try:
+                    if '-' in date_str:
+                        return pd.to_datetime(f"{date_str} {time_str}", format='%Y-%m-%d %H:%M')
+                    else:
+                        return pd.to_datetime(f"{date_str} {time_str}", format='%m/%d/%Y %H:%M')
+                except:
+                    return pd.to_datetime(f"{date_str} {time_str}")
+            
+            df['datetime'] = df.apply(lambda x: parse_date(x['Date'], x['Start_period']), axis=1)
+            df = df.sort_values('datetime')
+            df = df.drop('datetime', axis=1)
+            
+            # Save back to CSV
+            df.to_csv(csv_path, index=False)
+            print(f"\nSaved input data to {csv_path}")
+            
+        except Exception as e:
+            print(f"Error saving to CSV: {str(e)}")
+            raise
+
+    def custom_metric(self, y_true, y_pred):
+        """Custom evaluation metric focusing on daytime predictions"""
+        # Only consider daytime values (where true GHI > 0)
+        day_mask = y_true > 0
         
-        # Get the last row of data
-        last_data = df.iloc[-1:].copy()
+        if not any(day_mask):
+            return 0
         
-        # Engineer features before setting the index
-        last_data = predictor.engineer_features(last_data)
+        y_true_day = y_true[day_mask]
+        y_pred_day = y_pred[day_mask]
         
-        # Set the index after feature engineering
-        last_data.set_index('period_end', inplace=True)
+        # Calculate weighted RMSE giving more importance to higher GHI values
+        weights = y_true_day / np.mean(y_true_day)
+        weighted_mse = np.average((y_true_day - y_pred_day) ** 2, weights=weights)
         
-        # Create all required features using the datetime index
-        last_data['day_of_year'] = last_data.index.dayofyear
-        last_data['is_dry_period'] = last_data.index.month.isin([1, 2, 3, 4]).astype(int)
-        last_data['is_transitional'] = last_data.index.month.isin([5, 6]).astype(int)
-        last_data['is_wet_period'] = last_data.index.month.isin([7, 8, 9, 10, 11, 12]).astype(int)
-        last_data['monsoon_influence'] = last_data.index.month.isin([6, 7, 8, 9, 10, 11]).astype(int)
-        last_data['cyclone_season'] = last_data.index.month.isin([10, 11, 12]).astype(int)
-        last_data['morning_convection'] = last_data.index.hour.isin([9, 10, 11]).astype(int)
-        last_data['afternoon_convection'] = last_data.index.hour.isin([14, 15, 16, 17]).astype(int)
-        last_data['solar_elevation'] = predictor.calculate_solar_elevation(last_data.index, 7.0711, 125.6134)
-        last_data['day_length'] = predictor.calculate_day_length(last_data.index, 7.0711)
-        last_data['absolute_humidity'] = predictor.calculate_absolute_humidity(
-            last_data['air_temp'], 
-            last_data['relative_humidity']
+        return np.sqrt(weighted_mse)
+
+    def prepare_data_for_training(self, df):
+        """Enhanced data preparation with better feature engineering"""
+        try:
+            df_clean = df.copy()
+            
+            # Basic preprocessing (keep existing)
+            df_clean['datetime'] = pd.to_datetime(df_clean['Date'] + ' ' + df_clean['Start_period'])
+            df_clean.set_index('datetime', inplace=True)
+            df_clean = df_clean.sort_index()
+            
+            # Enhanced time features (keep existing)
+            df_clean['Hour_Sin'] = np.sin(2 * np.pi * df_clean['Hour of Day'] / 24)
+            df_clean['Hour_Cos'] = np.cos(2 * np.pi * df_clean['Hour of Day'] / 24)
+            df_clean['Day_Sin'] = np.sin(2 * np.pi * df_clean['Day of Year'] / 365)
+            df_clean['Day_Cos'] = np.cos(2 * np.pi * df_clean['Day of Year'] / 365)
+            
+            # IMPROVED: Better solar position features
+            df_clean['Cos_Hour_Angle'] = np.cos(np.radians(15 * (df_clean['Hour of Day'] - 12)))
+            df_clean['Sin_Solar_Elevation'] = np.sin(np.radians(df_clean['Solar Elevation Angle']))
+            df_clean['Clear_Sky_GHI'] = self.SOLAR_CONSTANT * df_clean['Sin_Solar_Elevation']
+            
+            # IMPROVED: Enhanced atmospheric model with humidity and temperature effects
+            df_clean['Air_Mass'] = 1 / (df_clean['Sin_Solar_Elevation'].clip(0.001, 1))
+            df_clean['Air_Mass'] = df_clean['Air_Mass'].clip(1, 38)
+            
+            # New temperature-adjusted atmospheric attenuation
+            temp_factor = (df_clean['Temp - Â°C'] + 273.15) / 298.15  # Normalize to 25°C
+            humidity_factor = 1 + (df_clean['Hum - %'] / 100) * 0.1  # Humidity effect
+            df_clean['Atmospheric_Attenuation'] = (0.7 ** (df_clean['Air_Mass'] * humidity_factor)) * temp_factor
+            df_clean['Clear_Sky_GHI_Adjusted'] = df_clean['Clear_Sky_GHI'] * df_clean['Atmospheric_Attenuation']
+            
+            # IMPROVED: Better rapid change detection
+            df_clean['GHI_Change'] = df_clean['GHI - W/m^2'].diff()
+            df_clean['GHI_Change_Rate'] = df_clean['GHI_Change'] / df_clean['Clear_Sky_GHI_Adjusted'].clip(1, None)
+            df_clean['GHI_Acceleration'] = df_clean['GHI_Change'].diff()
+            
+            # Normalized change rates
+            df_clean['Normalized_Change'] = df_clean['GHI_Change'] / df_clean['Clear_Sky_GHI'].clip(1, None)
+            df_clean['Is_Rapid_Change'] = (abs(df_clean['Normalized_Change']) > 0.1).astype(int)
+            
+            # IMPROVED: Enhanced transition period detection
+            df_clean['Is_Transition'] = (
+                ((df_clean['Solar Elevation Angle'] > -5) & (df_clean['Solar Elevation Angle'] < 15)) |  # Wider range
+                ((df_clean['GHI - W/m^2'] > 0) & (df_clean['GHI - W/m^2'] < 100))  # Higher threshold
+            ).astype(int)
+            
+            # IMPROVED: More sophisticated weather condition detection
+            df_clean['GHI_Clear_Sky_Ratio'] = np.where(
+                df_clean['Clear_Sky_GHI_Adjusted'] > 10,
+                df_clean['GHI - W/m^2'] / df_clean['Clear_Sky_GHI_Adjusted'],
+                0
+            )
+            df_clean['GHI_Clear_Sky_Ratio'] = df_clean['GHI_Clear_Sky_Ratio'].clip(0, 1.2)
+            
+            # Dynamic thresholds based on solar elevation
+            base_clear = 0.85
+            elevation_factor = (90 - df_clean['Solar Elevation Angle']) / 90
+            clear_threshold = base_clear - 0.1 * elevation_factor
+            
+            df_clean['Is_Clear'] = (df_clean['GHI_Clear_Sky_Ratio'] > clear_threshold).astype(int)
+            df_clean['Is_Mostly_Clear'] = ((df_clean['GHI_Clear_Sky_Ratio'] > clear_threshold*0.8) & 
+                                         (df_clean['GHI_Clear_Sky_Ratio'] <= clear_threshold)).astype(int)
+            df_clean['Is_Partly_Cloudy'] = ((df_clean['GHI_Clear_Sky_Ratio'] > 0.5) & 
+                                          (df_clean['GHI_Clear_Sky_Ratio'] <= clear_threshold*0.8)).astype(int)
+            df_clean['Is_Mostly_Cloudy'] = ((df_clean['GHI_Clear_Sky_Ratio'] > 0.2) & 
+                                          (df_clean['GHI_Clear_Sky_Ratio'] <= 0.5)).astype(int)
+            df_clean['Is_Overcast'] = (df_clean['GHI_Clear_Sky_Ratio'] <= 0.2).astype(int)
+            
+            # IMPROVED: Enhanced temporal features with better smoothing
+            df_clean['Recent_Variability'] = df_clean['GHI_Change'].rolling(window=5, center=True).std()
+            df_clean['Recent_Trend'] = df_clean['GHI_Change'].rolling(window=5, center=True).mean()
+            
+            # IMPROVED: Better handling of rolling statistics
+            for window in [3, 6, 12]:
+                # Centered rolling statistics for better accuracy
+                df_clean[f'GHI_{window}h_mean'] = df_clean['GHI - W/m^2'].rolling(
+                    window=window, center=True, min_periods=1
+                ).mean()
+                df_clean[f'GHI_{window}h_std'] = df_clean['GHI - W/m^2'].rolling(
+                    window=window, center=True, min_periods=1
+                ).std()
+                
+                # Exponential moving averages with adjusted spans
+                span = window * 2  # Longer span for better smoothing
+                df_clean[f'GHI_EMA_{window}h'] = df_clean['GHI - W/m^2'].ewm(
+                    span=span, adjust=False, min_periods=1
+                ).mean()
+                df_clean[f'GHI_Ratio_EMA_{window}h'] = df_clean['GHI_Clear_Sky_Ratio'].ewm(
+                    span=span, adjust=False, min_periods=1
+                ).mean()
+                
+                # Volatility with normalization
+                df_clean[f'GHI_Volatility_{window}h'] = (
+                    df_clean['GHI_Change'].rolling(window=window, min_periods=1).std() /
+                    df_clean['Clear_Sky_GHI_Adjusted'].clip(1, None)
+                )
+            
+            # IMPROVED: Enhanced lag features
+            for lag in [1, 2, 3]:
+                df_clean[f'GHI_{lag}h_lag'] = df_clean['GHI - W/m^2'].shift(lag)
+                df_clean[f'GHI_Change_{lag}h'] = df_clean['GHI - W/m^2'].diff(lag)
+                df_clean[f'Clear_Sky_Ratio_{lag}h_lag'] = df_clean['GHI_Clear_Sky_Ratio'].shift(lag)
+                df_clean[f'Clear_Sky_GHI_{lag}h_lag'] = df_clean['Clear_Sky_GHI_Adjusted'].shift(lag)
+                
+                # Add normalized lag changes
+                df_clean[f'Normalized_Change_{lag}h'] = (
+                    df_clean[f'GHI_Change_{lag}h'] / 
+                    df_clean['Clear_Sky_GHI_Adjusted'].clip(1, None)
+                )
+            
+            # IMPROVED: Enhanced weather interaction features
+            df_clean['GHI_UV_Interaction'] = df_clean['GHI - W/m^2'] * df_clean['UV Index']
+            df_clean['Temp_Humidity_Interaction'] = df_clean['Temp - Â°C'] * df_clean['Hum - %']
+            df_clean['GHI_Temp_Interaction'] = df_clean['GHI - W/m^2'] * df_clean['Temp - Â°C']
+            df_clean['GHI_Wind_Interaction'] = df_clean['GHI - W/m^2'] * np.log1p(df_clean['Avg Wind Speed - km/h'])
+            
+            # Handle missing values (keep existing sophisticated approach)
+            df_clean = self._handle_missing_values(df_clean)
+            
+            # Store historical values
+            self.historical_values = df_clean.tail(24)[
+                ['GHI - W/m^2', 'GHI_Clear_Sky_Ratio', 'Clear_Sky_GHI_Adjusted', 'Is_Rapid_Change']
+            ].copy()
+            
+            # Update feature columns
+            self._update_feature_columns(df_clean)
+            
+            # Prepare features and target
+            X = df_clean[self.feature_columns].values
+            y = df_clean['GHI - W/m^2'].values
+            
+            # Scale features and target
+            X_scaled = self.features_scaler.fit_transform(X)
+            y_scaled = self.target_scaler.fit_transform(y.reshape(-1, 1))
+            
+            return X_scaled, y_scaled, df_clean
+            
+        except Exception as e:
+            print(f"Error in prepare_data_for_training: {str(e)}")
+            print("DataFrame columns:", df_clean.columns.tolist())
+            raise
+    
+    def _handle_missing_values(self, df):
+        """Enhanced missing value handling"""
+        # First pass: Interpolate within same weather conditions
+        for condition in ['Is_Clear', 'Is_Mostly_Clear', 'Is_Partly_Cloudy', 'Is_Mostly_Cloudy', 'Is_Overcast']:
+            mask = df[condition] == 1
+            df.loc[mask] = df.loc[mask].interpolate(method='time', limit=2)
+        
+        # Second pass: Fill remaining gaps
+        for col in df.columns:
+            if df[col].isnull().any():
+                # Short gaps: Linear interpolation
+                df[col] = df[col].interpolate(method='linear', limit=2)
+                
+                # Medium gaps: Polynomial interpolation
+                if df[col].isnull().any():
+                    df[col] = df[col].interpolate(method='polynomial', order=2, limit=4)
+                
+                # Long gaps: Forward fill then backward fill
+                if df[col].isnull().any():
+                    df[col] = df[col].fillna(method='ffill').fillna(method='bfill')
+        
+        return df
+    
+    def _update_feature_columns(self, df):
+        """Update feature columns list with new features"""
+        base_features = [
+            'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos',
+            'Cos_Hour_Angle', 'Sin_Solar_Elevation',
+            'Clear_Sky_GHI', 'Clear_Sky_GHI_Adjusted',
+            'GHI_Clear_Sky_Ratio', 'Air_Mass', 'Atmospheric_Attenuation'
+        ]
+        
+        condition_features = [
+            'Is_Clear', 'Is_Mostly_Clear', 'Is_Partly_Cloudy',
+            'Is_Mostly_Cloudy', 'Is_Overcast', 'Is_Transition',
+            'Is_Rapid_Change'
+        ]
+        
+        change_features = [
+            'GHI_Change', 'GHI_Change_Rate', 'GHI_Acceleration',
+            'Recent_Variability', 'Recent_Trend'
+        ]
+        
+        self.feature_columns = (
+            base_features +
+            condition_features +
+            change_features +
+            [col for col in df.columns if any(
+                pattern in col for pattern in [
+                    'GHI_Variability_', 'GHI_Volatility_',
+                    '_persistence', 'EMA_', '_lag', '_Interaction'
+                ]
+            )]
         )
-        last_data['convection_potential'] = (
-            (last_data['air_temp'] > last_data['air_temp'].mean()) & 
-            (last_data['relative_humidity'] > 75)
-        ).astype(int)
-        last_data['mountain_effect'] = (
-            (last_data.index.hour.isin([14, 15, 16, 17])) & 
-            (last_data['wind_direction_10m'].between(45, 135))
-        ).astype(int)
-        
-        # Use the same features that the scaler was trained with
-        predictor.selected_features = scaler_features.tolist()
-        input_features = last_data[predictor.selected_features]
-        
-        # Scale features and make prediction
-        input_features_scaled = predictor.scaler.transform(input_features)
-        prediction = predictor.best_model.predict(input_features_scaled)
-        
-        # Get the timestamp for the prediction
-        last_timestamp = last_data.index[-1]
-        prediction_timestamp = last_timestamp + pd.Timedelta(hours=1)
-        
-        print("\n=== GHI Prediction Results ===")
-        print(f"Current Time: {last_timestamp}")
-        print(f"Prediction Time: {prediction_timestamp}")
-        print(f"Predicted GHI: {prediction[0]:.2f}")
-        
-    except Exception as e:
-        print(f"Error making prediction: {str(e)}")
-        import traceback
-        traceback.print_exc()
 
-def main():
-    data_path = 'raw.csv'
-    predictor = GHIPredictionSystem(data_path, target_error=0.05)
-    
-    print("Debug: GHI Prediction System initialized")
-    
-    while True:
-        choice = display_menu()
-        
-        if choice == '1':
-            print("\nTraining new model... This may take a while.")
-            predictor.train_and_optimize()
-            print("\nModel training completed!")
+    def get_input_data(self):
+        """Get input data from user with validation"""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            csv_path = os.path.join(script_dir, 'dataset.csv')
             
-        elif choice == '2':
-            print("\nEnter the directory name of the trained model to continue (e.g., best_models_20241215_023813_iter_19):")
-            model_dir = input().strip()
-            if os.path.exists(model_dir):
-                continue_training(predictor, model_dir)
-            else:
-                print(f"Error: Directory {model_dir} not found!")
+            # Read existing CSV and get last timestamp
+            df = pd.read_csv(csv_path)
             
-        elif choice == '3':
-            print("\nPredicting next hour GHI...")
-            model_dir = input("Enter the trained model directory name: ").strip()
-            predict_next_hour(predictor, data_path, model_dir)
+            # Handle different date formats
+            try:
+                df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['End_period'])
+            except:
+                df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['End_period'], format='%m/%d/%Y %H:%M')
             
-        elif choice == '4':
-            print("\nExiting program...")
-            break
+            # Get the last end time
+            last_end_time = df['datetime'].max()
             
-        else:
-            print("\nInvalid option. Please try again.")
+            # Set the next period (XX:05 to (XX+1):00)
+            next_start = last_end_time.replace(minute=5)  # Start at XX:05
+            next_end = (next_start + timedelta(hours=1)).replace(minute=0)  # End at (XX+1):00
+            
+            print(f"\nEntering weather data for period:")
+            print(f"From: {next_start.strftime('%Y-%m-%d %H:%M')}")
+            print(f"To: {next_end.strftime('%Y-%m-%d %H:%M')}")
+            
+            # Get current time
+            input_data = {
+                'Date': next_start.strftime('%Y-%m-%d'),
+                'Start_period': next_start.strftime('%H:%M'),
+                'End_period': next_end.strftime('%H:%M'),
+                'Hour of Day': next_start.hour + next_start.minute/60,
+                'Day of Year': next_start.timetuple().tm_yday
+            }
+            
+            print("\nEnter weather data:")
+            input_data.update({
+                'Barometer - hPa': float(input("Barometer (hPa): ")),
+                'Temp - Â°C': float(input("Temperature (°C): ")),
+                'Hum - %': float(input("Humidity (%): ")),
+                'Dew Point - Â°C': float(input("Dew Point (°C): ")),
+                'Wet Bulb - Â°C': float(input("Wet Bulb (°C): ")),
+                'Avg Wind Speed - km/h': float(input("Average Wind Speed (km/h): ")),
+                'Wind Run - km': float(input("Wind Run (km): ")),
+                'UV Index': float(input("UV Index: ")),
+                'GHI - W/m^2': float(input("Current GHI (W/m^2): "))
+            })
+            
+            # Calculate solar parameters
+            solar_angles = self.compute_solar_angles(pd.Series(input_data))
+            input_data['Solar Zenith Angle'] = solar_angles['Solar Zenith Angle']
+            input_data['Solar Elevation Angle'] = solar_angles['Solar Elevation Angle']
+            
+            # Calculate clearness index using the new method
+            input_data['Clearness Index'] = self.compute_clearness_index(
+                input_data['GHI - W/m^2'],
+                input_data['Solar Zenith Angle']
+            )
+            
+            # If clearness index is NaN, set it to 0
+            if np.isnan(input_data['Clearness Index']):
+                input_data['Clearness Index'] = 0
+            
+            print("\nComputed parameters:")
+            print(f"Solar Zenith Angle: {input_data['Solar Zenith Angle']:.2f}°")
+            print(f"Solar Elevation Angle: {input_data['Solar Elevation Angle']:.2f}°")
+            print(f"Clearness Index: {input_data['Clearness Index']:.4f}")
+            
+            return input_data
+            
+        except ValueError as e:
+            print(f"Invalid input: {str(e)}")
+            raise
+        except Exception as e:
+            print(f"Error in get_input_data: {str(e)}")
+            raise
+
+    def save_models(self):
+        """Save trained models and scalers in the same directory as dataset.csv"""
+        try:
+            # Get script directory (where dataset.csv is located)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # Save XGBoost models (median and intervals)
+            for i, (model, model_lower, model_upper) in enumerate(zip(self.xgb_models, self.xgb_models_lower, self.xgb_models_upper)):
+                model_path = os.path.join(script_dir, f'xgboost_model_hour_{i+1}.json')
+                model_lower_path = os.path.join(script_dir, f'xgboost_model_lower_hour_{i+1}.json')
+                model_upper_path = os.path.join(script_dir, f'xgboost_model_upper_hour_{i+1}.json')
+                
+                model.save_model(model_path)
+                model_lower.save_model(model_lower_path)
+                model_upper.save_model(model_upper_path)
+                print(f"Saved models for hour {i+1}")
+            
+            # Save scalers
+            scaler_paths = {
+                'features_scaler': os.path.join(script_dir, 'features_scaler.joblib'),
+                'target_scaler': os.path.join(script_dir, 'target_scaler.joblib')
+            }
+            
+            joblib.dump(self.features_scaler, scaler_paths['features_scaler'])
+            joblib.dump(self.target_scaler, scaler_paths['target_scaler'])
+            print(f"Saved scalers to {script_dir}")
+            
+            # Save feature columns
+            feature_path = os.path.join(script_dir, 'feature_columns.json')
+            with open(feature_path, 'w') as f:
+                json.dump(self.feature_columns, f)
+            print(f"Saved feature columns to {feature_path}")
+            
+            print("\nAll models and associated files saved successfully!")
+            
+        except Exception as e:
+            print(f"Error saving models: {str(e)}")
+            raise
+
+    def load_models(self):
+        """Load trained models and scalers from the same directory as dataset.csv"""
+        try:
+            # Get script directory (where dataset.csv is located)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # Load XGBoost models (median and intervals)
+            self.xgb_models = []
+            self.xgb_models_lower = []
+            self.xgb_models_upper = []
+            
+            for i in range(self.FORECAST_HOURS):
+                model_path = os.path.join(script_dir, f'xgboost_model_hour_{i+1}.json')
+                model_lower_path = os.path.join(script_dir, f'xgboost_model_lower_hour_{i+1}.json')
+                model_upper_path = os.path.join(script_dir, f'xgboost_model_upper_hour_{i+1}.json')
+                
+                if not all(os.path.exists(p) for p in [model_path, model_lower_path, model_upper_path]):
+                    raise FileNotFoundError(f"Model files for hour {i+1} not found")
+                
+                model = xgb.XGBRegressor()
+                model_lower = xgb.XGBRegressor()
+                model_upper = xgb.XGBRegressor()
+                
+                model.load_model(model_path)
+                model_lower.load_model(model_lower_path)
+                model_upper.load_model(model_upper_path)
+                
+                self.xgb_models.append(model)
+                self.xgb_models_lower.append(model_lower)
+                self.xgb_models_upper.append(model_upper)
+                print(f"Loaded models for hour {i+1}")
+            
+            # Load scalers
+            scaler_paths = {
+                'features_scaler': os.path.join(script_dir, 'features_scaler.joblib'),
+                'target_scaler': os.path.join(script_dir, 'target_scaler.joblib')
+            }
+            
+            for name, path in scaler_paths.items():
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"Scaler file '{path}' not found")
+            
+            self.features_scaler = joblib.load(scaler_paths['features_scaler'])
+            self.target_scaler = joblib.load(scaler_paths['target_scaler'])
+            print(f"Loaded scalers from {script_dir}")
+            
+            # Load feature columns
+            feature_path = os.path.join(script_dir, 'feature_columns.json')
+            if not os.path.exists(feature_path):
+                raise FileNotFoundError(f"Feature columns file '{feature_path}' not found")
+            
+            with open(feature_path, 'r') as f:
+                self.feature_columns = json.load(f)
+            print(f"Loaded feature columns from {feature_path}")
+            
+            print("\nAll models and associated files loaded successfully!")
+            
+        except Exception as e:
+            print(f"Error loading models: {str(e)}")
+            raise
+
+    def compute_solar_angles(self, row):
+        """Compute solar angles for a given row of data"""
+        try:
+            # Calculate declination
+            declination = np.radians(23.45 * np.sin(np.radians(360/365 * (row['Day of Year'] + 284))))
+            
+            # Calculate hour angle
+            hour_angle = np.radians(15 * (row['Hour of Day'] - 12))
+            
+            # Convert latitude to radians
+            latitude_rad = np.radians(self.lat)
+            
+            # Compute solar elevation angle
+            solar_elevation_angle = np.arcsin(
+                np.sin(latitude_rad) * np.sin(declination) +
+                np.cos(latitude_rad) * np.cos(declination) * np.cos(hour_angle)
+            )
+            
+            # Compute solar zenith angle
+            solar_zenith_angle = np.pi/2 - solar_elevation_angle
+            
+            return pd.Series({
+                'Solar Zenith Angle': np.degrees(solar_zenith_angle),
+                'Solar Elevation Angle': np.degrees(solar_elevation_angle)
+            })
+            
+        except Exception as e:
+            print(f"Error in compute_solar_angles: {str(e)}")
+            raise
+
+    def compute_clearness_index(self, ghi, solar_zenith_angle):
+        """Compute clearness index using the provided formula"""
+        try:
+            # If solar zenith angle is >= 90° or NaN, return NaN
+            if solar_zenith_angle >= 90 or np.isnan(solar_zenith_angle):
+                return np.nan
+            
+            # If GHI > solar constant or GHI < 0 or GHI is NaN, return NaN
+            if ghi > self.SOLAR_CONSTANT or ghi < 0 or np.isnan(ghi):
+                return np.nan
+            
+            # Calculate clearness index directly using solar constant
+            clearness_index = ghi / self.SOLAR_CONSTANT
+            
+            return clearness_index
+            
+        except Exception as e:
+            print(f"Error in compute_clearness_index: {str(e)}")
+            return np.nan
 
 if __name__ == "__main__":
-    main()
+    try:
+        predictor = WeatherPredictor()
+        
+        while True:
+            print("\nGHI Forecast System")
+            print("1. Train Model")
+            print("2. Make Prediction")
+            print("3. Exit")
+            
+            choice = input("\nEnter your choice (1-3): ")
+            
+            try:
+                if choice == '1':
+                    # Get script directory
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    dataset_path = os.path.join(script_dir, 'dataset.csv')
+                    
+                    # Load and prepare data
+                    X_scaled, y_scaled, df = predictor.load_and_prepare_data(dataset_path)
+                    
+                    # Prepare data for XGBoost with proper splits
+                    X_train, y_train_split, X_val, y_val_split, X_test, y_test_split = predictor.prepare_xgboost_data(X_scaled, y_scaled)
+                    
+                    # Train model with validation data
+                    print("\nTraining XGBoost models...")
+                    predictor.train_xgboost(X_train, y_train_split, X_val, y_val_split)
+                    
+                    # Save models and associated files
+                    print("\nSaving trained models...")
+                    predictor.save_models()
+                    
+                    # Evaluate model on test set
+                    print("\nEvaluating on test set:")
+                    test_results = predictor.evaluate_model(X_test, y_test_split)
+                    
+                elif choice == '2':
+                    try:
+                        print("\nLoading trained models...")
+                        script_dir = os.path.dirname(os.path.abspath(__file__))
+                        
+                        # Check if all required model files exist
+                        required_files = []
+                        for i in range(predictor.FORECAST_HOURS):
+                            required_files.extend([
+                                f'xgboost_model_hour_{i+1}.json',
+                                f'xgboost_model_lower_hour_{i+1}.json',
+                                f'xgboost_model_upper_hour_{i+1}.json'
+                            ])
+                        required_files.extend(['features_scaler.joblib', 'target_scaler.joblib', 'feature_columns.json'])
+                        
+                        missing_files = [f for f in required_files if not os.path.exists(os.path.join(script_dir, f))]
+                        if missing_files:
+                            print("\nError: Some model files are missing:")
+                            for f in missing_files:
+                                print(f"  - {f}")
+                            print("\nPlease train the models first (Option 1).")
+                            continue
+                        
+                        predictor.load_models()
+                        print("\nMaking predictions...")
+                        predictions = predictor.make_prediction_from_input()
+                        
+                        if predictions:
+                            predictions_median, predictions_lower, predictions_upper = predictions
+                            print("\nSummary of Predictions:")
+                            print("=" * 60)
+                            for hour in range(predictor.FORECAST_HOURS):
+                                print(f"\nHour {hour+1} Forecast:")
+                                print("-" * 40)
+                                print(f"Upper bound (75th percentile): {predictions_upper[0][hour]:.2f} W/m²")
+                                print(f"Expected (median):          {predictions_median[0][hour]:.2f} W/m²")
+                                print(f"Lower bound (25th percentile): {predictions_lower[0][hour]:.2f} W/m²")
+                            print("\nNote: A prediction is considered excellent if the actual value")
+                            print("falls within the interval between worst and best case scenarios.")
+                            print("=" * 60)
+                            
+                    except FileNotFoundError as e:
+                        print(f"\nError: {str(e)}")
+                        print("Please train the models first (Option 1).")
+                    except Exception as e:
+                        print(f"\nError during prediction: {str(e)}")
+                        traceback.print_exc()
+                        
+                elif choice == '3':
+                    print("\nExiting program...")
+                    break
+                else:
+                    print("\nInvalid choice. Please try again.")
+            except Exception as e:
+                print(f"\nAn error occurred: {str(e)}")
+                print("Please try again.")
+                
+    except Exception as e:
+        print(f"\nError occurred: {str(e)}")
+        print("\nFull error traceback:")
+        traceback.print_exc()
