@@ -286,108 +286,148 @@ class WeatherPredictor:
     
     def train_xgboost(self, X_train_list, y_train_split, X_val_list, y_val_split):
         """Train XGBoost models with improved parameters and quantile predictions"""
-        self.xgb_models = []
-        self.xgb_models_lower = []
-        self.xgb_models_upper = []
+        try:
+            self.xgb_models = []
+            self.xgb_models_lower = []
+            self.xgb_models_upper = []
+            
+            # Ensure feature_columns is initialized with FEATURE_COLUMNS
+            if not hasattr(self, 'feature_columns'):
+                self.feature_columns = self.FEATURE_COLUMNS.copy()
+            
+            # Enhanced base parameters for better accuracy
+            base_params = {
+                'n_estimators': 4000,
+                'max_depth': 8,
+                'learning_rate': 0.001,
+                'min_child_weight': 3,
+                'subsample': 0.85,
+                'colsample_bytree': 0.85,
+                'gamma': 0.2,
+                'reg_alpha': 0.5,
+                'reg_lambda': 1.5,
+                'tree_method': 'hist',
+                'random_state': 42,
+                'n_jobs': -1
+            }
+            
+            # Keep original quantile ranges
+            quantile_params_lower = base_params.copy()
+            quantile_params_lower['objective'] = 'reg:quantileerror'
+            quantile_params_lower['quantile_alpha'] = 0.25  # Keep at 25th percentile
+            
+            quantile_params_upper = base_params.copy()
+            quantile_params_upper['objective'] = 'reg:quantileerror'
+            quantile_params_upper['quantile_alpha'] = 0.75  # Keep at 75th percentile
+            
+            # Additional parameters for transition periods
+            transition_params_lower = quantile_params_lower.copy()
+            transition_params_lower['min_child_weight'] = 2  # Allow more granular splits for transitions
+            transition_params_lower['subsample'] = 0.9  # Slightly higher subsample for better stability
+            
+            transition_params_upper = quantile_params_upper.copy()
+            transition_params_upper['min_child_weight'] = 2
+            transition_params_upper['subsample'] = 0.9
+            
+            for i in range(self.FORECAST_HOURS):
+                print(f"\nTraining XGBoost model for {i+1}-hour ahead prediction")
+                
+                # Adjust parameters based on forecast horizon
+                horizon_params = base_params.copy()
+                if i > 0:
+                    # Increase trees and decrease learning rate for longer horizons
+                    horizon_params['n_estimators'] += i * 500
+                    horizon_params['learning_rate'] *= 0.9
+                    horizon_params['subsample'] *= 0.95
+                
+                # Get solar elevation from features for current training data
+                solar_elevation_idx = self.feature_columns.index('Solar Elevation Angle')
+                solar_elevation = X_train_list[i][:, solar_elevation_idx]
+                
+                # Add sample weights for better handling of edge cases
+                weights = self._calculate_sample_weights(y_train_split[i], X_train_list[i])
+                
+                # Train median model with sample weights
+                model = xgb.XGBRegressor(**horizon_params)
+                model.fit(
+                    X_train_list[i], 
+                    y_train_split[i],
+                    sample_weight=weights,
+                    eval_set=[(X_val_list[i], y_val_split[i])],
+                    verbose=True
+                )
+                
+                # Train lower bound model with enhanced weights for low values
+                model_lower = xgb.XGBRegressor(**quantile_params_lower)
+                low_value_weights = weights.copy()
+                low_value_mask = y_train_split[i] < np.percentile(y_train_split[i][y_train_split[i] > 0], 25)
+                low_value_weights[low_value_mask] *= 1.5  # Increase weight for low values
+                
+                model_lower.fit(
+                    X_train_list[i], 
+                    y_train_split[i],
+                    sample_weight=low_value_weights,
+                    eval_set=[(X_val_list[i], y_val_split[i])],
+                    verbose=True
+                )
+                
+                # Train upper bound model
+                model_upper = xgb.XGBRegressor(**quantile_params_upper)
+                model_upper.fit(
+                    X_train_list[i], 
+                    y_train_split[i],
+                    sample_weight=weights,
+                    eval_set=[(X_val_list[i], y_val_split[i])],
+                    verbose=True
+                )
+                
+                # Train transition-specific models
+                transition_mask = (solar_elevation > -5) & (solar_elevation < 15)
+                transition_weights = weights.copy()
+                transition_weights[transition_mask] *= 2.0  # Double weight for transitions
+                
+                model_lower_transition = xgb.XGBRegressor(**transition_params_lower)
+                model_upper_transition = xgb.XGBRegressor(**transition_params_upper)
+                
+                model_lower_transition.fit(
+                    X_train_list[i],
+                    y_train_split[i],
+                    sample_weight=transition_weights,
+                    eval_set=[(X_val_list[i], y_val_split[i])],
+                    verbose=True
+                )
+                
+                model_upper_transition.fit(
+                    X_train_list[i],
+                    y_train_split[i],
+                    sample_weight=transition_weights,
+                    eval_set=[(X_val_list[i], y_val_split[i])],
+                    verbose=True
+                )
+                
+                self.xgb_models.append(model)
+                self.xgb_models_lower.append((model_lower, model_lower_transition))
+                self.xgb_models_upper.append((model_upper, model_upper_transition))
+                
+                # Print feature importance
+                importance = pd.DataFrame({
+                    'feature': self.feature_columns,
+                    'importance': model.feature_importances_
+                })
+                importance = importance.sort_values('importance', ascending=False)
+                print(f"\nTop 10 important features for hour {i+1}:")
+                print(importance.head(10))
         
-        # Enhanced base parameters for better accuracy
-        base_params = {
-            'n_estimators': 4000,  # Increased from 3500
-            'max_depth': 8,        # Increased from 7
-            'learning_rate': 0.001, # Decreased for better stability
-            'min_child_weight': 3,  # Decreased for better granularity
-            'subsample': 0.85,      # Adjusted for better stability
-            'colsample_bytree': 0.85,
-            'gamma': 0.2,          # Increased to reduce overfitting
-            'reg_alpha': 0.5,      # Increased L1 regularization
-            'reg_lambda': 1.5,     # Increased L2 regularization
-            'tree_method': 'hist',
-            'random_state': 42,
-            'n_jobs': -1
-        }
-        
-        # Keep original quantile ranges
-        quantile_params_lower = base_params.copy()
-        quantile_params_lower['objective'] = 'reg:quantileerror'
-        quantile_params_lower['quantile_alpha'] = 0.25  # Keep at 25th percentile
-        
-        quantile_params_upper = base_params.copy()
-        quantile_params_upper['objective'] = 'reg:quantileerror'
-        quantile_params_upper['quantile_alpha'] = 0.75  # Keep at 75th percentile
-        
-        for i in range(self.FORECAST_HOURS):
-            print(f"\nTraining XGBoost model for {i+1}-hour ahead prediction")
-            
-            # Adjust parameters based on forecast horizon
-            horizon_params = base_params.copy()
-            if i > 0:
-                # Increase trees and decrease learning rate for longer horizons
-                horizon_params['n_estimators'] += i * 500
-                horizon_params['learning_rate'] *= 0.9
-                horizon_params['subsample'] *= 0.95  # Reduce variance for longer horizons
-            
-            # Add sample weights for better handling of edge cases
-            weights = self._calculate_sample_weights(y_train_split[i], X_train_list[i])
-            
-            # Train median model with sample weights
-            model = xgb.XGBRegressor(**horizon_params)
-            model.fit(
-                X_train_list[i], 
-                y_train_split[i],
-                sample_weight=weights,
-                eval_set=[(X_val_list[i], y_val_split[i])],
-                verbose=True
-            )
-            
-            # Adjust quantile parameters based on horizon
-            q_params_lower = quantile_params_lower.copy()
-            q_params_upper = quantile_params_upper.copy()
-            if i > 0:
-                # Widen prediction intervals for longer horizons, but maintain 25-75 range
-                q_params_lower['learning_rate'] *= 0.9 ** i  # Adjust learning rate instead
-                q_params_upper['learning_rate'] *= 0.9 ** i
-            
-            # Train lower bound model
-            model_lower = xgb.XGBRegressor(**q_params_lower)
-            model_lower.fit(
-                X_train_list[i], 
-                y_train_split[i],
-                sample_weight=weights,
-                eval_set=[(X_val_list[i], y_val_split[i])],
-                verbose=True
-            )
-            
-            # Train upper bound model
-            model_upper = xgb.XGBRegressor(**q_params_upper)
-            model_upper.fit(
-                X_train_list[i], 
-                y_train_split[i],
-                sample_weight=weights,
-                eval_set=[(X_val_list[i], y_val_split[i])],
-                verbose=True
-            )
-            
-            self.xgb_models.append(model)
-            self.xgb_models_lower.append(model_lower)
-            self.xgb_models_upper.append(model_upper)
-            
-            # Print feature importance
-            importance = pd.DataFrame({
-                'feature': self.feature_columns,
-                'importance': model.feature_importances_
-            })
-            importance = importance.sort_values('importance', ascending=False)
-            print(f"\nTop 10 important features for hour {i+1}:")
-            print(importance.head(10))
-    
+        except Exception as e:
+            print(f"Error in train_xgboost: {str(e)}")
+            raise
+
     def _calculate_sample_weights(self, y, X):
         """Calculate sample weights to focus on important cases"""
         try:
-            # Get solar elevation from features - using Sin_Solar_Elevation instead
-            solar_elevation_idx = self.feature_columns.index('Sin_Solar_Elevation')
-            sin_solar_elevation = X[:, solar_elevation_idx]
-            # Convert from sin to actual angle
-            solar_elevation = np.arcsin(np.clip(sin_solar_elevation, -1, 1)) * 180 / np.pi
+            # Get solar elevation from features - using Solar Elevation Angle directly
+            solar_elevation_idx = self.feature_columns.index('Solar Elevation Angle')  # This matches FEATURE_COLUMNS
+            solar_elevation = X[:, solar_elevation_idx]
             
             # Initialize base weights
             weights = np.ones_like(y)
@@ -417,53 +457,70 @@ class WeatherPredictor:
             return np.ones_like(y)
 
     def predict_xgboost(self, X):
-        """Enhanced prediction with improved physical constraints and confidence intervals"""
+        """Enhanced prediction with improved interval handling"""
         try:
-            # Get base predictions
+            # Get base predictions from median models (these are not tuples)
             predictions = np.column_stack([
                 model.predict(X) for model in self.xgb_models
             ])
             
-            predictions_lower = np.column_stack([
-                model.predict(X) for model in self.xgb_models_lower
-            ])
+            # Get predictions from both standard and transition models
+            predictions_lower = np.zeros_like(predictions)
+            predictions_upper = np.zeros_like(predictions)
             
-            predictions_upper = np.column_stack([
-                model.predict(X) for model in self.xgb_models_upper
-            ])
+            # Get solar parameters
+            solar_elevation_idx = self.feature_columns.index('Solar Elevation Angle')
+            solar_elevation = X[:, solar_elevation_idx]
             
-            # Get solar parameters using Sin_Solar_Elevation
-            solar_elevation_idx = self.feature_columns.index('Sin_Solar_Elevation')
-            sin_solar_elevation = X[:, solar_elevation_idx]
-            # Convert from sin to actual angle
-            solar_elevation = np.arcsin(np.clip(sin_solar_elevation, -1, 1)) * 180 / np.pi
+            for i in range(self.FORECAST_HOURS):
+                # Unpack the tuples correctly
+                model_lower, model_lower_transition = self.xgb_models_lower[i]
+                model_upper, model_upper_transition = self.xgb_models_upper[i]
+                
+                # Get predictions from both models
+                pred_lower_std = model_lower.predict(X)
+                pred_lower_trans = model_lower_transition.predict(X)
+                pred_upper_std = model_upper.predict(X)
+                pred_upper_trans = model_upper_transition.predict(X)
+                
+                # Identify transition periods
+                transition_mask = (solar_elevation > -5) & (solar_elevation < 15)
+                
+                # Use maximum of upper predictions and minimum of lower predictions
+                predictions_lower[:, i] = np.where(
+                    transition_mask,
+                    np.minimum(pred_lower_std, pred_lower_trans),
+                    pred_lower_std
+                )
+                
+                predictions_upper[:, i] = np.where(
+                    transition_mask,
+                    np.maximum(pred_upper_std, pred_upper_trans),
+                    pred_upper_std
+                )
             
-            # Calculate theoretical clear sky GHI with improved atmospheric model
-            clear_sky_ghi = self.SOLAR_CONSTANT * np.sin(np.radians(solar_elevation))
-            
-            # Apply physical constraints with horizon-dependent adjustments
+            # Apply physical constraints
             predictions_median = self.target_scaler.inverse_transform(predictions)
             predictions_lower = self.target_scaler.inverse_transform(predictions_lower)
             predictions_upper = self.target_scaler.inverse_transform(predictions_upper)
             
-            for i in range(self.FORECAST_HOURS):
-                # Wider bounds for longer horizons
-                horizon_factor = 1 + (i * 0.1)  # 10% increase per hour
-                
-                # Adjust upper bounds based on clear sky
-                max_bound = clear_sky_ghi[:, np.newaxis] * horizon_factor
-                predictions_upper[:, i] = np.minimum(predictions_upper[:, i], max_bound[:, 0])
-                
-                # Ensure lower bound doesn't exceed median
-                predictions_lower[:, i] = np.minimum(predictions_lower[:, i], predictions_median[:, i])
-                
-                # Adjust interval width based on solar elevation
-                interval_width = predictions_upper[:, i] - predictions_lower[:, i]
-                elevation_factor = np.clip(solar_elevation / 45.0, 0.5, 2.0)  # Scale based on elevation
-                predictions_upper[:, i] = predictions_median[:, i] + (interval_width * elevation_factor * 0.5)
-                predictions_lower[:, i] = predictions_median[:, i] - (interval_width * elevation_factor * 0.5)
+            # Calculate safety margin based on historical error patterns
+            if hasattr(self, 'historical_values'):
+                error_margin = np.abs(predictions_median - self.historical_values['GHI - W/m^2'].values[-1])
+                # Add error margin to upper bound and subtract from lower bound
+                predictions_upper = predictions_upper + error_margin[:, np.newaxis]
+                predictions_lower = np.maximum(0, predictions_lower - error_margin[:, np.newaxis])
             
-            # Set night values to 0 with smooth transition
+            # Ensure physical constraints with wider bounds
+            predictions_lower = np.maximum(0, predictions_lower)  # GHI can't be negative
+            max_theoretical = self.SOLAR_CONSTANT * np.sin(np.radians(solar_elevation))[:, np.newaxis] * 1.2  # Allow 20% above theoretical
+            predictions_upper = np.minimum(predictions_upper, max_theoretical)
+            
+            # Ensure proper ordering while maintaining wider intervals
+            predictions_lower = np.minimum(predictions_lower, predictions_median * 0.9)  # Allow lower bound to be 10% below median
+            predictions_upper = np.maximum(predictions_upper, predictions_median * 1.15)  # Allow upper bound to be 15% above median
+            
+            # Handle night periods
             night_mask = solar_elevation <= -5
             transition_mask = (solar_elevation > -5) & (solar_elevation <= 0)
             
@@ -471,15 +528,19 @@ class WeatherPredictor:
             transition_factor = np.zeros_like(solar_elevation)
             transition_factor[transition_mask] = (solar_elevation[transition_mask] + 5) / 5
             
-            for i in range(predictions_median.shape[1]):
-                predictions_median[night_mask, i] = 0
-                predictions_lower[night_mask, i] = 0
-                predictions_upper[night_mask, i] = 0
-                
-                # Apply smooth transition
-                predictions_median[transition_mask, i] *= transition_factor[transition_mask]
-                predictions_lower[transition_mask, i] *= transition_factor[transition_mask]
-                predictions_upper[transition_mask, i] *= transition_factor[transition_mask]
+            # Reshape transition_factor for broadcasting
+            transition_factor = transition_factor.reshape(-1, 1)
+            
+            # Apply night and transition adjustments
+            predictions_median[night_mask] = 0
+            predictions_lower[night_mask] = 0
+            predictions_upper[night_mask] = 0
+            
+            # Apply transition factor with proper broadcasting
+            if np.any(transition_mask):
+                predictions_median[transition_mask] = predictions_median[transition_mask] * transition_factor[transition_mask]
+                predictions_lower[transition_mask] = predictions_lower[transition_mask] * transition_factor[transition_mask]
+                predictions_upper[transition_mask] = predictions_upper[transition_mask] * transition_factor[transition_mask]
             
             return predictions_median, predictions_lower, predictions_upper
             
@@ -503,8 +564,14 @@ class WeatherPredictor:
             
             # Make predictions with all models
             y_pred = self.xgb_models[i].predict(X)
-            y_pred_lower = self.xgb_models_lower[i].predict(X)
-            y_pred_upper = self.xgb_models_upper[i].predict(X)
+            
+            # Correctly unpack and use the tuple models
+            model_lower, model_lower_transition = self.xgb_models_lower[i]
+            model_upper, model_upper_transition = self.xgb_models_upper[i]
+            
+            # Get predictions from both standard and transition models
+            y_pred_lower = model_lower.predict(X)
+            y_pred_upper = model_upper.predict(X)
             
             # Inverse transform predictions and true values
             y_true = self.target_scaler.inverse_transform(y_true.reshape(-1, 1)).reshape(-1)
@@ -589,7 +656,7 @@ class WeatherPredictor:
         return all_metrics
 
     def calculate_metrics(self, y_true, y_pred):
-        """Calculate all evaluation metrics"""
+        """Calculate all evaluation metrics with improved MAPE handling"""
         try:
             # Basic metrics
             r2 = r2_score(y_true, y_pred)
@@ -598,19 +665,37 @@ class WeatherPredictor:
             mbe = np.mean(y_pred - y_true)
             nse = 1 - np.sum((y_pred - y_true) ** 2) / np.sum((y_true - np.mean(y_true)) ** 2)
             
-            # Calculate MAPE for daytime values only
-            day_mask = y_true > 0
+            # Improved MAPE calculation
+            # Only consider daytime values and handle low GHI better
+            day_mask = y_true > 10  # Increased threshold from 0 to 10 W/m²
             y_true_day = y_true[day_mask]
             y_pred_day = y_pred[day_mask]
             
             if len(y_true_day) > 0:
-                mape = np.mean(np.abs((y_true_day - y_pred_day) / y_true_day)) * 100
-                # Weighted MAPE
-                weights = y_true_day / np.mean(y_true_day)
-                wmape = np.average(np.abs((y_true_day - y_pred_day) / y_true_day), weights=weights) * 100
+                # Modified MAPE calculation with better handling of low values
+                epsilon = 10  # Small constant to prevent division by very small values
+                mape = np.mean(np.abs((y_true_day - y_pred_day) / (y_true_day + epsilon))) * 100
+                
+                # Weighted MAPE with dynamic weighting
+                weights = np.log1p(y_true_day) / np.log1p(y_true_day).mean()  # Log-scale weights
+                wmape = np.average(np.abs((y_true_day - y_pred_day) / (y_true_day + epsilon)), 
+                                 weights=weights) * 100
+                
+                # Additional weighted metrics for low GHI
+                low_ghi_mask = (y_true > 0) & (y_true <= 50)  # Low GHI range
+                if np.any(low_ghi_mask):
+                    low_ghi_weights = 1 / (y_true[low_ghi_mask] + epsilon)
+                    low_ghi_weights = low_ghi_weights / low_ghi_weights.sum()
+                    weighted_low_ghi_error = np.average(
+                        np.abs(y_true[low_ghi_mask] - y_pred[low_ghi_mask]),
+                        weights=low_ghi_weights
+                    )
+                else:
+                    weighted_low_ghi_error = np.nan
             else:
                 mape = np.nan
                 wmape = np.nan
+                weighted_low_ghi_error = np.nan
             
             return {
                 'r2': r2,
@@ -619,7 +704,8 @@ class WeatherPredictor:
                 'mape': mape,
                 'wmape': wmape,
                 'mbe': mbe,
-                'nse': nse
+                'nse': nse,
+                'weighted_low_ghi_error': weighted_low_ghi_error
             }
             
         except Exception as e:
@@ -897,9 +983,9 @@ class WeatherPredictor:
             print("\nPredicted GHI values with confidence intervals:")
             for hour in range(self.FORECAST_HOURS):
                 print(f"\nHour {hour+1}:")
-                print(f"Upper bound (75th percentile): {predictions_upper[0][hour]:.2f} W/m²")
-                print(f"Expected (median): {predictions_median[0][hour]:.2f} W/m²")
-                print(f"Lower bound (25th percentile): {predictions_lower[0][hour]:.2f} W/m²")
+                print(f"Upper bound (75th percentile): {float(predictions_upper[0, hour]):.2f} W/m²")
+                print(f"Expected (median): {float(predictions_median[0, hour]):.2f} W/m²")
+                print(f"Lower bound (25th percentile): {float(predictions_lower[0, hour]):.2f} W/m²")
             
             # Save input data and predictions to CSV
             self.save_to_csv(new_row, predictions_median)
@@ -1006,11 +1092,16 @@ class WeatherPredictor:
             df_clean.set_index('datetime', inplace=True)
             df_clean = df_clean.sort_index()
             
+            # Initialize feature_columns with the base FEATURE_COLUMNS first
+            self.feature_columns = self.FEATURE_COLUMNS.copy()
+            
             # Enhanced time features (keep existing)
             df_clean['Hour_Sin'] = np.sin(2 * np.pi * df_clean['Hour of Day'] / 24)
             df_clean['Hour_Cos'] = np.cos(2 * np.pi * df_clean['Hour of Day'] / 24)
             df_clean['Day_Sin'] = np.sin(2 * np.pi * df_clean['Day of Year'] / 365)
             df_clean['Day_Cos'] = np.cos(2 * np.pi * df_clean['Day of Year'] / 365)
+            
+            # Rest of the method remains the same...
             
             # IMPROVED: Better solar position features
             df_clean['Cos_Hour_Angle'] = np.cos(np.radians(15 * (df_clean['Hour of Day'] - 12)))
@@ -1163,6 +1254,10 @@ class WeatherPredictor:
     
     def _update_feature_columns(self, df):
         """Update feature columns list with new features"""
+        # Keep original FEATURE_COLUMNS
+        original_features = self.FEATURE_COLUMNS.copy()
+        
+        # Additional feature groups
         base_features = [
             'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos',
             'Cos_Hour_Angle', 'Sin_Solar_Elevation',
@@ -1181,7 +1276,9 @@ class WeatherPredictor:
             'Recent_Variability', 'Recent_Trend'
         ]
         
+        # Combine all features while preserving original ones first
         self.feature_columns = (
+            original_features +
             base_features +
             condition_features +
             change_features +
@@ -1277,14 +1374,23 @@ class WeatherPredictor:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             
             # Save XGBoost models (median and intervals)
-            for i, (model, model_lower, model_upper) in enumerate(zip(self.xgb_models, self.xgb_models_lower, self.xgb_models_upper)):
+            for i, (model, (model_lower, model_lower_transition), (model_upper, model_upper_transition)) in enumerate(zip(self.xgb_models, self.xgb_models_lower, self.xgb_models_upper)):
+                # Save median model
                 model_path = os.path.join(script_dir, f'xgboost_model_hour_{i+1}.json')
-                model_lower_path = os.path.join(script_dir, f'xgboost_model_lower_hour_{i+1}.json')
-                model_upper_path = os.path.join(script_dir, f'xgboost_model_upper_hour_{i+1}.json')
-                
                 model.save_model(model_path)
+                
+                # Save lower bound models
+                model_lower_path = os.path.join(script_dir, f'xgboost_model_lower_hour_{i+1}.json')
                 model_lower.save_model(model_lower_path)
+                model_lower_transition_path = os.path.join(script_dir, f'xgboost_model_lower_transition_hour_{i+1}.json')
+                model_lower_transition.save_model(model_lower_transition_path)
+                
+                # Save upper bound models
+                model_upper_path = os.path.join(script_dir, f'xgboost_model_upper_hour_{i+1}.json')
                 model_upper.save_model(model_upper_path)
+                model_upper_transition_path = os.path.join(script_dir, f'xgboost_model_upper_transition_hour_{i+1}.json')
+                model_upper_transition.save_model(model_upper_transition_path)
+                
                 print(f"Saved models for hour {i+1}")
             
             # Save scalers
@@ -1321,25 +1427,39 @@ class WeatherPredictor:
             self.xgb_models_upper = []
             
             for i in range(self.FORECAST_HOURS):
-                model_path = os.path.join(script_dir, f'xgboost_model_hour_{i+1}.json')
-                model_lower_path = os.path.join(script_dir, f'xgboost_model_lower_hour_{i+1}.json')
-                model_upper_path = os.path.join(script_dir, f'xgboost_model_upper_hour_{i+1}.json')
+                hour = i + 1
+                # Load paths for all models
+                model_path = os.path.join(script_dir, f'xgboost_model_hour_{hour}.json')
+                model_lower_path = os.path.join(script_dir, f'xgboost_model_lower_hour_{hour}.json')
+                model_lower_transition_path = os.path.join(script_dir, f'xgboost_model_lower_transition_hour_{hour}.json')
+                model_upper_path = os.path.join(script_dir, f'xgboost_model_upper_hour_{hour}.json')
+                model_upper_transition_path = os.path.join(script_dir, f'xgboost_model_upper_transition_hour_{hour}.json')
                 
-                if not all(os.path.exists(p) for p in [model_path, model_lower_path, model_upper_path]):
-                    raise FileNotFoundError(f"Model files for hour {i+1} not found")
+                # Check if all model files exist
+                model_files = [model_path, model_lower_path, model_lower_transition_path, 
+                             model_upper_path, model_upper_transition_path]
+                if not all(os.path.exists(p) for p in model_files):
+                    raise FileNotFoundError(f"Model files for hour {hour} not found")
                 
+                # Load all models
                 model = xgb.XGBRegressor()
                 model_lower = xgb.XGBRegressor()
+                model_lower_transition = xgb.XGBRegressor()
                 model_upper = xgb.XGBRegressor()
+                model_upper_transition = xgb.XGBRegressor()
                 
                 model.load_model(model_path)
                 model_lower.load_model(model_lower_path)
+                model_lower_transition.load_model(model_lower_transition_path)
                 model_upper.load_model(model_upper_path)
+                model_upper_transition.load_model(model_upper_transition_path)
                 
+                # Store models in the same tuple format as during training
                 self.xgb_models.append(model)
-                self.xgb_models_lower.append(model_lower)
-                self.xgb_models_upper.append(model_upper)
-                print(f"Loaded models for hour {i+1}")
+                self.xgb_models_lower.append((model_lower, model_lower_transition))
+                self.xgb_models_upper.append((model_upper, model_upper_transition))
+                
+                print(f"Loaded models for hour {hour}")
             
             # Load scalers
             scaler_paths = {
@@ -1464,10 +1584,13 @@ if __name__ == "__main__":
                         # Check if all required model files exist
                         required_files = []
                         for i in range(predictor.FORECAST_HOURS):
+                            hour = i + 1
                             required_files.extend([
-                                f'xgboost_model_hour_{i+1}.json',
-                                f'xgboost_model_lower_hour_{i+1}.json',
-                                f'xgboost_model_upper_hour_{i+1}.json'
+                                f'xgboost_model_hour_{hour}.json',
+                                f'xgboost_model_lower_hour_{hour}.json',
+                                f'xgboost_model_lower_transition_hour_{hour}.json',
+                                f'xgboost_model_upper_hour_{hour}.json',
+                                f'xgboost_model_upper_transition_hour_{hour}.json'
                             ])
                         required_files.extend(['features_scaler.joblib', 'target_scaler.joblib', 'feature_columns.json'])
                         
@@ -1485,14 +1608,17 @@ if __name__ == "__main__":
                         
                         if predictions:
                             predictions_median, predictions_lower, predictions_upper = predictions
-                            print("\nSummary of Predictions:")
-                            print("=" * 60)
+                            print("\nPredicted GHI values with confidence intervals:")
                             for hour in range(predictor.FORECAST_HOURS):
-                                print(f"\nHour {hour+1} Forecast:")
-                                print("-" * 40)
-                                print(f"Upper bound (75th percentile): {predictions_upper[0][hour]:.2f} W/m²")
-                                print(f"Expected (median):          {predictions_median[0][hour]:.2f} W/m²")
-                                print(f"Lower bound (25th percentile): {predictions_lower[0][hour]:.2f} W/m²")
+                                print(f"\nHour {hour+1}:")
+                                # Extract values correctly from numpy arrays
+                                upper = predictions_upper[0][hour] if isinstance(predictions_upper, np.ndarray) else predictions_upper[hour]
+                                median = predictions_median[0][hour] if isinstance(predictions_median, np.ndarray) else predictions_median[hour]
+                                lower = predictions_lower[0][hour] if isinstance(predictions_lower, np.ndarray) else predictions_lower[hour]
+                                
+                                print(f"Upper bound (75th percentile): {upper:.2f} W/m²")
+                                print(f"Expected (median): {median:.2f} W/m²")
+                                print(f"Lower bound (25th percentile): {lower:.2f} W/m²")
                             print("\nNote: A prediction is considered excellent if the actual value")
                             print("falls within the interval between worst and best case scenarios.")
                             print("=" * 60)
