@@ -1342,7 +1342,9 @@ class WeatherPredictor:
             'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos',
             'Cos_Hour_Angle', 'Sin_Solar_Elevation',
             'Clear_Sky_GHI', 'Clear_Sky_GHI_Adjusted',
-            'GHI_Clear_Sky_Ratio', 'Air_Mass', 'Atmospheric_Attenuation'
+            'GHI_Clear_Sky_Ratio', 'Air_Mass', 'Atmospheric_Attenuation',
+            'Solar Zenith Angle', 'Solar Elevation Angle',
+            'Hour of Day', 'Day of Year'  # Added core temporal features
         ]
         
         condition_features = [
