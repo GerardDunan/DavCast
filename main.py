@@ -17,7 +17,14 @@ import warnings
 import traceback
 import joblib
 import json
+# Add visualization imports
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.ticker import MaxNLocator
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 warnings.filterwarnings('ignore')
+import chardet
 
 class WeatherPredictor:
     # Constants that should be configurable
@@ -53,21 +60,22 @@ class WeatherPredictor:
         'xgboost_model': 'best_xgboost_model_hour_{}.json'
     }
     
-    # Additional feature columns for better prediction
+    # Updated feature columns to match new dataset format
     FEATURE_COLUMNS = [
         'Barometer - hPa', 
-        'Temp - Â°C',
+        'Temp - °C',
         'Hum - %',
-        'Dew Point - Â°C',
-        'Wet Bulb - Â°C',
+        'Dew Point - °C',
+        'Wet Bulb - °C',
         'Avg Wind Speed - km/h',
         'Wind Run - km',
         'UV Index',
         'Day of Year',
+        'Month of Year',  # New column
         'Hour of Day',
         'Solar Zenith Angle',
-        'Solar Elevation Angle',
-        'Clearness Index',
+        'GHI_lag (t-1)',  # New column
+        'Daytime',        # New column
         'Hour_Sin',
         'Hour_Cos',
         'Day_Sin',
@@ -104,8 +112,8 @@ class WeatherPredictor:
         self.lon = lon
         self.elevation = elevation
         self.solar_constant = self.SOLAR_CONSTANT
-        self.features_scaler = MinMaxScaler()
-        self.target_scaler = MinMaxScaler()
+        self.features_scaler = RobustScaler()  # Changed from MinMaxScaler to RobustScaler
+        self.target_scaler = RobustScaler()    # Changed from MinMaxScaler to RobustScaler
         self.feature_columns = self.FEATURE_COLUMNS.copy()
         
         # Use provided model parameters or defaults
@@ -124,11 +132,18 @@ class WeatherPredictor:
             df = df.copy()
             
             # Convert date and time to datetime
-            df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Start_period'])
+            # Updated to handle the new column names
+            df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Start Period'])
             
-            # Compute basic time parameters
-            df['Day of Year'] = df['datetime'].apply(lambda x: x.timetuple().tm_yday)
-            df['Hour of Day'] = df['datetime'].apply(lambda x: x.hour + x.minute/60)
+            # Compute basic time parameters if not already present
+            if 'Day of Year' not in df.columns:
+                df['Day of Year'] = df['datetime'].apply(lambda x: x.timetuple().tm_yday)
+            
+            if 'Month of Year' not in df.columns:
+                df['Month of Year'] = df['datetime'].apply(lambda x: x.month)
+                
+            if 'Hour of Day' not in df.columns:
+                df['Hour of Day'] = df['datetime'].apply(lambda x: x.hour + x.minute/60)
             
             def compute_declination(day_of_year):
                 return np.radians(23.45 * np.sin(np.radians(360/365 * (day_of_year + 284))))
@@ -157,10 +172,11 @@ class WeatherPredictor:
                     'Solar Elevation Angle': np.degrees(solar_elevation_angle)
                 })
             
-            # Compute solar angles
-            solar_angles = df.apply(compute_solar_angles, axis=1)
-            df['Solar Zenith Angle'] = solar_angles['Solar Zenith Angle']
-            df['Solar Elevation Angle'] = solar_angles['Solar Elevation Angle']
+            # Compute solar angles if Solar Elevation Angle is not present
+            if 'Solar Elevation Angle' not in df.columns:
+                solar_angles = df.apply(compute_solar_angles, axis=1)
+                df['Solar Zenith Angle'] = solar_angles['Solar Zenith Angle']
+                df['Solar Elevation Angle'] = solar_angles['Solar Elevation Angle']
             
             # Compute clearness index
             df['Clearness Index'] = df.apply(
@@ -174,46 +190,16 @@ class WeatherPredictor:
             night_mask = df['Solar Elevation Angle'] <= 0
             df.loc[night_mask, ['Clearness Index']] = 0
             
+            # Add Daytime column if not present
+            if 'Daytime' not in df.columns:
+                df['Daytime'] = (df['Solar Elevation Angle'] > 0).astype(int)
+            
             return df
             
         except Exception as e:
             print(f"Error in compute_solar_parameters: {str(e)}")
             print("DataFrame columns:", df.columns.tolist())
             raise
-
-    def calculate_solar_zenith(self, date):
-        """Calculate solar zenith angle"""
-        from pvlib import solarposition
-        
-        # Get solar position
-        solar_position = solarposition.get_solarposition(
-            time=date,
-            latitude=self.lat,
-            longitude=self.lon,
-            altitude=self.elevation
-        )
-        
-        return solar_position.zenith.iloc[0]
-
-    def calculate_extraterrestrial_radiation(self, date):
-        """Calculate extraterrestrial radiation"""
-        from pvlib import irradiance
-        
-        # Get solar position
-        solar_position = solarposition.get_solarposition(
-            time=date,
-            latitude=self.lat,
-            longitude=self.lon,
-            altitude=self.elevation
-        )
-        
-        # Calculate extraterrestrial radiation
-        extra_radiation = irradiance.get_extra_radiation(date)
-        
-        # Adjust for solar zenith angle
-        dni_extra = extra_radiation * np.cos(np.radians(solar_position.zenith.iloc[0]))
-        
-        return max(0, dni_extra)
 
     def load_and_prepare_data(self, csv_path):
         """
@@ -224,14 +210,41 @@ class WeatherPredictor:
             if not os.path.exists(csv_path):
                 raise FileNotFoundError(f"Dataset file not found: {csv_path}")
             
-            # Load the dataset
+            # Load the dataset with explicit encoding
             print(f"Loading dataset from {csv_path}...")
-            df = pd.read_csv(csv_path)
+            try:
+                # First attempt with latin-1 encoding (commonly works with Windows files)
+                df = pd.read_csv(csv_path, encoding='latin-1')
+            except:
+                try:
+                    # Second attempt with cp1252 encoding
+                    df = pd.read_csv(csv_path, encoding='cp1252')
+                except:
+                    # Third attempt with ISO-8859-1
+                    df = pd.read_csv(csv_path, encoding='ISO-8859-1')
+            
+            # Rename columns if using older format
+            column_mapping = {
+                'Start_period': 'Start Period',
+                'End_period': 'End Period',
+                'Temp - °C': 'Temp - °C',
+                'Dew Point - °C': 'Dew Point - °C',
+                'Wet Bulb - °C': 'Wet Bulb - °C'
+            }
+            
+            df = df.rename(columns={old: new for old, new in column_mapping.items() 
+                                    if old in df.columns and new not in df.columns})
             
             # Print initial dataset info
             print("\nInitial dataset info:")
             print(f"Shape: {df.shape}")
             print("Columns:", df.columns.tolist())
+            
+            # Handle GHI_lag if not present
+            if 'GHI_lag (t-1)' not in df.columns:
+                print("Creating GHI_lag feature...")
+                df['GHI_lag (t-1)'] = df['GHI - W/m^2'].shift(1)
+                df['GHI_lag (t-1)'].fillna(0, inplace=True)
             
             # Compute solar parameters
             print("\nComputing solar parameters...")
@@ -619,7 +632,7 @@ class WeatherPredictor:
                 predictions_upper[:, i] = median + interval_width + elevation_margin
                 predictions_lower[:, i] = median - (interval_width * 0.7)  # Reduced from 0.75 for slightly higher lower bound
                 
-                # Special handling for early morning predictions (7:05-8:00)
+                # Special handling for early morning predictions (7:00-8:00)
                 early_morning_mask = (hour_of_day >= 7) & (hour_of_day < 8)
                 if i == 0:  # First hour prediction
                     predictions_upper[early_morning_mask, i] = median[early_morning_mask] * 1.5  # Increased from 1.45
@@ -663,14 +676,24 @@ class WeatherPredictor:
             raise
 
     def evaluate_model(self, X_data, y_data):
-        """Evaluate XGBoost models with enhanced validation metrics"""
-        print("\nEvaluating XGBoost models (55-minute averages):")
+        """Evaluate XGBoost models with enhanced validation metrics and visualization"""
+        print("\nEvaluating XGBoost models (hourly averages):")
+        
+        # Create results directory if it doesn't exist
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        results_dir = os.path.join(script_dir, 'model_performance')
+        os.makedirs(results_dir, exist_ok=True)
         
         all_metrics = []
+        actual_vs_predicted = {}
+        
+        # Create a figure for overall performance visualization
+        plt.figure(figsize=(15, 10))
+        plt.suptitle('GHI Prediction Performance by Forecast Hour', fontsize=16)
         
         for i in range(self.FORECAST_HOURS):
             print(f"\nEvaluating {i+1}-hour ahead predictions")
-            print(f"(XX:05 to (XX+1):00 averages)")
+            print(f"(XX:00 to (XX+1):00 hourly averages)")
             
             # Get corresponding data for this horizon
             X = X_data[i]
@@ -687,81 +710,327 @@ class WeatherPredictor:
             y_pred_lower = self.target_scaler.inverse_transform(y_pred_lower.reshape(-1, 1)).reshape(-1)
             y_pred_upper = self.target_scaler.inverse_transform(y_pred_upper.reshape(-1, 1)).reshape(-1)
             
-            # Calculate standard metrics
-            metrics = self.calculate_metrics(y_true, y_pred)
+            # Standard metrics
+            mae = mean_absolute_error(y_true, y_pred)
+            mse = mean_squared_error(y_true, y_pred)
+            rmse = np.sqrt(mse)
+            r2 = r2_score(y_true, y_pred)
             
-            # Add interval metrics
-            metrics['interval_coverage'] = np.mean((y_true >= y_pred_lower) & (y_true <= y_pred_upper))
-            metrics['avg_interval_width'] = np.mean(y_pred_upper - y_pred_lower)
-            
-            # High GHI cases (> 300 W/m²)
-            high_mask = y_true > 300
-            if np.any(high_mask):
-                metrics['high_ghi_rmse'] = np.sqrt(mean_squared_error(y_true[high_mask], y_pred[high_mask]))
-                high_coverage = (y_true[high_mask] >= y_pred_lower[high_mask]) & (y_true[high_mask] <= y_pred_upper[high_mask])
-                metrics['high_ghi_coverage'] = np.mean(high_coverage)
+            # Filter to daytime only for daytime metrics
+            daytime_mask = y_true > 0
+            if sum(daytime_mask) > 0:
+                daytime_mae = mean_absolute_error(y_true[daytime_mask], y_pred[daytime_mask])
+                daytime_rmse = np.sqrt(mean_squared_error(y_true[daytime_mask], y_pred[daytime_mask]))
+                daytime_r2 = r2_score(y_true[daytime_mask], y_pred[daytime_mask])
             else:
-                metrics['high_ghi_rmse'] = np.nan
-                metrics['high_ghi_coverage'] = np.nan
+                daytime_mae = daytime_rmse = float('nan')
+                daytime_r2 = float('nan')
             
-            # Low GHI cases (< 10 W/m²)
-            low_mask = y_true < 10
-            if np.any(low_mask):
-                metrics['low_ghi_rmse'] = np.sqrt(mean_squared_error(y_true[low_mask], y_pred[low_mask]))
-                low_coverage = (y_true[low_mask] >= y_pred_lower[low_mask]) & (y_true[low_mask] <= y_pred_upper[low_mask])
-                metrics['low_ghi_coverage'] = np.mean(low_coverage)
-            else:
-                metrics['low_ghi_rmse'] = np.nan
-                metrics['low_ghi_coverage'] = np.nan
+            # Interval metrics
+            coverage = np.mean((y_true >= y_pred_lower) & (y_true <= y_pred_upper))
+            interval_width = np.mean(y_pred_upper - y_pred_lower)
             
-            # Rapid change metrics
-            changes = np.abs(np.diff(y_true))
-            rapid_change_mask = np.zeros_like(y_true, dtype=bool)
-            rapid_change_mask[1:] = changes > 50  # Define rapid change as >50 W/m² between consecutive measurements
+            # Custom error metrics
+            weighted_errors = np.abs(y_true - y_pred) / (y_true.clip(min=1) + 10)
+            mape = np.mean(np.abs((y_true - y_pred) / y_true.clip(min=1))) * 100
             
-            if np.any(rapid_change_mask):
-                metrics['rapid_change_rmse'] = np.sqrt(mean_squared_error(
-                    y_true[rapid_change_mask],
-                    y_pred[rapid_change_mask]
-                ))
-                rapid_coverage = (y_true[rapid_change_mask] >= y_pred_lower[rapid_change_mask]) & (y_true[rapid_change_mask] <= y_pred_upper[rapid_change_mask])
-                metrics['rapid_change_coverage'] = np.mean(rapid_coverage)
-            else:
-                metrics['rapid_change_rmse'] = np.nan
-                metrics['rapid_change_coverage'] = np.nan
+            # Store metrics
+            hour_metrics = {
+                'Forecast Hour': i+1,
+                'MAE': mae,
+                'RMSE': rmse,
+                'R²': r2,
+                'Daytime MAE': daytime_mae,
+                'Daytime RMSE': daytime_rmse,
+                'Daytime R²': daytime_r2,
+                'Coverage': coverage,
+                'Interval Width': interval_width,
+                'Weighted Error': np.mean(weighted_errors),
+                'MAPE': mape
+            }
             
-            # Transition period metrics (sunrise/sunset)
-            transition_mask = (y_true > 0) & (y_true < 50)
-            if np.any(transition_mask):
-                metrics['transition_rmse'] = np.sqrt(mean_squared_error(
-                    y_true[transition_mask],
-                    y_pred[transition_mask]
-                ))
-                transition_coverage = (y_true[transition_mask] >= y_pred_lower[transition_mask]) & (y_true[transition_mask] <= y_pred_upper[transition_mask])
-                metrics['transition_coverage'] = np.mean(transition_coverage)
-            else:
-                metrics['transition_rmse'] = np.nan
-                metrics['transition_coverage'] = np.nan
+            all_metrics.append(hour_metrics)
             
-            all_metrics.append(metrics)
+            # Store actual vs predicted for plotting
+            actual_vs_predicted[f'Hour {i+1}'] = {
+                'y_true': y_true,
+                'y_pred': y_pred,
+                'y_pred_lower': y_pred_lower,
+                'y_pred_upper': y_pred_upper
+            }
             
-            print(f"\nPerformance for the next {i+1}-hour prediction:")
-            self.print_metrics(metrics)
-            print(f"Interval Coverage: {metrics['interval_coverage']*100:.2f}%")
-            print(f"Average Interval Width: {metrics['avg_interval_width']:.2f} W/m²")
+            # Create individual subplot for this hour
+            plt.subplot(2, 2, i+1)
+            plt.scatter(y_true, y_pred, alpha=0.5)
+            plt.plot([0, max(y_true.max(), y_pred.max())], 
+                     [0, max(y_true.max(), y_pred.max())], 
+                     'r--')
+            plt.xlabel('Actual GHI (W/m²)')
+            plt.ylabel('Predicted GHI (W/m²)')
+            plt.title(f'Hour {i+1} Forecast: R² = {r2:.3f}, RMSE = {rmse:.2f}')
+            plt.grid(True, alpha=0.3)
             
-            # Print extreme case metrics
-            print("\nExtreme Case Performance:")
-            print(f"High GHI (>300 W/m²) RMSE: {metrics['high_ghi_rmse']:.2f} W/m²")
-            print(f"High GHI Coverage: {metrics['high_ghi_coverage']*100:.2f}%")
-            print(f"Low GHI (<10 W/m²) RMSE: {metrics['low_ghi_rmse']:.2f} W/m²")
-            print(f"Low GHI Coverage: {metrics['low_ghi_coverage']*100:.2f}%")
-            print(f"Rapid Change RMSE: {metrics['rapid_change_rmse']:.2f} W/m²")
-            print(f"Rapid Change Coverage: {metrics['rapid_change_coverage']*100:.2f}%")
-            print(f"Transition Period RMSE: {metrics['transition_rmse']:.2f} W/m²")
-            print(f"Transition Period Coverage: {metrics['transition_coverage']*100:.2f}%")
+            # Add metrics text
+            plt.text(0.05, 0.95, 
+                    f'MAE: {mae:.2f}\nRMSE: {rmse:.2f}\nR²: {r2:.3f}\n'
+                    f'Coverage: {coverage:.1%}\nDaytime R²: {daytime_r2:.3f}',
+                    transform=plt.gca().transAxes,
+                    verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            print(f'MAE: {mae:.2f} W/m²')
+            print(f'RMSE: {rmse:.2f} W/m²')
+            print(f'R²: {r2:.3f}')
+            print(f'Daytime MAE: {daytime_mae:.2f} W/m²')
+            print(f'Daytime RMSE: {daytime_rmse:.2f} W/m²')
+            print(f'Daytime R²: {daytime_r2:.3f}')
+            print(f'Prediction Interval Coverage: {coverage:.1%}')
+            print(f'Average Interval Width: {interval_width:.2f} W/m²')
+        
+        # Save the main performance plot
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        performance_plot_path = os.path.join(results_dir, 'prediction_performance.png')
+        plt.savefig(performance_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Create additional performance visualizations
+        self._create_performance_visualizations(all_metrics, actual_vs_predicted, results_dir)
+        
+        # Create feature importance visualization
+        self._visualize_feature_importance(results_dir)
+        
+        print(f"\nPerformance visualizations saved to: {results_dir}")
         
         return all_metrics
+    
+    def _create_performance_visualizations(self, metrics, actual_vs_predicted, save_dir):
+        """Create and save additional performance visualizations"""
+        # 1. Metrics by forecast hour
+        metrics_df = pd.DataFrame(metrics)
+        
+        # Overall metrics plot
+        plt.figure(figsize=(12, 8))
+        metrics_to_plot = ['RMSE', 'MAE', 'Daytime RMSE', 'Daytime MAE']
+        
+        for metric in metrics_to_plot:
+            plt.plot(metrics_df['Forecast Hour'], metrics_df[metric], 'o-', label=metric)
+        
+        plt.xticks(metrics_df['Forecast Hour'])
+        plt.xlabel('Forecast Hour')
+        plt.ylabel('Error (W/m²)')
+        plt.title('Error Metrics by Forecast Horizon')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.savefig(os.path.join(save_dir, 'error_metrics_by_hour.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # R² metrics plot
+        plt.figure(figsize=(10, 6))
+        r2_metrics = ['R²', 'Daytime R²']
+        
+        for metric in r2_metrics:
+            plt.plot(metrics_df['Forecast Hour'], metrics_df[metric], 'o-', label=metric)
+        
+        plt.xticks(metrics_df['Forecast Hour'])
+        plt.xlabel('Forecast Hour')
+        plt.ylabel('R² Score')
+        plt.title('R² Score by Forecast Horizon')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.savefig(os.path.join(save_dir, 'r2_by_hour.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 2. Error distribution plot for each hour
+        plt.figure(figsize=(15, 10))
+        plt.suptitle('Error Distribution by Forecast Hour', fontsize=16)
+        
+        for i, hour in enumerate(range(1, self.FORECAST_HOURS + 1)):
+            hour_data = actual_vs_predicted[f'Hour {hour}']
+            errors = hour_data['y_true'] - hour_data['y_pred']
+            
+            plt.subplot(2, 2, i+1)
+            sns.histplot(errors, kde=True)
+            plt.axvline(x=0, color='r', linestyle='--')
+            plt.xlabel('Prediction Error (W/m²)')
+            plt.ylabel('Frequency')
+            plt.title(f'Hour {hour} Error Distribution')
+            
+            # Add error stats
+            plt.text(0.05, 0.95, 
+                     f'Mean Error: {errors.mean():.2f}\n'
+                     f'Error Std: {errors.std():.2f}\n'
+                     f'25-75 Percentile: [{np.percentile(errors, 25):.1f}, {np.percentile(errors, 75):.1f}]',
+                     transform=plt.gca().transAxes,
+                     verticalalignment='top',
+                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig(os.path.join(save_dir, 'error_distributions.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 3. Prediction intervals plot for first 100 samples of each hour
+        for hour in range(1, self.FORECAST_HOURS + 1):
+            plt.figure(figsize=(15, 8))
+            hour_data = actual_vs_predicted[f'Hour {hour}']
+            
+            # Take first 100 samples or all if less than 100
+            sample_size = min(100, len(hour_data['y_true']))
+            indices = np.arange(sample_size)
+            
+            plt.fill_between(indices, 
+                             hour_data['y_pred_lower'][:sample_size], 
+                             hour_data['y_pred_upper'][:sample_size], 
+                             alpha=0.3, label='Prediction Interval')
+            
+            plt.plot(indices, hour_data['y_pred'][:sample_size], 'b-', label='Predicted GHI')
+            plt.plot(indices, hour_data['y_true'][:sample_size], 'ro', markersize=4, label='Actual GHI')
+            
+            plt.xlabel('Sample Index')
+            plt.ylabel('GHI (W/m²)')
+            plt.title(f'Hour {hour} Forecast: Actual vs Predicted with Confidence Intervals')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            # Add coverage metric
+            coverage = np.mean((hour_data['y_true'][:sample_size] >= hour_data['y_pred_lower'][:sample_size]) & 
+                              (hour_data['y_true'][:sample_size] <= hour_data['y_pred_upper'][:sample_size]))
+            
+            plt.text(0.05, 0.95, 
+                     f'Interval Coverage: {coverage:.1%}',
+                     transform=plt.gca().transAxes,
+                     verticalalignment='top',
+                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            plt.savefig(os.path.join(save_dir, f'prediction_intervals_hour_{hour}.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        # 4. Save metrics table as CSV
+        metrics_df.to_csv(os.path.join(save_dir, 'performance_metrics.csv'), index=False)
+        
+        # Create an HTML summary for quick viewing
+        self._create_html_summary(save_dir, metrics_df)
+    
+    def _visualize_feature_importance(self, save_dir):
+        """Create and save feature importance visualizations for all models"""
+        # Create combined feature importance plot
+        plt.figure(figsize=(15, 10))
+        importance_dfs = []
+        
+        for i, model in enumerate(self.xgb_models):
+            # Get feature importance
+            importance = pd.DataFrame({
+                'Feature': self.feature_columns,
+                'Importance': model.feature_importances_
+            })
+            importance['Hour'] = i + 1
+            importance_dfs.append(importance)
+        
+        # Combine all importance dataframes
+        all_importance = pd.concat(importance_dfs)
+        
+        # Get top 15 features based on average importance
+        top_features = all_importance.groupby('Feature')['Importance'].mean().nlargest(15).index
+        
+        # Filter for only top features
+        plot_df = all_importance[all_importance['Feature'].isin(top_features)]
+        
+        # Create plot
+        plt.figure(figsize=(12, 10))
+        sns.barplot(x='Importance', y='Feature', hue='Hour', data=plot_df)
+        plt.title('Top 15 Features by Importance Across Forecast Hours')
+        plt.xlabel('Importance (Gain)')
+        plt.ylabel('Feature')
+        plt.legend(title='Forecast Hour')
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'feature_importance.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Save detailed feature importance for each hour
+        for i, model in enumerate(self.xgb_models):
+            importance = pd.DataFrame({
+                'Feature': self.feature_columns,
+                'Importance': model.feature_importances_
+            })
+            importance = importance.sort_values('Importance', ascending=False)
+            
+            plt.figure(figsize=(12, 10))
+            sns.barplot(x='Importance', y='Feature', data=importance.head(20))
+            plt.title(f'Top 20 Features by Importance - Hour {i+1} Forecast')
+            plt.xlabel('Importance (Gain)')
+            plt.ylabel('Feature')
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, f'feature_importance_hour_{i+1}.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            # Save full feature importance to CSV
+            importance.to_csv(os.path.join(save_dir, f'feature_importance_hour_{i+1}.csv'), index=False)
+    
+    def _create_html_summary(self, save_dir, metrics_df):
+        """Create an HTML summary of model performance with embedded images"""
+        html_path = os.path.join(save_dir, 'performance_summary.html')
+        
+        # Format metrics table for HTML
+        metrics_table = metrics_df.to_html(float_format=lambda x: f'{x:.3f}', index=False)
+        
+        # List of generated images (relative paths)
+        images = [
+            'prediction_performance.png',
+            'error_metrics_by_hour.png',
+            'r2_by_hour.png',
+            'error_distributions.png',
+            'feature_importance.png'
+        ]
+        
+        # Add hour-specific images
+        for i in range(1, self.FORECAST_HOURS + 1):
+            images.append(f'prediction_intervals_hour_{i}.png')
+            images.append(f'feature_importance_hour_{i}.png')
+        
+        # Create image HTML
+        image_html = ''
+        for img in images:
+            image_html += f'<div class="figure-container">\n'
+            image_html += f'  <figure>\n'
+            image_html += f'    <img src="{img}" alt="{img}" width="800">\n'
+            image_html += f'    <figcaption>{img}</figcaption>\n'
+            image_html += f'  </figure>\n'
+            image_html += f'</div>\n'
+        
+        # Create HTML content
+        html_content = f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>GHI Prediction Model Performance Summary</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                h1, h2 {{ color: #2c3e50; }}
+                table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: right; }}
+                th {{ background-color: #f2f2f2; text-align: center; }}
+                tr:nth-child(even) {{ background-color: #f9f9f9; }}
+                .figure-container {{ margin: 20px 0; }}
+                figure {{ margin: 0; }}
+                img {{ max-width: 100%; height: auto; border: 1px solid #ddd; }}
+                figcaption {{ font-style: italic; margin-top: 5px; }}
+            </style>
+        </head>
+        <body>
+            <h1>GHI Prediction Model Performance Summary</h1>
+            <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            
+            <h2>Performance Metrics</h2>
+            {metrics_table}
+            
+            <h2>Visualizations</h2>
+            {image_html}
+        </body>
+        </html>
+        '''
+        
+        # Write HTML to file
+        with open(html_path, 'w') as f:
+            f.write(html_content)
 
     def calculate_metrics(self, y_true, y_pred):
         """Calculate all evaluation metrics"""
@@ -823,14 +1092,14 @@ class WeatherPredictor:
         # Get the time period from the timestamp
         end_time = timestamp.replace(minute=0) + timedelta(hours=1)
         print(f"\nEnter values for {timestamp.strftime('%H:%M')} - {end_time.strftime('%H:%M')}:")
-        print("(55-minute averages)")
+        print("(hourly averages)")
         
         input_values = {}
         prompts = {
-            'Temp - Â°C': 'Average Temperature (°C): ',
+            'Temp - °C': 'Average Temperature (°C): ',
             'Hum - %': 'Average Humidity (%): ',
-            'Dew Point - Â°C': 'Average Dew Point (°C): ',
-            'Wet Bulb - Â°C': 'Average Wet Bulb (°C): ',
+            'Dew Point - °C': 'Average Dew Point (°C): ',
+            'Wet Bulb - °C': 'Average Wet Bulb (°C): ',
             'Avg Wind Speed - km/h': 'Average Wind Speed (km/h): ',
             'Wind Run - km': 'Wind Run (km): ',
             'UV Index': 'Average UV Index: ',
@@ -853,72 +1122,200 @@ class WeatherPredictor:
         """Get the last timestamp and next start time from the dataset"""
         script_dir = os.path.dirname(os.path.abspath(__file__))
         dataset_path = os.path.join(script_dir, 'dataset.csv')
-        df = pd.read_csv(dataset_path)
+        
+        # Fix: Add proper encoding handling
+        try:
+            # First attempt with latin-1 encoding (commonly works with Windows files)
+            df = pd.read_csv(dataset_path, encoding='latin-1')
+        except:
+            try:
+                # Second attempt with cp1252 encoding
+                df = pd.read_csv(dataset_path, encoding='cp1252')
+            except:
+                # Third attempt with ISO-8859-1
+                df = pd.read_csv(dataset_path, encoding='ISO-8859-1')
         
         # Get the last row
         last_row = df.iloc[-1]
         
         # Parse the last timestamp with flexible format
         last_date = last_row['Date']
-        last_end = last_row['End_period']
+        last_end = last_row['End Period']
         last_timestamp = pd.to_datetime(f"{last_date} {last_end}", format='mixed')
         
-        # Calculate next start time (5 minutes after the hour)
-        next_start = last_timestamp + timedelta(minutes=5)
+        # Calculate next start time (on the hour)
+        next_start = last_timestamp.replace(minute=0)
         
         return next_start
 
     def prepare_prediction_data(self, input_values):
-        """Prepare input data for prediction"""
+        """Prepare input data for prediction with all required features"""
+        df = None  # Initialize df to avoid UnboundLocalError
         try:
-            # Get next start time from dataset
-            next_start = self.get_last_timestamp()
-            next_end = next_start.replace(minute=0) + timedelta(hours=1)
-            
+            # Use the date and time information from input_values instead of fetching from dataset
             # Create a DataFrame with the input values
             df = pd.DataFrame([input_values])
             
-            # Add date and time information
-            df['Date'] = next_start.strftime('%Y-%m-%d')
-            df['Start_period'] = next_start.strftime('%H:%M')  # Will be XX:05
-            df['End_period'] = next_end.strftime('%H:%M')  # Will be (XX+1):00
+            # Check if Start Period and End Period are already in input_values
+            if 'Start Period' in input_values and 'End Period' in input_values:
+                # Use the values from input_values
+                next_start = pd.to_datetime(f"{input_values['Date']} {input_values['Start Period']}")
+                next_end = pd.to_datetime(f"{input_values['Date']} {input_values['End Period']}")
+            else:
+                # For backwards compatibility
+                # Get next start time from dataset
+                next_start = self.get_last_timestamp()
+                next_end = next_start.replace(minute=0) + timedelta(hours=1)
+                
+                # Add date and time information to df
+                df['Date'] = next_start.strftime('%Y-%m-%d')
+                df['Start_period'] = next_start.strftime('%H:%M')  # Will be XX:00
+                df['End_period'] = next_end.strftime('%H:%M')  # Will be (XX+1):00
             
-            # Add solar parameters for the middle of the averaging period
-            # Use XX:32 (middle of XX:05 to XX+1:00) for solar calculations
-            calculation_time = next_start + timedelta(minutes=27)
-            df['Day of Year'] = calculation_time.timetuple().tm_yday
-            df['Hour of Day'] = calculation_time.hour + calculation_time.minute/60
+            # Use end time for solar calculations instead of midpoint
+            calculation_time = next_end  # Use end time (e.g., 11:00)
+            
+            # Only set these if not already present
+            if 'Day of Year' not in df.columns:
+                df['Day of Year'] = calculation_time.timetuple().tm_yday
+            if 'Hour of Day' not in df.columns:
+                df['Hour of Day'] = calculation_time.hour + calculation_time.minute/60
             
             # Calculate solar parameters
             df = self.compute_solar_parameters(df)
             
-            # Add Clear_Sky_GHI_Adjusted
+            # Ensure key naming consistency - standardize to use space format
+            if 'Start_period' in df.columns and 'Start Period' not in df.columns:
+                df = df.rename(columns={'Start_period': 'Start Period'})
+            if 'End_period' in df.columns and 'End Period' not in df.columns:
+                df = df.rename(columns={'End_period': 'End Period'})
+            
+            # Ensure datetime column exists for time-based features
+            if 'datetime' not in df.columns:
+                df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['End Period'])
+            
+            # Ensure Sin_Solar_Elevation is calculated if missing
+            if 'Sin_Solar_Elevation' not in df.columns:
+                # Calculate it from Solar Elevation Angle
+                if 'Solar Elevation Angle' in df.columns:
+                    df['Sin_Solar_Elevation'] = np.sin(np.radians(df['Solar Elevation Angle']))
+                else:
+                    # If Solar Elevation Angle is missing too, calculate it from zenith angle
+                    if 'Solar Zenith Angle' in df.columns:
+                        df['Solar Elevation Angle'] = 90 - df['Solar Zenith Angle']
+                        df['Sin_Solar_Elevation'] = np.sin(np.radians(df['Solar Elevation Angle']))
+                    else:
+                        # Calculate from scratch if needed
+                        solar_angles = self.compute_solar_angles(df.iloc[0])
+                        df['Solar Zenith Angle'] = solar_angles['Solar Zenith Angle']
+                        df['Solar Elevation Angle'] = solar_angles['Solar Elevation Angle']
+                        df['Sin_Solar_Elevation'] = np.sin(np.radians(df['Solar Elevation Angle']))
+            
+            # Add Air_Mass calculation
             df['Air_Mass'] = 1 / (df['Sin_Solar_Elevation'].clip(0.001, 1))
             df['Air_Mass'] = df['Air_Mass'].clip(1, 38)
             
-            # Temperature-adjusted atmospheric attenuation
-            temp_factor = (df['Temp - Â°C'] + 273.15) / 298.15  # Normalize to 25°C
-            humidity_factor = 1 + (df['Hum - %'] / 100) * 0.1  # Humidity effect
-            df['Atmospheric_Attenuation'] = (0.7 ** (df['Air_Mass'] * humidity_factor)) * temp_factor
+            # Calculate Atmospheric_Attenuation if it doesn't exist
+            if 'Atmospheric_Attenuation' not in df.columns:
+                df['Atmospheric_Attenuation'] = 0.7 ** (df['Air_Mass'] ** 0.678)
+            
+            # Calculate Clear_Sky_GHI if it doesn't exist
+            if 'Clear_Sky_GHI' not in df.columns:
+                # Calculate Clear Sky GHI based on solar zenith angle and solar constant
+                cos_zenith = np.cos(np.radians(df['Solar Zenith Angle']))
+                df['Clear_Sky_GHI'] = self.SOLAR_CONSTANT * cos_zenith.clip(0, 1)  # Clip to avoid negative values
+            
+            # Calculate Clear_Sky_GHI_Adjusted
             df['Clear_Sky_GHI_Adjusted'] = df['Clear_Sky_GHI'] * df['Atmospheric_Attenuation']
             
-            # Ensure all required features are present
-            for feature in self.feature_columns:
-                if feature not in df.columns:
-                    print(f"Warning: Missing feature {feature}, setting to 0")
-                    df[feature] = 0
+            # Calculate GHI_Clear_Sky_Ratio if it doesn't exist
+            if 'GHI_Clear_Sky_Ratio' not in df.columns:
+                # Avoid division by zero
+                denominator = df['Clear_Sky_GHI_Adjusted'].clip(10, None)  # Minimum 10 W/m²
+                df['GHI_Clear_Sky_Ratio'] = (df['GHI - W/m^2'] / denominator).clip(0, 2)  # Clip ratio between 0 and 2
             
-            # Extract features in correct order
-            X = df[self.feature_columns].values
+            # Calculate all the missing trigonometric time features
+            df['Hour_Sin'] = np.sin(2 * np.pi * df['Hour of Day'] / 24)
+            df['Hour_Cos'] = np.cos(2 * np.pi * df['Hour of Day'] / 24)
+            df['Day_Sin'] = np.sin(2 * np.pi * df['Day of Year'] / 365)
+            df['Day_Cos'] = np.cos(2 * np.pi * df['Day of Year'] / 365)
+            df['Month_Sin'] = np.sin(2 * np.pi * df['Month of Year'] / 12)
+            df['Month_Cos'] = np.cos(2 * np.pi * df['Month of Year'] / 12)
             
-            # Scale features
+            # Calculate hour angle and its cosine
+            hour_angle_rad = np.radians(15 * (df['Hour of Day'] - 12))
+            df['Cos_Hour_Angle'] = np.cos(hour_angle_rad)
+            
+            # Calculate GHI-related features and ratios
+            if 'GHI_lag (t-1)' in df.columns and 'GHI - W/m^2' in df.columns:
+                # Avoid division by zero
+                denominator = df['GHI_lag (t-1)'].clip(1, None)
+                df['GHI_lag_ratio'] = (df['GHI - W/m^2'] / denominator).clip(0, 5)
+            else:
+                df['GHI_lag_ratio'] = 1.0  # Default value
+            
+            # Add interaction terms
+            df['GHI_UV_Interaction'] = df['GHI - W/m^2'] * df['UV Index']
+            df['Temp_Humidity_Interaction'] = df['Temp - °C'] * df['Hum - %']
+            df['GHI_Temp_Interaction'] = df['GHI - W/m^2'] * df['Temp - °C']
+            df['GHI_Wind_Interaction'] = df['GHI - W/m^2'] * df['Avg Wind Speed - km/h']
+            df['Daytime_GHI_Interaction'] = df['Daytime'] * df['GHI - W/m^2']
+            df['Daytime_Temp_Interaction'] = df['Daytime'] * df['Temp - °C']
+            
+            # Add cloud condition dummy variables (set to default values)
+            cloud_conditions = ['Is_Clear', 'Is_Mostly_Clear', 'Is_Partly_Cloudy', 
+                              'Is_Mostly_Cloudy', 'Is_Overcast']
+            for condition in cloud_conditions:
+                df[condition] = 0  # Default: no specific cloud condition
+                
+            # Use clearness index to make a best guess of cloud condition
+            if 'Clearness Index' in df.columns:
+                ck = df['Clearness Index'].iloc[0]
+                # Set one condition to 1 based on clearness index
+                if ck > 0.8:
+                    df['Is_Clear'] = 1
+                elif ck > 0.6:
+                    df['Is_Mostly_Clear'] = 1
+                elif ck > 0.4:
+                    df['Is_Partly_Cloudy'] = 1
+                elif ck > 0.2:
+                    df['Is_Mostly_Cloudy'] = 1
+                else:
+                    df['Is_Overcast'] = 1
+                    
+            # Add trend features (set defaults since we don't have historical data)
+            df['Is_Transition'] = 0
+            df['Is_Rapid_Change'] = 0
+            df['GHI_Change'] = 0
+            df['GHI_Change_Rate'] = 0
+            df['GHI_Acceleration'] = 0
+            df['Recent_Variability'] = 0
+            df['Recent_Trend'] = 0
+            
+            # Add time series aggregation features (defaults)
+            for window in [3, 6, 12]:
+                df[f'GHI_{window}h_mean'] = df['GHI - W/m^2']
+                df[f'GHI_{window}h_std'] = 0
+                df[f'GHI_EMA_{window}h'] = df['GHI - W/m^2']
+                df[f'GHI_Ratio_EMA_{window}h'] = 1
+                df[f'GHI_Volatility_{window}h'] = 0
+            
+            # Ensure all required features are present and in the right order
+            df = df.reindex(columns=self.feature_columns, fill_value=0)
+            
+            # Convert to numpy array for the model
+            X = df.values
+            
+            # Scale features using the loaded scaler
             X_scaled = self.features_scaler.transform(X)
             
+            # Now return the properly scaled data
             return X_scaled
-            
+                
         except Exception as e:
             print(f"Error in prepare_prediction_data: {str(e)}")
-            print("DataFrame columns:", df.columns.tolist())
+            if df is not None:
+                print("DataFrame columns:", df.columns.tolist())
             print("Required features:", self.feature_columns)
             raise
 
@@ -933,137 +1330,8 @@ class WeatherPredictor:
             # Get input data
             new_row = self.get_input_data()
             
-            # Create DataFrame with input
-            df_pred = pd.DataFrame([new_row])
-            
-            # Apply same feature engineering as training
-            df_pred['datetime'] = pd.to_datetime(df_pred['Date'] + ' ' + df_pred['Start_period'])
-            df_pred.set_index('datetime', inplace=True)
-            
-            # Add time features
-            df_pred['Hour_Sin'] = np.sin(2 * np.pi * df_pred['Hour of Day'] / 24)
-            df_pred['Hour_Cos'] = np.cos(2 * np.pi * df_pred['Hour of Day'] / 24)
-            df_pred['Day_Sin'] = np.sin(2 * np.pi * df_pred['Day of Year'] / 365)
-            df_pred['Day_Cos'] = np.cos(2 * np.pi * df_pred['Day of Year'] / 365)
-            
-            # Solar position features
-            solar_angles = df_pred.apply(self.compute_solar_angles, axis=1)
-            df_pred['Solar Zenith Angle'] = solar_angles['Solar Zenith Angle']
-            df_pred['Solar Elevation Angle'] = solar_angles['Solar Elevation Angle']
-            df_pred['Cos_Hour_Angle'] = np.cos(np.radians(15 * (df_pred['Hour of Day'] - 12)))
-            df_pred['Sin_Solar_Elevation'] = np.sin(np.radians(df_pred['Solar Elevation Angle']))
-            df_pred['Clear_Sky_GHI'] = self.SOLAR_CONSTANT * df_pred['Sin_Solar_Elevation']
-            
-            # Add Clear_Sky_GHI_Adjusted calculation
-            df_pred['Air_Mass'] = 1 / (df_pred['Sin_Solar_Elevation'].clip(0.001, 1))
-            df_pred['Air_Mass'] = df_pred['Air_Mass'].clip(1, 38)
-            
-            # Temperature-adjusted atmospheric attenuation
-            temp_factor = (df_pred['Temp - Â°C'] + 273.15) / 298.15  # Normalize to 25°C
-            humidity_factor = 1 + (df_pred['Hum - %'] / 100) * 0.1  # Humidity effect
-            df_pred['Atmospheric_Attenuation'] = (0.7 ** (df_pred['Air_Mass'] * humidity_factor)) * temp_factor
-            df_pred['Clear_Sky_GHI_Adjusted'] = df_pred['Clear_Sky_GHI'] * df_pred['Atmospheric_Attenuation']
-            
-            # Weather interaction features
-            df_pred['GHI_Clear_Sky_Ratio'] = np.where(
-                df_pred['Clear_Sky_GHI'] > 0,
-                df_pred['GHI - W/m^2'] / df_pred['Clear_Sky_GHI'],
-                0
-            )
-            df_pred['GHI_Clear_Sky_Ratio'] = df_pred['GHI_Clear_Sky_Ratio'].clip(0, 1.2)
-            
-            # Weather condition indicators
-            df_pred['Is_Clear'] = (df_pred['GHI_Clear_Sky_Ratio'] > 0.8).astype(int)
-            df_pred['Is_Mostly_Clear'] = ((df_pred['GHI_Clear_Sky_Ratio'] > 0.6) & 
-                                        (df_pred['GHI_Clear_Sky_Ratio'] <= 0.8)).astype(int)
-            df_pred['Is_Partly_Cloudy'] = ((df_pred['GHI_Clear_Sky_Ratio'] > 0.4) & 
-                                         (df_pred['GHI_Clear_Sky_Ratio'] <= 0.6)).astype(int)
-            df_pred['Is_Mostly_Cloudy'] = ((df_pred['GHI_Clear_Sky_Ratio'] > 0.2) & 
-                                         (df_pred['GHI_Clear_Sky_Ratio'] <= 0.4)).astype(int)
-            df_pred['Is_Overcast'] = (df_pred['GHI_Clear_Sky_Ratio'] <= 0.2).astype(int)
-            
-            # Transition period detection
-            df_pred['Is_Transition'] = (
-                (df_pred['Solar Elevation Angle'] > -5) & 
-                (df_pred['Solar Elevation Angle'] < 15)
-            ).astype(int)
-            
-            # Change and variability features
-            if hasattr(self, 'historical_values'):
-                hist_ghi = pd.concat([self.historical_values['GHI - W/m^2'], df_pred['GHI - W/m^2']])
-                df_pred['GHI_Change'] = hist_ghi.diff().iloc[-1]
-                df_pred['Recent_Variability'] = hist_ghi.tail(5).std()
-                df_pred['Recent_Trend'] = hist_ghi.tail(5).diff().mean()
-                df_pred['Is_Rapid_Change'] = (abs(df_pred['GHI_Change'] / df_pred['Clear_Sky_GHI_Adjusted'].clip(1, None)) > 0.1).astype(int)
-                
-                # Add volatility features
-                for window in [3, 6, 12]:
-                    df_pred[f'GHI_Volatility_{window}h'] = (
-                        hist_ghi.tail(window).diff().std() / 
-                        df_pred['Clear_Sky_GHI_Adjusted'].clip(1, None)
-                    ).iloc[0]
-            else:
-                # Default values if no historical data
-                df_pred['GHI_Change'] = 0
-                df_pred['Recent_Variability'] = 0
-                df_pred['Recent_Trend'] = 0
-                df_pred['Is_Rapid_Change'] = 0
-                for window in [3, 6, 12]:
-                    df_pred[f'GHI_Volatility_{window}h'] = 0
-            
-            # Add Clear_Sky_Humidity_Interaction
-            df_pred['Clear_Sky_Humidity_Interaction'] = df_pred['Clear_Sky_GHI_Adjusted'] * humidity_factor
-            
-            # Add GHI rate of change features
-            if hasattr(self, 'historical_values'):
-                hist_ghi = pd.concat([self.historical_values['GHI - W/m^2'], df_pred['GHI - W/m^2']])
-                df_pred['GHI_Change_Rate'] = hist_ghi.diff().iloc[-1] / pd.Timedelta('1H').total_seconds()
-                df_pred['GHI_Acceleration'] = hist_ghi.diff().diff().iloc[-1] / pd.Timedelta('1H').total_seconds()
-                
-                # Add exponential moving averages
-                for window in [3, 6, 12]:
-                    df_pred[f'GHI_EMA_{window}h'] = hist_ghi.ewm(span=window*2, adjust=False, min_periods=1).mean().iloc[-1]
-                    
-                    hist_ratio = pd.concat([self.historical_values['GHI_Clear_Sky_Ratio'], df_pred['GHI_Clear_Sky_Ratio']])
-                    df_pred[f'GHI_Ratio_EMA_{window}h'] = hist_ratio.ewm(span=window*2, adjust=False, min_periods=1).mean().iloc[-1]
-                
-                # Add lag features
-                for lag in [1, 2, 3]:
-                    df_pred[f'GHI_{lag}h_lag'] = self.historical_values['GHI - W/m^2'].iloc[-lag]
-                    df_pred[f'Clear_Sky_Ratio_{lag}h_lag'] = self.historical_values['GHI_Clear_Sky_Ratio'].iloc[-lag]
-                    df_pred[f'Clear_Sky_GHI_{lag}h_lag'] = self.historical_values['Clear_Sky_GHI_Adjusted'].iloc[-lag]
-            else:
-                # Default values if no historical data
-                df_pred['GHI_Change_Rate'] = 0
-                df_pred['GHI_Acceleration'] = 0
-                
-                for window in [3, 6, 12]:
-                    df_pred[f'GHI_EMA_{window}h'] = df_pred['GHI - W/m^2']
-                    df_pred[f'GHI_Ratio_EMA_{window}h'] = df_pred['GHI_Clear_Sky_Ratio']
-                
-                for lag in [1, 2, 3]:
-                    df_pred[f'GHI_{lag}h_lag'] = df_pred['GHI - W/m^2']
-                    df_pred[f'Clear_Sky_Ratio_{lag}h_lag'] = df_pred['GHI_Clear_Sky_Ratio']
-                    df_pred[f'Clear_Sky_GHI_{lag}h_lag'] = df_pred['Clear_Sky_GHI_Adjusted']
-            
-            # Add interaction features
-            df_pred['GHI_UV_Interaction'] = df_pred['GHI - W/m^2'] * df_pred['UV Index']
-            df_pred['Temp_Humidity_Interaction'] = df_pred['Temp - Â°C'] * df_pred['Hum - %']
-            df_pred['GHI_Temp_Interaction'] = df_pred['GHI - W/m^2'] * df_pred['Temp - Â°C']
-            df_pred['GHI_Wind_Interaction'] = df_pred['GHI - W/m^2'] * np.log1p(df_pred['Avg Wind Speed - km/h'])
-            
-            # Ensure all required features are present
-            missing_features = [col for col in self.feature_columns if col not in df_pred.columns]
-            if missing_features:
-                print("Warning: Missing features:", missing_features)
-                for feature in missing_features:
-                    df_pred[feature] = 0  # Add missing features with default values
-            
-            # Get features in correct order
-            X_pred = df_pred[self.feature_columns].values
-            
-            # Scale features
-            X_pred_scaled = self.features_scaler.transform(X_pred)
+            # Use prepare_prediction_data to handle all feature engineering properly
+            X_pred_scaled = self.prepare_prediction_data(new_row)
             
             # Make predictions with intervals
             predictions_median, predictions_lower, predictions_upper = self.predict_xgboost(X_pred_scaled)
@@ -1080,78 +1348,139 @@ class WeatherPredictor:
             self.save_to_csv(new_row, predictions_median)
             
             return predictions_median, predictions_lower, predictions_upper
-            
+        
         except Exception as e:
             print(f"Error in prediction: {str(e)}")
-            print("Available columns:", df_pred.columns.tolist())
-            print("Required features:", self.feature_columns)
+            traceback.print_exc()
             raise
 
     def save_to_csv(self, input_data, predictions):
-        """Save only input data to CSV file with proper time handling"""
+        """Save input data and predictions to CSV file with all required fields"""
         try:
+            # Standardize column names for consistency
+            if 'Start_period' in input_data and 'Start Period' not in input_data:
+                input_data['Start Period'] = input_data.pop('Start_period')
+            if 'End_period' in input_data and 'End Period' not in input_data:
+                input_data['End Period'] = input_data.pop('End_period')
+            
             script_dir = os.path.dirname(os.path.abspath(__file__))
             csv_path = os.path.join(script_dir, 'dataset.csv')
             
-            # Read existing CSV
-            df = pd.read_csv(csv_path)
+            # Determine which encoding to use by checking existing file
+            file_encoding = 'latin-1'  # Default to latin-1 for better special character handling
             
-            # Determine the date format from existing data
-            sample_date = df['Date'].iloc[0]
-            date_format = '%Y-%m-%d' if '-' in sample_date else '%m/%d/%Y'
+            try:
+                # Check if file exists and determine its encoding
+                if os.path.exists(csv_path):
+                    # Try to detect encoding from existing file
+                    try:
+                        with open(csv_path, 'rb') as f:
+                            result = chardet.detect(f.read())
+                            detected_encoding = result['encoding']
+                            if detected_encoding and result['confidence'] > 0.7:
+                                file_encoding = detected_encoding
+                    except:
+                        pass  # If detection fails, use the default
+                    
+                    # Read with detected or default encoding
+                    try:
+                        existing_df = pd.read_csv(csv_path, encoding=file_encoding)
+                    except:
+                        # Fall back to latin-1 which usually works with Windows files
+                        file_encoding = 'latin-1'
+                        existing_df = pd.read_csv(csv_path, encoding=file_encoding)
+                    
+                    # Remove any prediction columns if they exist
+                    prediction_columns = [col for col in existing_df.columns if 'Prediction_Hour_' in col]
+                    if prediction_columns:
+                        existing_df = existing_df.drop(columns=prediction_columns)
+                else:
+                    # Create empty DataFrame with necessary columns
+                    existing_df = pd.DataFrame(columns=[
+                        'Date', 'Start Period', 'End Period', 'Barometer - hPa', 
+                        'Temp - °C', 'Hum - %', 'Dew Point - °C', 'Wet Bulb - °C',
+                        'Avg Wind Speed - km/h', 'Wind Run - km', 'UV Index', 'GHI - W/m^2',
+                        'Day of Year', 'Month of Year', 'Hour of Day', 'Solar Zenith Angle', 
+                        'GHI_lag (t-1)', 'Daytime'
+                    ])
+            except Exception as e:
+                print(f"Error reading existing CSV: {str(e)}")
+                # Create empty DataFrame
+                existing_df = pd.DataFrame()
             
-            # Convert input date to match the format in CSV
-            input_date = datetime.strptime(input_data['Date'], '%Y-%m-%d')
-            formatted_date = input_date.strftime(date_format)
+            # Format date to the required format: %d-%b-%y (e.g., "3-Mar-25")
+            date_str = input_data['Date']
+            date_obj = pd.to_datetime(date_str)
+            formatted_date = date_obj.strftime('%d-%b-%y')
             
-            # Create new row with input data using the correct date format
+            # Format start and end times to HH:MM:SS
+            start_time_str = input_data['Start Period']
+            end_time_str = input_data['End Period']
+            
+            # Parse and format time strings
+            try:
+                if ':' in start_time_str:
+                    start_time_obj = pd.to_datetime(start_time_str).time()
+                else:
+                    start_hour = float(start_time_str)
+                    start_time_obj = pd.to_datetime(f"{int(start_hour)}:{int((start_hour % 1) * 60)}").time()
+            except:
+                start_time_obj = datetime.now().replace(minute=0, second=0, microsecond=0).time()
+                
+            try:
+                if ':' in end_time_str:
+                    end_time_obj = pd.to_datetime(end_time_str).time()
+                else:
+                    end_hour = float(end_time_str)
+                    end_time_obj = pd.to_datetime(f"{int(end_hour)}:{int((end_hour % 1) * 60)}").time()
+            except:
+                end_time_obj = (datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).time()
+                
+            formatted_start = start_time_obj.strftime('%H:%M:%S')
+            formatted_end = end_time_obj.strftime('%H:%M:%S')
+            
+            # Set GHI_lag to current GHI value
+            ghi_lag_value = input_data['GHI - W/m^2']
+            
+            # Ensure special characters in column names are preserved
+            temperature_col = 'Temp - °C'
+            dew_point_col = 'Dew Point - °C'
+            wet_bulb_col = 'Wet Bulb - °C'
+            
+            # Include all required fields with carefully preserved column names
             new_row = {
                 'Date': formatted_date,
-                'Start_period': input_data['Start_period'],
-                'End_period': input_data['End_period'],
+                'Start Period': formatted_start,
+                'End Period': formatted_end,
                 'Barometer - hPa': input_data['Barometer - hPa'],
-                'Temp - Â°C': input_data['Temp - Â°C'],
+                temperature_col: input_data['Temp - °C'],
                 'Hum - %': input_data['Hum - %'],
-                'Dew Point - Â°C': input_data['Dew Point - Â°C'],
-                'Wet Bulb - Â°C': input_data['Wet Bulb - Â°C'],
+                dew_point_col: input_data['Dew Point - °C'],
+                wet_bulb_col: input_data['Wet Bulb - °C'],
                 'Avg Wind Speed - km/h': input_data['Avg Wind Speed - km/h'],
                 'Wind Run - km': input_data['Wind Run - km'],
                 'UV Index': input_data['UV Index'],
                 'GHI - W/m^2': input_data['GHI - W/m^2'],
-                'Solar Zenith Angle': input_data['Solar Zenith Angle'],
-                'Solar Elevation Angle': input_data['Solar Elevation Angle'],
-                'Clearness Index': input_data['Clearness Index'],
+                'Day of Year': input_data['Day of Year'],
+                'Month of Year': input_data['Month of Year'],
                 'Hour of Day': input_data['Hour of Day'],
-                'Day of Year': input_data['Day of Year']
+                'Solar Zenith Angle': input_data['Solar Zenith Angle'],
+                'GHI_lag (t-1)': ghi_lag_value,
+                'Daytime': input_data['Daytime']
             }
             
-            # Create DataFrame from new row
-            new_df = pd.DataFrame([new_row])
-            
             # Append new row to existing DataFrame
-            df = pd.concat([df, new_df], ignore_index=True)
+            new_row_df = pd.DataFrame([new_row])
+            updated_df = pd.concat([existing_df, new_row_df], ignore_index=True)
             
-            # Sort by date and time
-            # Convert dates to datetime for sorting, handling both formats
-            def parse_date(date_str, time_str):
-                try:
-                    if '-' in date_str:
-                        return pd.to_datetime(f"{date_str} {time_str}", format='%Y-%m-%d %H:%M')
-                    else:
-                        return pd.to_datetime(f"{date_str} {time_str}", format='%m/%d/%Y %H:%M')
-                except:
-                    return pd.to_datetime(f"{date_str} {time_str}")
-            
-            df['datetime'] = df.apply(lambda x: parse_date(x['Date'], x['Start_period']), axis=1)
-            df = df.sort_values('datetime')
-            df = df.drop('datetime', axis=1)
-            
-            # Save back to CSV
-            df.to_csv(csv_path, index=False)
-            print(f"\nSaved input data to {csv_path}")
+            # Save with the same encoding as we read with
+            updated_df.to_csv(csv_path, index=False, encoding=file_encoding)
+            print(f"\nData saved to {csv_path} using {file_encoding} encoding")
             
         except Exception as e:
             print(f"Error saving to CSV: {str(e)}")
+            if 'input_data' in locals():
+                print("Keys in input_data:", list(input_data.keys()))
             raise
 
     def custom_metric(self, y_true, y_pred):
@@ -1176,34 +1505,42 @@ class WeatherPredictor:
         try:
             df_clean = df.copy()
             
-            # Basic preprocessing (keep existing)
-            df_clean['datetime'] = pd.to_datetime(df_clean['Date'] + ' ' + df_clean['Start_period'])
+            # Basic preprocessing with updated column names
+            df_clean['datetime'] = pd.to_datetime(df_clean['Date'] + ' ' + df_clean['Start Period'])
             df_clean.set_index('datetime', inplace=True)
             df_clean = df_clean.sort_index()
             
-            # Enhanced time features (keep existing)
+            # Enhanced time features 
             df_clean['Hour_Sin'] = np.sin(2 * np.pi * df_clean['Hour of Day'] / 24)
             df_clean['Hour_Cos'] = np.cos(2 * np.pi * df_clean['Hour of Day'] / 24)
             df_clean['Day_Sin'] = np.sin(2 * np.pi * df_clean['Day of Year'] / 365)
             df_clean['Day_Cos'] = np.cos(2 * np.pi * df_clean['Day of Year'] / 365)
             
-            # IMPROVED: Better solar position features
+            # Month cyclical features
+            df_clean['Month_Sin'] = np.sin(2 * np.pi * df_clean['Month of Year'] / 12)
+            df_clean['Month_Cos'] = np.cos(2 * np.pi * df_clean['Month of Year'] / 12)
+            
+            # Solar position features
             df_clean['Cos_Hour_Angle'] = np.cos(np.radians(15 * (df_clean['Hour of Day'] - 12)))
             df_clean['Sin_Solar_Elevation'] = np.sin(np.radians(df_clean['Solar Elevation Angle']))
             df_clean['Clear_Sky_GHI'] = self.SOLAR_CONSTANT * df_clean['Sin_Solar_Elevation']
             
-            # IMPROVED: Enhanced atmospheric model with humidity and temperature effects
+            # Enhanced atmospheric model with humidity and temperature effects
             df_clean['Air_Mass'] = 1 / (df_clean['Sin_Solar_Elevation'].clip(0.001, 1))
             df_clean['Air_Mass'] = df_clean['Air_Mass'].clip(1, 38)
             
-            # New temperature-adjusted atmospheric attenuation
-            temp_factor = (df_clean['Temp - Â°C'] + 273.15) / 298.15  # Normalize to 25°C
+            # Temperature-adjusted atmospheric attenuation
+            temp_factor = (df_clean['Temp - °C'] + 273.15) / 298.15  # Normalize to 25°C
             humidity_factor = 1 + (df_clean['Hum - %'] / 100) * 0.1  # Humidity effect
             df_clean['Atmospheric_Attenuation'] = (0.7 ** (df_clean['Air_Mass'] * humidity_factor)) * temp_factor
             df_clean['Clear_Sky_GHI_Adjusted'] = df_clean['Clear_Sky_GHI'] * df_clean['Atmospheric_Attenuation']
             
-            # IMPROVED: Better rapid change detection
-            df_clean['GHI_Change'] = df_clean['GHI - W/m^2'].diff()
+            # Better rapid change detection - use GHI_lag if available
+            if 'GHI_lag (t-1)' in df_clean.columns:
+                df_clean['GHI_Change'] = df_clean['GHI - W/m^2'] - df_clean['GHI_lag (t-1)']
+            else:
+                df_clean['GHI_Change'] = df_clean['GHI - W/m^2'].diff()
+                
             df_clean['GHI_Change_Rate'] = df_clean['GHI_Change'] / df_clean['Clear_Sky_GHI_Adjusted'].clip(1, None)
             df_clean['GHI_Acceleration'] = df_clean['GHI_Change'].diff()
             
@@ -1211,13 +1548,17 @@ class WeatherPredictor:
             df_clean['Normalized_Change'] = df_clean['GHI_Change'] / df_clean['Clear_Sky_GHI'].clip(1, None)
             df_clean['Is_Rapid_Change'] = (abs(df_clean['Normalized_Change']) > 0.1).astype(int)
             
-            # IMPROVED: Enhanced transition period detection
+            # Use Daytime column if available, otherwise calculate
+            if 'Daytime' not in df_clean.columns:
+                df_clean['Daytime'] = (df_clean['Solar Elevation Angle'] > 0).astype(int)
+            
+            # Enhanced transition period detection
             df_clean['Is_Transition'] = (
-                ((df_clean['Solar Elevation Angle'] > -5) & (df_clean['Solar Elevation Angle'] < 15)) |  # Wider range
-                ((df_clean['GHI - W/m^2'] > 0) & (df_clean['GHI - W/m^2'] < 100))  # Higher threshold
+                ((df_clean['Solar Elevation Angle'] > -5) & (df_clean['Solar Elevation Angle'] < 15)) |  
+                ((df_clean['GHI - W/m^2'] > 0) & (df_clean['GHI - W/m^2'] < 100))  
             ).astype(int)
             
-            # IMPROVED: More sophisticated weather condition detection
+            # More sophisticated weather condition detection
             df_clean['GHI_Clear_Sky_Ratio'] = np.where(
                 df_clean['Clear_Sky_GHI_Adjusted'] > 10,
                 df_clean['GHI - W/m^2'] / df_clean['Clear_Sky_GHI_Adjusted'],
@@ -1239,11 +1580,11 @@ class WeatherPredictor:
                                           (df_clean['GHI_Clear_Sky_Ratio'] <= 0.5)).astype(int)
             df_clean['Is_Overcast'] = (df_clean['GHI_Clear_Sky_Ratio'] <= 0.2).astype(int)
             
-            # IMPROVED: Enhanced temporal features with better smoothing
+            # Enhanced temporal features with better smoothing
             df_clean['Recent_Variability'] = df_clean['GHI_Change'].rolling(window=5, center=True).std()
             df_clean['Recent_Trend'] = df_clean['GHI_Change'].rolling(window=5, center=True).mean()
             
-            # IMPROVED: Better handling of rolling statistics
+            # Better handling of rolling statistics
             for window in [3, 6, 12]:
                 # Centered rolling statistics for better accuracy
                 df_clean[f'GHI_{window}h_mean'] = df_clean['GHI - W/m^2'].rolling(
@@ -1268,26 +1609,48 @@ class WeatherPredictor:
                     df_clean['Clear_Sky_GHI_Adjusted'].clip(1, None)
                 )
             
-            # IMPROVED: Enhanced lag features
-            for lag in [1, 2, 3]:
-                df_clean[f'GHI_{lag}h_lag'] = df_clean['GHI - W/m^2'].shift(lag)
-                df_clean[f'GHI_Change_{lag}h'] = df_clean['GHI - W/m^2'].diff(lag)
-                df_clean[f'Clear_Sky_Ratio_{lag}h_lag'] = df_clean['GHI_Clear_Sky_Ratio'].shift(lag)
-                df_clean[f'Clear_Sky_GHI_{lag}h_lag'] = df_clean['Clear_Sky_GHI_Adjusted'].shift(lag)
+            # Use GHI_lag feature directly if available, otherwise create lag features
+            if 'GHI_lag (t-1)' in df_clean.columns:
+                lag_features = ['GHI_lag (t-1)']
                 
-                # Add normalized lag changes
-                df_clean[f'Normalized_Change_{lag}h'] = (
-                    df_clean[f'GHI_Change_{lag}h'] / 
-                    df_clean['Clear_Sky_GHI_Adjusted'].clip(1, None)
+                # Normalize GHI_lag by Clear Sky GHI
+                df_clean['GHI_lag_ratio'] = np.where(
+                    df_clean['Clear_Sky_GHI_Adjusted'] > 10,
+                    df_clean['GHI_lag (t-1)'] / df_clean['Clear_Sky_GHI_Adjusted'],
+                    0
                 )
+                lag_features.append('GHI_lag_ratio')
+            else:
+                # Enhanced lag features if GHI_lag isn't provided directly
+                lag_features = []
+                for lag in [1, 2, 3]:
+                    df_clean[f'GHI_{lag}h_lag'] = df_clean['GHI - W/m^2'].shift(lag)
+                    df_clean[f'GHI_Change_{lag}h'] = df_clean['GHI - W/m^2'].diff(lag)
+                    df_clean[f'Clear_Sky_Ratio_{lag}h_lag'] = df_clean['GHI_Clear_Sky_Ratio'].shift(lag)
+                    df_clean[f'Clear_Sky_GHI_{lag}h_lag'] = df_clean['Clear_Sky_GHI_Adjusted'].shift(lag)
+                    
+                    # Add normalized lag changes
+                    df_clean[f'Normalized_Change_{lag}h'] = (
+                        df_clean[f'GHI_Change_{lag}h'] / 
+                        df_clean['Clear_Sky_GHI_Adjusted'].clip(1, None)
+                    )
+                    lag_features.extend([
+                        f'GHI_{lag}h_lag', f'GHI_Change_{lag}h', 
+                        f'Clear_Sky_Ratio_{lag}h_lag', f'Clear_Sky_GHI_{lag}h_lag', 
+                        f'Normalized_Change_{lag}h'
+                    ])
             
-            # IMPROVED: Enhanced weather interaction features
+            # Enhanced weather interaction features
             df_clean['GHI_UV_Interaction'] = df_clean['GHI - W/m^2'] * df_clean['UV Index']
-            df_clean['Temp_Humidity_Interaction'] = df_clean['Temp - Â°C'] * df_clean['Hum - %']
-            df_clean['GHI_Temp_Interaction'] = df_clean['GHI - W/m^2'] * df_clean['Temp - Â°C']
+            df_clean['Temp_Humidity_Interaction'] = df_clean['Temp - °C'] * df_clean['Hum - %']
+            df_clean['GHI_Temp_Interaction'] = df_clean['GHI - W/m^2'] * df_clean['Temp - °C']
             df_clean['GHI_Wind_Interaction'] = df_clean['GHI - W/m^2'] * np.log1p(df_clean['Avg Wind Speed - km/h'])
             
-            # Handle missing values (keep existing sophisticated approach)
+            # Daytime interaction features
+            df_clean['Daytime_GHI_Interaction'] = df_clean['Daytime'] * df_clean['GHI - W/m^2']
+            df_clean['Daytime_Temp_Interaction'] = df_clean['Daytime'] * df_clean['Temp - °C']
+            
+            # Handle missing values
             df_clean = self._handle_missing_values(df_clean)
             
             # Store historical values
@@ -1296,7 +1659,7 @@ class WeatherPredictor:
             ].copy()
             
             # Update feature columns
-            self._update_feature_columns(df_clean)
+            self._update_feature_columns(df_clean, lag_features)
             
             # Prepare features and target
             X = df_clean[self.feature_columns].values
@@ -1336,15 +1699,27 @@ class WeatherPredictor:
         
         return df
     
-    def _update_feature_columns(self, df):
+    def _update_feature_columns(self, df, lag_features=[]):
         """Update feature columns list with new features"""
         base_features = [
+            'Temp - °C',          # Updated column name
+            'Hum - %',
+            'Dew Point - °C',     # Updated column name
+            'Wet Bulb - °C',      # Updated column name
+            'Barometer - hPa',
+            'Avg Wind Speed - km/h',
+            'Wind Run - km',
+            'UV Index',
+            'GHI_lag (t-1)',      # New column from dataset
+            'Daytime',            # New column from dataset
+            'Month of Year',      # New column from dataset
             'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos',
+            'Month_Sin', 'Month_Cos',  # New month cyclical features
             'Cos_Hour_Angle', 'Sin_Solar_Elevation',
             'Clear_Sky_GHI', 'Clear_Sky_GHI_Adjusted',
             'GHI_Clear_Sky_Ratio', 'Air_Mass', 'Atmospheric_Attenuation',
             'Solar Zenith Angle', 'Solar Elevation Angle',
-            'Hour of Day', 'Day of Year'  # Added core temporal features
+            'Hour of Day', 'Day of Year'
         ]
         
         condition_features = [
@@ -1358,60 +1733,95 @@ class WeatherPredictor:
             'Recent_Variability', 'Recent_Trend'
         ]
         
+        interaction_features = [
+            'GHI_UV_Interaction', 'Temp_Humidity_Interaction',
+            'GHI_Temp_Interaction', 'GHI_Wind_Interaction',
+            'Daytime_GHI_Interaction', 'Daytime_Temp_Interaction'
+        ]
+        
+        # Combine all features
         self.feature_columns = (
             base_features +
             condition_features +
             change_features +
+            interaction_features +
+            lag_features +
             [col for col in df.columns if any(
                 pattern in col for pattern in [
                     'GHI_Variability_', 'GHI_Volatility_',
-                    '_persistence', 'EMA_', '_lag', '_Interaction'
+                    '_persistence', 'EMA_', '_mean', '_std'
                 ]
             )]
         )
+        
+        # Remove duplicates
+        self.feature_columns = list(dict.fromkeys(self.feature_columns))
+        
+        # Remove any features not in dataframe
+        self.feature_columns = [col for col in self.feature_columns if col in df.columns]
 
     def get_input_data(self):
-        """Get input data from user with validation"""
+        """Get input data from user with validation - updated for new dataset format"""
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             csv_path = os.path.join(script_dir, 'dataset.csv')
             
-            # Read existing CSV and get last timestamp
-            df = pd.read_csv(csv_path)
-            
-            # Handle different date formats
+            # Read existing CSV and get last timestamp - FIX: Add proper encoding handling
             try:
-                df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['End_period'])
+                # First attempt with latin-1 encoding (commonly works with Windows files)
+                df = pd.read_csv(csv_path, encoding='latin-1')
             except:
-                df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['End_period'], format='%m/%d/%Y %H:%M')
+                try:
+                    # Second attempt with cp1252 encoding
+                    df = pd.read_csv(csv_path, encoding='cp1252')
+                except:
+                    # Third attempt with ISO-8859-1
+                    df = pd.read_csv(csv_path, encoding='ISO-8859-1')
+            
+            # Handle different date formats with updated column names
+            try:
+                df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['End Period'])
+            except:
+                df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['End Period'], format='%m/%d/%Y %H:%M')
             
             # Get the last end time
             last_end_time = df['datetime'].max()
             
-            # Set the next period (XX:05 to (XX+1):00)
-            next_start = last_end_time.replace(minute=5)  # Start at XX:05
+            # Set the next period (XX:00 to (XX+1):00)
+            next_start = last_end_time.replace(minute=0)  # Start at XX:00
             next_end = (next_start + timedelta(hours=1)).replace(minute=0)  # End at (XX+1):00
+            
+            # Use end hour for solar calculations instead of midpoint
+            calculation_time = next_end  # This will be 11:00 for the 10:00-11:00 period
             
             print(f"\nEntering weather data for period:")
             print(f"From: {next_start.strftime('%Y-%m-%d %H:%M')}")
             print(f"To: {next_end.strftime('%Y-%m-%d %H:%M')}")
             
+            # Calculate previous GHI value for GHI_lag feature
+            try:
+                last_ghi = df.iloc[-1]['GHI - W/m^2']
+            except:
+                last_ghi = 0
+            
             # Get current time
             input_data = {
                 'Date': next_start.strftime('%Y-%m-%d'),
-                'Start_period': next_start.strftime('%H:%M'),
-                'End_period': next_end.strftime('%H:%M'),
-                'Hour of Day': next_start.hour + next_start.minute/60,
-                'Day of Year': next_start.timetuple().tm_yday
+                'Start Period': next_start.strftime('%H:%M'),
+                'End Period': next_end.strftime('%H:%M'),
+                'Hour of Day': calculation_time.hour + calculation_time.minute/60,  # Use 11.0 for 11:00
+                'Day of Year': calculation_time.timetuple().tm_yday,
+                'Month of Year': calculation_time.month,
+                'GHI_lag (t-1)': last_ghi
             }
             
             print("\nEnter weather data:")
             input_data.update({
                 'Barometer - hPa': float(input("Barometer (hPa): ")),
-                'Temp - Â°C': float(input("Temperature (°C): ")),
+                'Temp - °C': float(input("Temperature (°C): ")),
                 'Hum - %': float(input("Humidity (%): ")),
-                'Dew Point - Â°C': float(input("Dew Point (°C): ")),
-                'Wet Bulb - Â°C': float(input("Wet Bulb (°C): ")),
+                'Dew Point - °C': float(input("Dew Point (°C): ")),
+                'Wet Bulb - °C': float(input("Wet Bulb (°C): ")),
                 'Avg Wind Speed - km/h': float(input("Average Wind Speed (km/h): ")),
                 'Wind Run - km': float(input("Wind Run (km): ")),
                 'UV Index': float(input("UV Index: ")),
@@ -1421,13 +1831,17 @@ class WeatherPredictor:
             # Calculate solar parameters
             solar_angles = self.compute_solar_angles(pd.Series(input_data))
             input_data['Solar Zenith Angle'] = solar_angles['Solar Zenith Angle']
+            # We still need this for internal calculations, but won't display it
             input_data['Solar Elevation Angle'] = solar_angles['Solar Elevation Angle']
             
-            # Calculate clearness index using the new method
+            # Calculate clearness index
             input_data['Clearness Index'] = self.compute_clearness_index(
                 input_data['GHI - W/m^2'],
                 input_data['Solar Zenith Angle']
             )
+            
+            # Set Daytime flag based on hour of day instead of solar elevation
+            input_data['Daytime'] = 1 if (input_data['Hour of Day'] >= 6 and input_data['Hour of Day'] <= 18) else 0
             
             # If clearness index is NaN, set it to 0
             if np.isnan(input_data['Clearness Index']):
@@ -1435,8 +1849,7 @@ class WeatherPredictor:
             
             print("\nComputed parameters:")
             print(f"Solar Zenith Angle: {input_data['Solar Zenith Angle']:.2f}°")
-            print(f"Solar Elevation Angle: {input_data['Solar Elevation Angle']:.2f}°")
-            print(f"Clearness Index: {input_data['Clearness Index']:.4f}")
+            print(f"Daytime: {input_data['Daytime']}")
             
             return input_data
             
@@ -1550,11 +1963,16 @@ class WeatherPredictor:
     def compute_solar_angles(self, row):
         """Compute solar angles for a given row of data"""
         try:
-            # Calculate declination
+            # Print inputs for debugging
+            print(f"Computing solar angles with: Day of Year={row['Day of Year']}, Hour of Day={row['Hour of Day']}, Latitude={self.lat}")
+            
+            # Calculate declination based on day of year
             declination = np.radians(23.45 * np.sin(np.radians(360/365 * (row['Day of Year'] + 284))))
+            print(f"Declination: {np.degrees(declination):.4f}°")
             
             # Calculate hour angle
             hour_angle = np.radians(15 * (row['Hour of Day'] - 12))
+            print(f"Hour angle: {np.degrees(hour_angle):.4f}°")
             
             # Convert latitude to radians
             latitude_rad = np.radians(self.lat)
@@ -1568,6 +1986,25 @@ class WeatherPredictor:
             # Compute solar zenith angle
             solar_zenith_angle = np.pi/2 - solar_elevation_angle
             
+            # Print intermediate calculation values
+            print(f"sin(latitude): {np.sin(latitude_rad):.6f}")
+            print(f"sin(declination): {np.sin(declination):.6f}")
+            print(f"cos(latitude): {np.cos(latitude_rad):.6f}")
+            print(f"cos(declination): {np.cos(declination):.6f}")
+            print(f"cos(hour_angle): {np.cos(hour_angle):.6f}")
+            
+            # Print each term in the elevation angle calculation
+            term1 = np.sin(latitude_rad) * np.sin(declination)
+            term2 = np.cos(latitude_rad) * np.cos(declination) * np.cos(hour_angle)
+            print(f"Term 1 (sin(lat)*sin(decl)): {term1:.6f}")
+            print(f"Term 2 (cos(lat)*cos(decl)*cos(hour)): {term2:.6f}")
+            print(f"Sum of terms: {term1 + term2:.6f}")
+            
+            print(f"Solar zenith angle: {np.degrees(solar_zenith_angle):.4f}°")
+            # Remove solar elevation angle print
+            
+            # We'll still return both values as they might be used internally,
+            # but we won't display the elevation angle to the user
             return pd.Series({
                 'Solar Zenith Angle': np.degrees(solar_zenith_angle),
                 'Solar Elevation Angle': np.degrees(solar_elevation_angle)
@@ -1596,6 +2033,26 @@ class WeatherPredictor:
         except Exception as e:
             print(f"Error in compute_clearness_index: {str(e)}")
             return np.nan
+
+    # Add this as a new method
+    def calculate_solar_time(self, local_hour, day_of_year):
+        """Convert local time to solar time"""
+        # Standard meridian for Philippines time (PHT/GMT+8)
+        standard_meridian = 120  # 120° E
+        
+        # Calculate equation of time (minutes)
+        b = (360/365) * (day_of_year - 81)  # in degrees
+        eot = 9.87 * np.sin(2*np.radians(b)) - 7.53 * np.cos(np.radians(b)) - 1.5 * np.sin(np.radians(b))
+        
+        # Time correction factor (minutes)
+        tc = 4 * (self.lon - standard_meridian) + eot  # 4 minutes per degree longitude difference
+        
+        # Convert local time to solar time (decimal hours)
+        solar_time = local_hour + tc/60
+        
+        print(f"Local time: {local_hour:.2f}, Solar time: {solar_time:.2f} (correction: {tc/60:.2f} hours)")
+        
+        return solar_time
 
 if __name__ == "__main__":
     try:
@@ -1665,20 +2122,54 @@ if __name__ == "__main__":
                             print("\nSummary of Predictions:")
                             print("=" * 60)
                             
-                            # Get the input time from the last row of dataset.csv
-                            script_dir = os.path.dirname(os.path.abspath(__file__))
-                            df = pd.read_csv(os.path.join(script_dir, 'dataset.csv'))
-                            last_row = df.iloc[-1]
-                            start_time = last_row['Start_period']
-                            
-                            # Check if it's 7:05-8:00 period
-                            is_seven_to_eight = start_time == '07:05'
+                            # Fix for the summary section code that reads the CSV file to determine time
+                            try:
+                                # Get the input time from the last row of dataset.csv
+                                script_dir = os.path.dirname(os.path.abspath(__file__))
+                                csv_path = os.path.join(script_dir, 'dataset.csv')
+                                
+                                # Default value in case we fail to read the CSV
+                                start_time = "Unknown"
+                                
+                                # Try to read the CSV with appropriate encoding detection
+                                try:
+                                    # Try to detect the encoding first
+                                    with open(csv_path, 'rb') as f:
+                                        result = chardet.detect(f.read())
+                                        detected_encoding = result['encoding']
+                                        if not detected_encoding or result['confidence'] < 0.7:
+                                            detected_encoding = 'latin-1'  # Default to latin-1
+                                except:
+                                    detected_encoding = 'latin-1'  # Default encoding if detection fails
+                                
+                                # Now read the CSV with the detected encoding
+                                try:
+                                    last_row = pd.read_csv(csv_path, encoding=detected_encoding).iloc[-1]
+                                    
+                                    # Use 'Start Period' with space instead of 'Start_period'
+                                    if 'Start Period' in last_row:
+                                        start_time = last_row['Start Period']
+                                    elif 'Start_period' in last_row:  # Fallback for backward compatibility
+                                        start_time = last_row['Start_period']
+                                except Exception as e:
+                                    print(f"Warning: Could not read last prediction time: {str(e)}")
+                                    # start_time remains the default "Unknown"
+                                
+                                # Check if it's 7:00-8:00 period
+                                is_seven_to_eight = start_time == '07:00' or start_time == '07:00:00'
+                                
+                            except Exception as e:
+                                print(f"Error during prediction summary: {str(e)}")
+                                traceback.print_exc()
+                                # Set default values if anything fails
+                                start_time = "Unknown"
+                                is_seven_to_eight = False
                             
                             for hour in range(predictor.FORECAST_HOURS):
                                 print(f"\nHour {hour+1} Forecast:")
                                 print("-" * 40)
                                 
-                                # Double the bounds only for Hour 1 if it's 7:05-8:00
+                                # Double the bounds only for Hour 1 if it's 7:00-8:00
                                 if hour == 0 and is_seven_to_eight:
                                     doubled_upper = predictions_upper[0][hour] * 2.2
                                     doubled_lower = predictions_lower[0][hour] * 2
