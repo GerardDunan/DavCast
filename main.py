@@ -8,6 +8,8 @@ from datetime import datetime
 import os
 import optuna
 import logging  # Add logging import
+import joblib
+import json
 
 class GHIPredictionModel:
     def __init__(self):
@@ -2096,7 +2098,7 @@ class GHIPredictionModel:
 
     def create_features_for_prediction(self, data):
         """
-        Create features specifically for prediction without creating target variables.
+        Create features for a single prediction.
         
         Parameters:
         -----------
@@ -2140,24 +2142,159 @@ class GHIPredictionModel:
         
         # Only return the last row which has all the lagged features filled
         return df.iloc[[-1]].copy()
+        
+    def save_models(self, model_dir='davcast'):
+        """
+        Save all trained models and scalers to files.
+        
+        Parameters:
+        -----------
+        model_dir (str): Directory to save the models
+        """
+        print(f"Saving models and scalers to {model_dir}...")
+        
+        # Create directory if it doesn't exist
+        os.makedirs(model_dir, exist_ok=True)
+        
+        # Save feature columns to JSON
+        with open(os.path.join(model_dir, 'feature_columns.json'), 'w') as f:
+            json.dump(self.feature_columns, f)
+        
+        # Save scalers
+        joblib.dump(self.scaler, os.path.join(model_dir, 'features_scaler.joblib'))
+        
+        # Save each forecast horizon model
+        for horizon in self.forecast_horizons:
+            # Save median model
+            if horizon in self.models_median:
+                self.models_median[horizon].save_model(os.path.join(model_dir, f'xgboost_model_hour_{horizon}.json'))
+            
+            # Save lower bound model
+            if horizon in self.models_lower:
+                self.models_lower[horizon].save_model(os.path.join(model_dir, f'xgboost_model_lower_hour_{horizon}.json'))
+            
+            # Save upper bound model
+            if horizon in self.models_upper:
+                self.models_upper[horizon].save_model(os.path.join(model_dir, f'xgboost_model_upper_hour_{horizon}.json'))
+        
+        # Save error percentiles if available
+        if hasattr(self, 'error_percentiles') and self.error_percentiles:
+            joblib.dump(self.error_percentiles, os.path.join(model_dir, 'error_percentiles.joblib'))
+        
+        print(f"Models and scalers saved successfully to {model_dir}")
+    
+    def load_models(self, model_dir='davcast'):
+        """
+        Load all trained models and scalers from files.
+        
+        Parameters:
+        -----------
+        model_dir (str): Directory to load the models from
+        
+        Returns:
+        --------
+        bool: True if models loaded successfully, False otherwise
+        """
+        print(f"Loading models and scalers from {model_dir}...")
+        
+        try:
+            # Load feature columns
+            feature_columns_path = os.path.join(model_dir, 'feature_columns.json')
+            if os.path.exists(feature_columns_path):
+                with open(feature_columns_path, 'r') as f:
+                    self.feature_columns = json.load(f)
+                print(f"Loaded {len(self.feature_columns)} feature columns")
+            else:
+                print(f"Warning: Feature columns file not found at {feature_columns_path}")
+                return False
+            
+            # Load scaler
+            scaler_path = os.path.join(model_dir, 'features_scaler.joblib')
+            if os.path.exists(scaler_path):
+                self.scaler = joblib.load(scaler_path)
+                print("Loaded feature scaler")
+            else:
+                print(f"Warning: Scaler file not found at {scaler_path}")
+                return False
+            
+            # Initialize model dictionaries
+            self.models_median = {}
+            self.models_lower = {}
+            self.models_upper = {}
+            
+            # Load each forecast horizon model
+            for horizon in self.forecast_horizons:
+                # Load median model
+                median_model_path = os.path.join(model_dir, f'xgboost_model_hour_{horizon}.json')
+                if os.path.exists(median_model_path):
+                    self.models_median[horizon] = xgb.XGBRegressor()
+                    self.models_median[horizon].load_model(median_model_path)
+                    print(f"Loaded median model for horizon {horizon}h")
+                else:
+                    print(f"Warning: Median model for horizon {horizon}h not found")
+                    return False
+                
+                # Load lower bound model
+                lower_model_path = os.path.join(model_dir, f'xgboost_model_lower_hour_{horizon}.json')
+                if os.path.exists(lower_model_path):
+                    self.models_lower[horizon] = xgb.XGBRegressor()
+                    self.models_lower[horizon].load_model(lower_model_path)
+                    print(f"Loaded lower bound model for horizon {horizon}h")
+                
+                # Load upper bound model
+                upper_model_path = os.path.join(model_dir, f'xgboost_model_upper_hour_{horizon}.json')
+                if os.path.exists(upper_model_path):
+                    self.models_upper[horizon] = xgb.XGBRegressor()
+                    self.models_upper[horizon].load_model(upper_model_path)
+                    print(f"Loaded upper bound model for horizon {horizon}h")
+            
+            # Load error percentiles if available
+            error_percentiles_path = os.path.join(model_dir, 'error_percentiles.joblib')
+            if os.path.exists(error_percentiles_path):
+                self.error_percentiles = joblib.load(error_percentiles_path)
+                print("Loaded error percentiles for calibrated intervals")
+            
+            print("All models and scalers loaded successfully")
+            return True
+            
+        except Exception as e:
+            print(f"Error loading models: {str(e)}")
+            return False
 
 
 # Main execution
 if __name__ == "__main__":
-    def train_model():
+    import os
+    
+    def display_menu():
+        """Display the main menu options"""
+        print("\n===== GHI Prediction Model Menu =====")
+        print("1. Train new models")
+        print("2. Make predictions with existing models")
+        print("3. Exit")
+        return input("\nSelect an option (1-3): ")
+    
+    def train_models():
         """Function to handle model training"""
-        print("\n=== Starting Model Training ===")
+        print("\n===== Training New Models =====")
         
         # Create instance of the model
         model = GHIPredictionModel()
         
+        # Define input parameters
+        file_path = 'davcast/dataset.csv'
+        test_size = 0.2
+        val_size = 0.1
+        lag_hours = 3
+        random_state = 42
+        
         # Run the entire pipeline for multi-horizon forecasting
         result = model.run_pipeline(
-            file_path='davcast/dataset.csv',
-            test_size=0.2,
-            val_size=0.1,
-            lag_hours=3,
-            random_state=42
+            file_path=file_path,
+            test_size=test_size,
+            val_size=val_size,
+            lag_hours=lag_hours,
+            random_state=random_state
         )
         
         print("\n--- Final Multi-Horizon Metrics ---")
@@ -2203,46 +2340,46 @@ if __name__ == "__main__":
                 else:
                     print(f"Horizon {horizon}h: {mets}")
         
+        # Save the trained models
+        model.save_models()
+        
         print("\nTraining completed successfully!")
-
-    def make_prediction():
-        """Function to handle predictions"""
-        print("\n=== Starting Prediction ===")
+    
+    def make_predictions():
+        """Function to handle predictions with existing models"""
+        print("\n===== Making Predictions with Existing Models =====")
+        
+        # Check if models exist
+        model_dir = 'davcast'
+        if not os.path.exists(os.path.join(model_dir, 'xgboost_model_hour_1.json')):
+            print("\nError: No trained models found. Please train models first (Option 1).")
+            return
         
         # Create instance of the model
         model = GHIPredictionModel()
         
-        # Generate predictions for future hours (next 1-4 hours after the latest timestamp)
+        # Load the trained models
+        if not model.load_models():
+            print("\nError: Failed to load models. Please train new models.")
+            return
+        
+        # Generate predictions for future hours
         print("\n--- Predicting Future Hours ---")
-        model.predict_future_hours(file_path='davcast/dataset.csv')
+        file_path = 'davcast/dataset.csv'
+        predictions = model.predict_future_hours(file_path=file_path)
         
         print("\nPrediction completed successfully!")
-
-    def main_menu():
-        """Main menu function"""
-        while True:
-            print("\n=== GHI Prediction System ===")
-            print("1. Train Model")
-            print("2. Make Prediction")
-            print("3. Exit")
-            
-            choice = input("\nEnter your choice (1-3): ")
-            
-            if choice == '1':
-                train_model()
-            elif choice == '2':
-                make_prediction()
-            elif choice == '3':
-                print("\nExiting program...")
-                break
-            else:
-                print("\nInvalid choice. Please enter 1, 2, or 3.")
-
-    try:
-        main_menu()
-    except KeyboardInterrupt:
-        print("\nProgram interrupted by user.")
-    except Exception as e:
-        print(f"\nAn error occurred: {str(e)}")
-        import traceback
-        traceback.print_exc() 
+    
+    # Main program loop
+    while True:
+        choice = display_menu()
+        
+        if choice == '1':
+            train_models()
+        elif choice == '2':
+            make_predictions()
+        elif choice == '3':
+            print("\nExiting program. Goodbye!")
+            break
+        else:
+            print("\nInvalid option. Please select 1, 2, or 3.")
