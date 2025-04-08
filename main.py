@@ -2048,7 +2048,7 @@ class GHIPredictionModel:
             logging.info(f"\n{result_df.to_string()}")
             
             # Save predictions
-            result_file = 'future_predictions.csv'  # Save in current directory
+            result_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'future_predictions.csv')  # Save in davcast folder
             result_df.to_csv(result_file, index=False)
             logging.info(f"Future predictions saved to {result_file}")
             
