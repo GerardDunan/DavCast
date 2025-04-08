@@ -29,16 +29,20 @@ class GHIPredictionModel:
         self.elevation = 7  # meters
         self.solar_constant = 1361  # W/m²
         
+        # Get the directory where main.py is located
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        
         # Setup logging
         self.setup_logging()
     
     def setup_logging(self):
         """Set up logging to file and console"""
         # Create logs directory if it doesn't exist
-        os.makedirs('logs', exist_ok=True)
+        logs_dir = os.path.join(self.base_dir, 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
         
         # Configure logging
-        log_file = os.path.join('logs', f'ghi_prediction_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+        log_file = os.path.join(logs_dir, f'ghi_prediction_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
         
         # Configure root logger
         logging.basicConfig(
@@ -56,13 +60,13 @@ class GHIPredictionModel:
         # Prevent debug messages from propagating to the root logger (and thus the console)
         self.debug_logger.propagate = False
         
-        debug_handler = logging.FileHandler(os.path.join('logs', f'debug_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'))
+        debug_handler = logging.FileHandler(os.path.join(logs_dir, f'debug_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'))
         debug_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         self.debug_logger.addHandler(debug_handler)
         
         # Save the log file path for reference
         self.log_file = log_file
-        debug_log_path = os.path.join('logs', f'debug_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+        debug_log_path = os.path.join(logs_dir, f'debug_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
         # Use file path info only in logs, not terminal
         logging.info(f"Log files created: \n- {log_file} \n- {debug_log_path}")
     
@@ -725,57 +729,14 @@ class GHIPredictionModel:
         y_true: Actual target values
         timestamps: Index or timestamps for the predictions
         """
-        # Create results directory if it doesn't exist
-        if not os.path.exists('results'):
-            os.makedirs('results')
-        
+        # Print debug info about predictions structure
         print(f"Debug - predictions keys: {list(predictions.keys())}")
         if predictions and len(predictions) > 0:
             # Print example of prediction structure for first horizon
             first_horizon = list(predictions.keys())[0]
             print(f"Debug - predictions[{first_horizon}] keys: {list(predictions[first_horizon].keys() if isinstance(predictions[first_horizon], dict) else ['<not a dict>'])}")
         
-        # Save prediction CSVs
-        for horizon in self.forecast_horizons:
-            # Get target column for this horizon
-            target_col = f'target_GHI_{horizon}h'
-            
-            # Create dataframe with predictions and actual values
-            results_df = pd.DataFrame()
-            
-            # Add timestamps if provided
-            if timestamps is not None:
-                results_df['timestamp'] = timestamps
-            
-            # Add actual values
-            results_df['actual'] = y_true[target_col].values
-            
-            # Check if predictions has the expected structure and add predictions
-            if horizon in predictions:
-                if isinstance(predictions[horizon], dict):
-                    # If structure is {horizon: {model_type: values}}
-                    if 'median' in predictions[horizon]:
-                        results_df['predicted_median'] = predictions[horizon]['median']
-                    if 'lower' in predictions[horizon]:
-                        results_df['predicted_lower'] = predictions[horizon]['lower']
-                    if 'upper' in predictions[horizon]:
-                        results_df['predicted_upper'] = predictions[horizon]['upper']
-                else:
-                    # If structure is {horizon: values}
-                    results_df['predicted'] = predictions[horizon]
-            
-            # Save to CSV
-            results_df.to_csv(f'results/predictions_horizon_{horizon}h.csv', index=False)
-            print(f"Saved predictions for {horizon}h horizon to results/predictions_horizon_{horizon}h.csv")
-        
-        # Save overall metrics summary (can be enhanced with actual metrics)
-        with open('results/metrics_summary.txt', 'w') as f:
-            f.write("GHI Prediction Model - Metrics Summary\n")
-            f.write("===================================\n\n")
-            for horizon in self.forecast_horizons:
-                f.write(f"Horizon {horizon}h results saved to predictions_horizon_{horizon}h.csv\n")
-        
-        print("Results saved successfully.")
+        print("Results processing completed.")
     
     def validate_forecast_setup(self, X_train, X_test, y_train, y_test):
         """
@@ -2068,9 +2029,8 @@ class GHIPredictionModel:
                     # Add to predictions list
                     future_predictions.append({
                         'datetime': future_time_str,
-                        'horizon': f"{hour}h",
-                        'predicted_ghi': round(median_pred, 2),
                         'lower_bound': round(lower_bound, 2) if lower_bound is not None else None,
+                        'median': round(median_pred, 2),
                         'upper_bound': round(upper_bound, 2) if upper_bound is not None else None
                     })
                 except Exception as e:
@@ -2082,12 +2042,13 @@ class GHIPredictionModel:
         # Convert to DataFrame for easy display
         if future_predictions:
             result_df = pd.DataFrame(future_predictions)
+            # Reorder columns to match requested sequence
+            result_df = result_df[['datetime', 'lower_bound', 'median', 'upper_bound']]
             logging.info("\n=== Future Hour Predictions ===")
             logging.info(f"\n{result_df.to_string()}")
             
             # Save predictions
-            os.makedirs('results', exist_ok=True)
-            result_file = os.path.join('results', 'future_predictions.csv')
+            result_file = 'future_predictions.csv'  # Save in current directory
             result_df.to_csv(result_file, index=False)
             logging.info(f"Future predictions saved to {result_file}")
             
@@ -2143,7 +2104,7 @@ class GHIPredictionModel:
         # Only return the last row which has all the lagged features filled
         return df.iloc[[-1]].copy()
         
-    def save_models(self, model_dir='davcast'):
+    def save_models(self, model_dir=None):
         """
         Save all trained models and scalers to files.
         
@@ -2151,6 +2112,10 @@ class GHIPredictionModel:
         -----------
         model_dir (str): Directory to save the models
         """
+        # Use the same directory as main.py if no model_dir is specified
+        if model_dir is None:
+            model_dir = self.base_dir
+        
         print(f"Saving models and scalers to {model_dir}...")
         
         # Create directory if it doesn't exist
@@ -2183,7 +2148,7 @@ class GHIPredictionModel:
         
         print(f"Models and scalers saved successfully to {model_dir}")
     
-    def load_models(self, model_dir='davcast'):
+    def load_models(self, model_dir=None):
         """
         Load all trained models and scalers from files.
         
@@ -2195,6 +2160,10 @@ class GHIPredictionModel:
         --------
         bool: True if models loaded successfully, False otherwise
         """
+        # Use the same directory as main.py if no model_dir is specified
+        if model_dir is None:
+            model_dir = self.base_dir
+        
         print(f"Loading models and scalers from {model_dir}...")
         
         try:
@@ -2281,8 +2250,9 @@ if __name__ == "__main__":
         # Create instance of the model
         model = GHIPredictionModel()
         
-        # Define input parameters
-        file_path = 'davcast/dataset.csv'
+        # Define input parameters - use the same directory as main.py
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(base_dir, 'dataset.csv')
         test_size = 0.2
         val_size = 0.1
         lag_hours = 3
@@ -2350,8 +2320,9 @@ if __name__ == "__main__":
         print("\n===== Making Predictions with Existing Models =====")
         
         # Check if models exist
-        model_dir = 'davcast'
-        if not os.path.exists(os.path.join(model_dir, 'xgboost_model_hour_1.json')):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        model_file = os.path.join(base_dir, 'xgboost_model_hour_1.json')
+        if not os.path.exists(model_file):
             print("\nError: No trained models found. Please train models first (Option 1).")
             return
         
@@ -2365,7 +2336,7 @@ if __name__ == "__main__":
         
         # Generate predictions for future hours
         print("\n--- Predicting Future Hours ---")
-        file_path = 'davcast/dataset.csv'
+        file_path = os.path.join(base_dir, 'dataset.csv')
         predictions = model.predict_future_hours(file_path=file_path)
         
         print("\nPrediction completed successfully!")
