@@ -10,6 +10,12 @@ import optuna
 import logging  # Add logging import
 import joblib
 import json
+from scipy.stats import skew
+
+# Disable Optuna logging except warnings
+from optuna.logging import get_logger, WARNING
+optuna_logger = get_logger("optuna")
+optuna_logger.setLevel(WARNING)
 
 class GHIPredictionModel:
     def __init__(self):
@@ -660,6 +666,41 @@ class GHIPredictionModel:
             mae_skill = 1 - (mae / persistence_mae)
             rmse_skill = 1 - (rmse / persistence_rmse)
             
+            # Calculate interval-related metrics
+            interval_width = None
+            interval_max_width = None
+            coverage = None
+            
+            # Calculate prediction intervals using error percentiles if available
+            if hasattr(self, 'error_percentiles') and horizon in self.error_percentiles:
+                lower_err, upper_err = self.error_percentiles[horizon]
+                
+                # Calculate bounds
+                lower_bounds = y_pred_median + lower_err
+                upper_bounds = y_pred_median + upper_err
+                
+                # Ensure non-negative bounds
+                lower_bounds = np.maximum(0, lower_bounds)
+                upper_bounds = np.maximum(lower_bounds, upper_bounds)
+                
+                # Calculate coverage and width metrics
+                coverage = np.mean((y_test_horizon >= lower_bounds) & (y_test_horizon <= upper_bounds))
+                interval_width = np.mean(upper_bounds - lower_bounds)
+                interval_max_width = np.max(upper_bounds - lower_bounds)
+            elif horizon in self.models_lower and horizon in self.models_upper:
+                # Use model-based intervals
+                lower_preds = self.models_lower[horizon].predict(X_test)
+                upper_preds = self.models_upper[horizon].predict(X_test)
+                
+                # Ensure non-negative values
+                lower_preds = np.maximum(0, lower_preds)
+                upper_preds = np.maximum(lower_preds, upper_preds)
+                
+                # Calculate metrics
+                coverage = np.mean((y_test_horizon >= lower_preds) & (y_test_horizon <= upper_preds))
+                interval_width = np.mean(upper_preds - lower_preds)
+                interval_max_width = np.max(upper_preds - lower_preds)
+            
             # Calculate specialized metrics for daylight only
             if np.any(daylight_mask):
                 day_mae = mean_absolute_error(y_test_horizon[daylight_mask], y_pred_median[daylight_mask])
@@ -693,6 +734,9 @@ class GHIPredictionModel:
             print(f"Horizon {horizon}h - Persistence MAE: {persistence_mae:.2f}, RMSE: {persistence_rmse:.2f}")
             print(f"Horizon {horizon}h - Skill Score (MAE): {mae_skill:.2f}, (RMSE): {rmse_skill:.2f}")
             
+            if coverage is not None:
+                print(f"Horizon {horizon}h - Interval Coverage: {coverage*100:.2f}%, Width: {interval_width:.2f} W/m², Max Width: {interval_max_width:.2f} W/m²")
+            
             # Store metrics
             test_metrics[horizon] = {
                 'mae': mae,
@@ -706,15 +750,18 @@ class GHIPredictionModel:
                 'forecast_bias': bias,
                 'persistence_mae': persistence_mae,
                 'persistence_rmse': persistence_rmse,
-                'rmse_by_zenith': rmse_by_zenith
+                'rmse_by_zenith': rmse_by_zenith,
+                'interval_coverage': coverage,
+                'interval_width': interval_width,
+                'interval_max_width': interval_max_width
             }
             
             # Store predictions
             predictions_dict[horizon] = {
                 'actual': y_test_horizon.values,
                 'predicted': y_pred_median,
-                'lower': self.models_lower[horizon].predict(X_test) if horizon in self.models_lower else None,
-                'upper': self.models_upper[horizon].predict(X_test) if horizon in self.models_upper else None
+                'lower': lower_bounds if 'lower_bounds' in locals() else (self.models_lower[horizon].predict(X_test) if horizon in self.models_lower else None),
+                'upper': upper_bounds if 'upper_bounds' in locals() else (self.models_upper[horizon].predict(X_test) if horizon in self.models_upper else None)
             }
         
         return test_metrics  # Return just the metrics dictionary, not a tuple
@@ -757,7 +804,7 @@ class GHIPredictionModel:
         else:
             print(f"Confirmed: Training ends at index {train_end_idx}, testing starts at index {test_start_idx}. Assuming index implies time order.")
     
-    def run_pipeline(self, file_path, test_size=0.2, val_size=0.1, lag_hours=3, random_state=42):
+    def run_pipeline(self, file_path, test_size=0.2, val_size=0.1, lag_hours=3, random_state=42, max_interval_width=100):
         """
         Run the full GHI prediction pipeline from data loading to evaluation.
         
@@ -768,6 +815,7 @@ class GHIPredictionModel:
         val_size (float): Proportion of remaining data to use for validation
         lag_hours (int): Number of lag hours to use for feature creation
         random_state (int): Random seed for reproducibility (used for model training)
+        max_interval_width (float): Maximum allowed width between lower and upper bounds in W/m² (default: 100)
         
         Returns:
         --------
@@ -801,15 +849,52 @@ class GHIPredictionModel:
         X_train_scaled, X_test_scaled, X_val_scaled = self.scale_features(X_train, X_test, X_val)
         
         # Optimize model parameters
-        self.optimize_model_parameters(X_train_scaled, y_train, X_val_scaled, y_val)
+        self.optimize_model_parameters(X_train_scaled, y_train, X_val_scaled, y_val, max_interval_width=max_interval_width)
         
         # Train models with optimized parameters
         print("Training direct models for horizons", self.forecast_horizons, "with best parameters...")
         self.train_models(X_train_scaled, y_train)
         
-        # Calibrate prediction intervals using validation data (NEW)
-        print("\nCalibrating prediction intervals to achieve 90% coverage...")
-        self.calibrate_prediction_intervals(X_val_scaled, y_val, target_coverage=0.90)
+        # Calibrate prediction intervals using validation data with width constraint
+        print(f"\nCalibrating prediction intervals to achieve 90% coverage with max width of {max_interval_width} W/m²...")
+        self.calibrate_prediction_intervals(X_val_scaled, y_val, target_coverage=0.90, max_interval_width=max_interval_width)
+        
+        # Analyze interval widths by hour of day to diagnose time-specific issues
+        print("\nAnalyzing interval widths by hour of day...")
+        for horizon in self.forecast_horizons:
+            try:
+                # Make sure we have the datetime column for hour analysis
+                if 'datetime' not in X_val_scaled.columns and 'datetime' in X_val.columns:
+                    # Create a copy to avoid modifying the original
+                    X_val_analysis = X_val_scaled.copy()
+                    # Add the datetime column from the original data
+                    X_val_analysis['datetime'] = X_val['datetime']
+                else:
+                    X_val_analysis = X_val_scaled
+                
+                # The analysis should use scaled data for predictions
+                hourly_stats = self.analyze_interval_widths_by_hour(X_val_analysis, y_val, horizon=horizon)
+                if hourly_stats is not None:
+                    # Print summary for noon hour to address the noon issue specifically
+                    if 12 in hourly_stats.index:
+                        noon_stats = hourly_stats.loc[12]
+                        print(f"\nHorizon {horizon}h - Noon (12 PM) interval statistics:")
+                        print(f"  Average width: {noon_stats['width_mean']:.2f} W/m²")
+                        print(f"  Maximum width: {noon_stats['width_max']:.2f} W/m²")
+                        print(f"  Coverage: {noon_stats['coverage_mean']*100:.2f}%")
+                        print(f"  Percentage exceeding max width: {noon_stats['pct_exceeding_max']:.1f}%")
+                    
+                    # Report the most problematic hours
+                    problematic_hours = hourly_stats[hourly_stats['pct_exceeding_max'] > 0].sort_values('pct_exceeding_max', ascending=False)
+                    if not problematic_hours.empty:
+                        top_3 = problematic_hours.head(3)
+                        print(f"\nHorizon {horizon}h - Top {len(top_3)} problematic hours:")
+                        for hour, row in top_3.iterrows():
+                            print(f"  Hour {hour}: {row['pct_exceeding_max']:.1f}% of intervals exceed max width")
+                            print(f"      Average width: {row['width_mean']:.2f} W/m², Maximum width: {row['width_max']:.2f} W/m²")
+            except Exception as e:
+                logging.error(f"Error analyzing interval widths for horizon {horizon}h: {str(e)}")
+                print(f"Could not analyze interval widths for horizon {horizon}h due to an error. See logs for details.")
         
         # Validate the models
         val_metrics = self.evaluate_validation(X_val_scaled, y_val)
@@ -818,6 +903,8 @@ class GHIPredictionModel:
         print("\n=== Validation Set Summary Metrics ===")
         for horizon, metrics in val_metrics.items():
             print(f"Horizon {horizon}h: MAE={metrics['mae']:.2f}, RMSE={metrics['rmse']:.2f}, MAPE={metrics['mape']:.2f}%, Coverage={metrics['coverage']:.2f}%")
+            if hasattr(self, 'interval_widths') and horizon in self.interval_widths:
+                print(f"                Interval Width={self.interval_widths[horizon]:.2f} W/m²")
         
         # Test the models
         print("Evaluating models for all horizons...")
@@ -832,267 +919,36 @@ class GHIPredictionModel:
         # Return the evaluation metrics for all horizons and the predictions
         return test_metrics, predictions
 
-    def predict(self, X_new, return_intervals=True):
+    def calibrate_prediction_intervals(self, X_val, y_val, target_coverage=0.90, max_iterations=10, max_interval_width=100):
         """
-        Make predictions with empirically calibrated intervals.
-        """
-        logging.info(f"Making multi-horizon predictions for horizons {self.forecast_horizons}...")
+        Direct empirical calibration of prediction intervals with width constraint.
         
-        # Handle metadata columns gracefully - check which ones are available
-        metadata_cols = ['Date', 'datetime', 'Start Period', 'End Period']
-        available_cols = [col for col in metadata_cols if col in X_new.columns]
-        missing_cols = set(metadata_cols) - set(available_cols)
-        
-        # Instead of raising an error, just log the info about missing columns
-        if missing_cols:
-            logging.info(f"Some metadata columns are not in input data: {missing_cols}")
-            logging.info("Continuing with prediction without these columns...")
-        
-        # Get feature columns from the model
-        if self.feature_columns is None:
-            raise ValueError("Model has not been trained (feature_columns is None)")
-        
-        # Filter out metadata columns from required features
-        required_features = [col for col in self.feature_columns 
-                              if col not in metadata_cols]
-        
-        # Get only the columns needed for prediction
-        available_features = [col for col in required_features if col in X_new.columns]
-        missing_features = set(required_features) - set(available_features)
-        
-        if missing_features:
-            raise ValueError(f"Missing required feature columns: {missing_features}")
-        
-        # Debug info about predictions structure
-        self.debug_logger.debug(f"Debug - predictions keys: {self.forecast_horizons}")
-        
-        # Create predictions for each forecast horizon
-        predictions = {}
-        
-        # Create a DataFrame to log nighttime detections for exporting
-        nighttime_log = []
-        
-        for horizon in self.forecast_horizons:
-            if horizon not in self.models_median:
-                raise ValueError(f"No trained model available for {horizon}h horizon")
-            
-            # Make median prediction
-            median_preds = self.models_median[horizon].predict(X_new[available_features])
-            
-            # Initialize predictions dictionary for this horizon
-            horizon_preds = {}
-            
-            # Apply a robust nighttime check for future predictions
-            is_night = np.zeros_like(median_preds, dtype=bool)
-            is_transition = np.zeros_like(median_preds, dtype=bool)  # For dawn/dusk transitions
-            
-            # If datetime information is available, use it to check nighttime directly
-            if 'datetime' in X_new.columns:
-                try:
-                    # Calculate target prediction timestamps for this horizon
-                    future_timestamps = X_new['datetime'] + pd.Timedelta(hours=horizon)
-                    
-                    # For each timestamp, determine if it's nighttime based on time and season
-                    for i, timestamp in enumerate(future_timestamps):
-                        # Extract hour (0-23) from timestamp
-                        hour = timestamp.hour
-                        month = timestamp.month
-                        
-                        # SIMPLIFIED NIGHTTIME DETECTION BASED ON PHILIPPINES CLIMATE
-                        # For Davao City, Philippines (latitude: 7.07)
-                        # The Philippines has two main seasons:
-                        
-                        # For Philippines climate (Tropical)
-                        # Cool dry season (December to February)
-                        if month in [12, 1, 2]:  
-                            is_nighttime = (hour >= 18) or (hour < 6)  # Earlier sunset, later sunrise
-                            is_transition_time = hour == 6 or hour == 17  # Dawn/dusk transition hours
-                            season = "Cool dry"
-                        # Hot dry season (March to May)
-                        elif month in [3, 4, 5]:
-                            is_nighttime = (hour >= 18) or (hour < 5)  # Later sunset, earlier sunrise
-                            is_transition_time = hour == 5 or hour == 17  # Dawn/dusk transition hours
-                            season = "Hot dry"
-                        # Rainy season (June to November)
-                        else:  # months 6-11
-                            is_nighttime = (hour >= 18) or (hour < 6)  # More cloud cover, affects daylight
-                            is_transition_time = hour == 6 or hour == 17  # Dawn/dusk transition hours
-                            season = "Rainy"
-                        
-                        if is_nighttime:
-                            is_night[i] = True
-                            self.debug_logger.debug(f"Horizon {horizon}h prediction at {timestamp} will be during nighttime (hour: {hour}, month: {month}, season: {season})")
-                        elif is_transition_time:
-                            is_transition[i] = True
-                            self.debug_logger.debug(f"Horizon {horizon}h prediction at {timestamp} will be during transition period (hour: {hour}, month: {month}, season: {season})")
-                            
-                        # Add to nighttime log for export
-                        nighttime_log.append({
-                            'horizon': horizon,
-                            'timestamp': timestamp,
-                            'hour': hour,
-                            'month': month,
-                            'season': season,
-                            'is_nighttime': is_nighttime,
-                            'is_transition': is_transition_time
-                        })
-                
-                    # Log summary of detections
-                    self.debug_logger.debug(f"Nighttime check result for horizon {horizon}h: {np.sum(is_night)}/{len(is_night)} nighttime periods detected")
-                    if np.any(is_transition):
-                        self.debug_logger.debug(f"Transition check result for horizon {horizon}h: {np.sum(is_transition)}/{len(is_transition)} transition periods detected")
-                    
-                    # Only show essential info in console
-                    logging.info(f"Horizon {horizon}h: {np.sum(is_night)}/{len(is_night)} nighttime periods, {np.sum(is_transition)}/{len(is_transition)} transition periods detected")
-                    
-                except Exception as e:
-                    logging.warning(f"Could not perform timestamp nighttime check: {str(e)}")
-                    logging.info(f"Falling back to simpler detection for horizon {horizon}h")
-                    
-                    # Fallback: check if horizon extends into typical night hours
-                    current_hour = X_new['datetime'].dt.hour.values[0]
-                    target_hour = (current_hour + horizon) % 24
-                    
-                    # Conservative nighttime check (6 PM to 6 AM)
-                    if target_hour >= 18 or target_hour < 6:
-                        is_night[:] = True
-                        logging.info(f"Fallback: Horizon {horizon}h (target hour {target_hour}) detected as nighttime")
-                    # Check transition periods
-                    elif target_hour == 6 or target_hour == 17:
-                        is_transition[:] = True
-                        logging.info(f"Fallback: Horizon {horizon}h (target hour {target_hour}) detected as transition period")
-            else:
-                # If datetime not available, use solar zenith from the data
-                current_night_mask = X_new['solar_zenith_cos'] <= 0.01
-                is_night |= current_night_mask.values
-                
-                # If available, use transition zone info
-                if 'is_transition' in X_new.columns:
-                    is_transition |= X_new['is_transition'].values.astype(bool)
-                
-                logging.info(f"No datetime available. Using solar zenith and transition indicators for horizon {horizon}h.")
-            
-            # Apply night mask to predictions
-            if np.any(is_night):
-                original_preds = median_preds.copy()
-                median_preds = np.where(is_night, 0, median_preds)
-                logging.info(f"Set {np.sum(is_night)} nighttime predictions to 0 for horizon {horizon}h")
-                # Avoid printing full arrays, just show summary
-                self.debug_logger.debug(f"Before: Mean={np.mean(original_preds):.2f}, After: Mean={np.mean(median_preds):.2f}")
-            
-            # Apply transition adjustments (reduce predictions during dawn/dusk by 70%)
-            if np.any(is_transition):
-                # First ensure no negative values
-                median_preds = np.maximum(0, median_preds)
-                
-                transition_factor = 0.3  # Reduce to 30% of original value
-                original_trans_preds = median_preds.copy()
-                median_preds = np.where(is_transition, median_preds * transition_factor, median_preds)
-                logging.info(f"Reduced {np.sum(is_transition)} transition period predictions to 30% for horizon {horizon}h")
-                self.debug_logger.debug(f"Before transition: Mean={np.mean(original_trans_preds):.2f}, After: Mean={np.mean(median_preds):.2f}")
-            
-            # Store median predictions
-            horizon_preds['predicted'] = median_preds
-            
-            # Add prediction intervals if requested
-            if return_intervals:
-                # Use error percentiles if available (new approach)
-                if hasattr(self, 'error_percentiles') and horizon in self.error_percentiles:
-                    lower_percentile, upper_percentile = self.error_percentiles[horizon]
-                    
-                    # Calculate prediction bounds using error percentiles
-                    lower_bounds = median_preds + lower_percentile
-                    upper_bounds = median_preds + upper_percentile
-                    
-                    # Apply night mask to bounds as well
-                    if np.any(is_night):
-                        lower_bounds = np.where(is_night, 0, lower_bounds)
-                        upper_bounds = np.where(is_night, 0, upper_bounds)
-                    
-                    # Ensure non-negative values before applying transition factor
-                    lower_bounds = np.maximum(0, lower_bounds)
-                    upper_bounds = np.maximum(0, upper_bounds)
-                    
-                    # Apply transition adjustments to bounds as well
-                    if np.any(is_transition):
-                        transition_factor = 0.3  # Same factor as for median predictions
-                        lower_bounds = np.where(is_transition, lower_bounds * transition_factor, lower_bounds)
-                        upper_bounds = np.where(is_transition, upper_bounds * transition_factor, upper_bounds)
-                    
-                    # Final check to ensure bounds are non-negative and lower <= upper
-                    lower_bounds = np.maximum(0, lower_bounds)
-                    upper_bounds = np.maximum(lower_bounds, upper_bounds)
-                    
-                    horizon_preds['lower'] = lower_bounds
-                    horizon_preds['upper'] = upper_bounds
-                
-                # Fallback to old approach if error percentiles aren't available
-                elif horizon in self.models_lower and horizon in self.models_upper:
-                    lower_preds = self.models_lower[horizon].predict(X_new[available_features])
-                    upper_preds = self.models_upper[horizon].predict(X_new[available_features])
-                    
-                    # Apply night mask to bounds
-                    if np.any(is_night):
-                        lower_preds = np.where(is_night, 0, lower_preds)
-                        upper_preds = np.where(is_night, 0, upper_preds)
-                        self.debug_logger.debug(f"Set upper/lower bounds to 0 for nighttime predictions")
-                    
-                    # Ensure non-negative values before applying transition factor
-                    lower_preds = np.maximum(0, lower_preds)
-                    upper_preds = np.maximum(0, upper_preds)
-                    
-                    # Apply transition adjustments to bounds
-                    if np.any(is_transition):
-                        transition_factor = 0.3  # Same factor as for median predictions
-                        lower_preds = np.where(is_transition, lower_preds * transition_factor, lower_preds)
-                        upper_preds = np.where(is_transition, upper_preds * transition_factor, upper_preds)
-                        self.debug_logger.debug(f"Reduced upper/lower bounds to 30% for transition period predictions")
-                    
-                    # If we have adjustment factors, apply them
-                    if hasattr(self, 'lower_adjustments') and horizon in self.lower_adjustments:
-                        lower_adj = self.lower_adjustments.get(horizon, 0)
-                        upper_adj = self.upper_adjustments.get(horizon, 0)
-                        
-                        lower_diff = median_preds - lower_preds
-                        upper_diff = upper_preds - median_preds
-                        
-                        lower_preds = lower_preds - lower_adj * lower_diff
-                        upper_preds = upper_preds + upper_adj * upper_diff
-                    
-                    horizon_preds['lower'] = np.maximum(0, lower_preds)
-                    horizon_preds['upper'] = np.maximum(horizon_preds['lower'], upper_preds)
-            
-            # Store predictions for this horizon
-            predictions[horizon] = horizon_preds
-        
-        # Print debug info about the first horizon's predictions
-        if predictions and len(predictions) > 0:
-            first_horizon = list(predictions.keys())[0]
-            self.debug_logger.debug(f"Debug - predictions[{first_horizon}] keys: {list(predictions[first_horizon].keys())}")
-        
-        # Save the nighttime detection log to CSV
-        if nighttime_log:
-            os.makedirs('logs', exist_ok=True)
-            nighttime_df = pd.DataFrame(nighttime_log)
-            nighttime_csv = os.path.join('logs', f'nighttime_detection_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
-            nighttime_df.to_csv(nighttime_csv, index=False)
-            logging.info(f"Nighttime detection details saved to: {nighttime_csv}")
-        
-        return predictions
-
-    def calibrate_prediction_intervals(self, X_val, y_val, target_coverage=0.90, max_iterations=10):
-        """
-        Direct empirical calibration of prediction intervals.
-        
-        This approach doesn't rely on the quantile models at all - instead it:
+        This approach:
         1. Uses the median model for the central prediction
         2. Calculates empirical error distributions
-        3. Creates intervals directly from those error distributions
+        3. Creates intervals with width constraints
+        4. Iteratively adjusts to maintain both coverage and width requirements
+        
+        Parameters:
+        -----------
+        X_val: Validation features
+        y_val: Validation targets
+        target_coverage: Target prediction interval coverage (default: 0.90)
+        max_iterations: Maximum iterations for calibration (default: 10)
+        max_interval_width: Maximum allowed width between lower and upper bounds in W/m² (default: 100)
         """
-        logging.info(f"Calibrating prediction intervals to achieve {target_coverage*100:.0f}% coverage...")
+        logging.info(f"Calibrating prediction intervals to achieve {target_coverage*100:.0f}% coverage with max width of {max_interval_width} W/m²...")
         
         # Dictionary to store calibration factors
         self.error_percentiles = {}
+        self.interval_widths = {}
+        self.max_interval_widths = {}
+        
+        # Check if we have timestamp information for time-of-day specific calibration
+        timestamps = None
+        if 'datetime' in X_val.columns:
+            timestamps = X_val['datetime'].values
+            logging.info("Using timestamp information for time-of-day specific calibration")
         
         for horizon in self.forecast_horizons:
             target_col = f'target_GHI_{horizon}h'
@@ -1104,18 +960,35 @@ class GHIPredictionModel:
             # Get actual values
             actual = y_val[target_col].values
             
+            # Define metadata columns that should be excluded
+            metadata_cols = ['Date', 'datetime', 'Start Period', 'End Period']
+            
+            # Filter to only include feature columns
+            feature_cols = [col for col in self.feature_columns if col not in metadata_cols]
+            
             # Get median predictions
-            median_preds = self.models_median[horizon].predict(X_val)
+            median_preds = self.models_median[horizon].predict(X_val[feature_cols])
             
             # Calculate prediction errors
             errors = actual - median_preds
             
-            # Find error percentiles for desired coverage
+            # Step 1: Initial calibration using error percentiles
             alpha = (1 - target_coverage) / 2  # split equally on both sides
-            lower_percentile = np.percentile(errors, alpha * 100)
-            upper_percentile = np.percentile(errors, (1 - alpha) * 100)
+            initial_lower_percentile = np.percentile(errors, alpha * 100)
+            initial_upper_percentile = np.percentile(errors, (1 - alpha) * 100)
             
-            logging.info(f"Horizon {horizon}h - Error percentiles: {lower_percentile:.2f} to {upper_percentile:.2f}")
+            # Step 2: Apply width constraint through optimization
+            optimal_percentiles = self.optimize_interval_width(
+                median_preds=median_preds,
+                actual=actual, 
+                initial_lower=initial_lower_percentile,
+                initial_upper=initial_upper_percentile,
+                target_coverage=target_coverage,
+                max_width=max_interval_width,
+                timestamps=timestamps
+            )
+            
+            lower_percentile, upper_percentile = optimal_percentiles
             
             # Create intervals by adding these percentiles to median predictions
             lower_bounds = median_preds + lower_percentile
@@ -1125,18 +998,328 @@ class GHIPredictionModel:
             lower_bounds = np.maximum(0, lower_bounds)
             upper_bounds = np.maximum(lower_bounds, upper_bounds)
             
-            # Calculate actual coverage
+            # Calculate actual coverage and width
             coverage = np.mean((actual >= lower_bounds) & (actual <= upper_bounds))
-            logging.info(f"Empirical calibration for horizon {horizon}h: coverage = {coverage*100:.2f}%")
+            avg_width = np.mean(upper_bounds - lower_bounds)
+            max_width = np.max(upper_bounds - lower_bounds)
+            
+            # If we have timestamps, calculate metrics for peak solar times separately
+            if timestamps is not None:
+                try:
+                    hours = pd.Series(timestamps).dt.hour
+                    peak_mask = (hours >= 11) & (hours <= 13)
+                    if np.any(peak_mask):
+                        peak_coverage = np.mean((actual[peak_mask] >= lower_bounds[peak_mask]) & 
+                                                (actual[peak_mask] <= upper_bounds[peak_mask]))
+                        peak_width = np.mean(upper_bounds[peak_mask] - lower_bounds[peak_mask])
+                        peak_max_width = np.max(upper_bounds[peak_mask] - lower_bounds[peak_mask])
+                        logging.info(f"  Peak solar hours (11am-1pm): Coverage: {peak_coverage*100:.2f}%, "
+                                     f"Avg width: {peak_width:.2f} W/m², Max width: {peak_max_width:.2f} W/m²")
+                except Exception as e:
+                    logging.warning(f"Could not calculate peak solar time metrics: {str(e)}")
+            
+            logging.info(f"Horizon {horizon}h - Calibrated intervals:")
+            logging.info(f"  Coverage: {coverage*100:.2f}% (target: {target_coverage*100:.0f}%)")
+            logging.info(f"  Average width: {avg_width:.2f} W/m²")
+            logging.info(f"  Maximum width: {max_width:.2f} W/m²")
+            logging.info(f"  Error percentiles: {lower_percentile:.2f} to {upper_percentile:.2f}")
             
             # Store the error percentiles for prediction
             self.error_percentiles[horizon] = (lower_percentile, upper_percentile)
+            self.interval_widths[horizon] = avg_width
+            self.max_interval_widths[horizon] = max_width
         
         return self.error_percentiles
 
-    def optimize_model_parameters(self, X_train, y_train, X_val, y_val):
+    def optimize_interval_width(self, median_preds, actual, initial_lower, initial_upper, target_coverage=0.90, max_width=100, max_iterations=20, timestamps=None):
         """
-        Optimize model hyperparameters for each forecast horizon.
+        Optimize prediction interval width while maintaining target coverage.
+        
+        This method iteratively adjusts the error percentiles to achieve the best
+        possible coverage while ensuring the interval width doesn't exceed the maximum allowed.
+        
+        Parameters:
+        -----------
+        median_preds: Array of median predictions
+        actual: Array of actual values
+        initial_lower: Initial lower percentile value
+        initial_upper: Initial upper percentile value
+        target_coverage: Target coverage probability (default: 0.90)
+        max_width: Maximum allowed interval width in W/m² (default: 100)
+        max_iterations: Maximum optimization iterations (default: 20)
+        timestamps: Optional array of timestamps for time-of-day specific adjustments
+        
+        Returns:
+        --------
+        tuple: Optimized (lower_percentile, upper_percentile)
+        """
+        logging.info(f"Optimizing interval width to max {max_width} W/m² while targeting {target_coverage*100:.0f}% coverage...")
+        
+        # Start with initial values
+        lower_percentile = initial_lower
+        upper_percentile = initial_upper
+        
+        # Initialize tracking variables
+        best_coverage = 0
+        best_lower = lower_percentile
+        best_upper = upper_percentile
+        
+        # Detect if we have timestamps for time-of-day specific adjustments
+        hour_of_day = None
+        peak_solar_times = []
+        
+        if timestamps is not None:
+            try:
+                # Convert timestamps to pandas Series if it's not already
+                if not isinstance(timestamps, pd.Series):
+                    timestamps = pd.Series(timestamps)
+                
+                # Extract hour of day from timestamps
+                hour_of_day = timestamps.dt.hour.values
+                
+                # Validate that we have the same number of timestamps as predictions
+                if len(hour_of_day) != len(median_preds):
+                    logging.warning(f"Timestamp count ({len(hour_of_day)}) doesn't match prediction count ({len(median_preds)}). Disabling time-specific optimization.")
+                    hour_of_day = None
+                else:
+                    # Identify peak solar times (11 AM - 1 PM)
+                    peak_solar_times = (hour_of_day >= 11) & (hour_of_day <= 13)
+                    logging.info(f"Time-of-day specific optimization enabled. {np.sum(peak_solar_times)} peak solar time points detected.")
+            except Exception as e:
+                logging.warning(f"Could not extract time of day from timestamps: {str(e)}")
+                hour_of_day = None
+                
+        # Function to evaluate a set of percentiles
+        def evaluate_percentiles(lower_p, upper_p):
+            # Create bounds
+            lower_bounds = median_preds + lower_p
+            upper_bounds = median_preds + upper_p
+            
+            # Ensure non-negative and proper ordering
+            lower_bounds = np.maximum(0, lower_bounds)
+            upper_bounds = np.maximum(lower_bounds, upper_bounds)
+            
+            # Calculate metrics
+            coverage = np.mean((actual >= lower_bounds) & (actual <= upper_bounds))
+            avg_width = np.mean(upper_bounds - lower_bounds)
+            max_actual_width = np.max(upper_bounds - lower_bounds)
+            
+            # Calculate time-specific metrics if available
+            time_metrics = {}
+            if hour_of_day is not None and len(peak_solar_times) > 0:
+                if np.any(peak_solar_times):
+                    time_metrics['peak_coverage'] = np.mean((actual[peak_solar_times] >= lower_bounds[peak_solar_times]) & 
+                                                    (actual[peak_solar_times] <= upper_bounds[peak_solar_times]))
+                    time_metrics['peak_width'] = np.mean(upper_bounds[peak_solar_times] - lower_bounds[peak_solar_times])
+                    time_metrics['peak_max_width'] = np.max(upper_bounds[peak_solar_times] - lower_bounds[peak_solar_times]) if np.any(peak_solar_times) else 0
+                else:
+                    time_metrics['peak_coverage'] = np.nan
+                    time_metrics['peak_width'] = np.nan
+                    time_metrics['peak_max_width'] = np.nan
+            
+            return coverage, avg_width, max_actual_width, lower_bounds, upper_bounds, time_metrics
+        
+        # Initial evaluation
+        coverage, avg_width, max_actual_width, _, _, time_metrics = evaluate_percentiles(lower_percentile, upper_percentile)
+        
+        # If initial width already satisfies constraint, we can potentially widen for better coverage
+        if avg_width <= max_width:
+            # Track this as the current best
+            best_coverage = coverage
+            best_lower = lower_percentile
+            best_upper = upper_percentile
+        
+        # Check if we have peak solar time data for special handling
+        have_peak_data = hour_of_day is not None and len(peak_solar_times) > 0 and np.any(peak_solar_times)
+        
+        # Optimization loop
+        for iteration in range(max_iterations):
+            # If width too large, apply asymmetric shrinking considering time-of-day
+            if avg_width > max_width:
+                # Calculate how much we need to shrink overall
+                scale_factor = max_width / avg_width
+                
+                if have_peak_data and time_metrics.get('peak_width', 0) > max_width:
+                    # Special handling for peak solar times (asymmetric adjustment)
+                    
+                    # Calculate error skewness at peak times for asymmetric adjustment
+                    if np.any(peak_solar_times):
+                        peak_errors = actual[peak_solar_times] - median_preds[peak_solar_times]
+                        error_skew = skew(peak_errors) if len(peak_errors) > 2 else 0
+                        
+                        # Calculate asymmetric adjustment factors based on error skew
+                        # Positive skew means more weight on upper tail
+                        # Negative skew means more weight on lower tail
+                        skew_factor = min(max(error_skew * 0.1, -0.3), 0.3)  # Limit skew impact
+                        
+                        logging.debug(f"Peak solar time error skew: {error_skew:.4f}, skew_factor: {skew_factor:.4f}")
+                        
+                        # Apply asymmetric shrinking based on error distribution
+                        width_range = upper_percentile - lower_percentile
+                        adjustment = (1 - scale_factor) * 0.5
+                        
+                        # Adjust more on the side with less important errors (based on skew)
+                        if skew_factor >= 0:  # Positive skew - more weight on upper errors
+                            # Shrink lower bound more
+                            lower_adj = adjustment * (1 + skew_factor) 
+                            upper_adj = adjustment * (1 - skew_factor)
+                        else:  # Negative skew - more weight on lower errors
+                            # Shrink upper bound more
+                            lower_adj = adjustment * (1 + skew_factor)
+                            upper_adj = adjustment * (1 - skew_factor)
+                        
+                        lower_percentile = lower_percentile + (width_range * lower_adj)
+                        upper_percentile = upper_percentile - (width_range * upper_adj)
+                    else:
+                        # Fallback to symmetric shrinking if no peak times
+                        width_range = upper_percentile - lower_percentile
+                        adjustment = (1 - scale_factor) * 0.5
+                        lower_percentile = lower_percentile + (width_range * adjustment)
+                        upper_percentile = upper_percentile - (width_range * adjustment)
+                else:
+                    # Standard symmetric shrinking for non-peak times
+                    width_range = upper_percentile - lower_percentile
+                    adjustment = (1 - scale_factor) * 0.5
+                    lower_percentile = lower_percentile + (width_range * adjustment)
+                    upper_percentile = upper_percentile - (width_range * adjustment)
+                
+            # If width smaller than max, try to expand for better coverage
+            else:
+                # Create a grid of candidate adjustments
+                lower_adjustments = np.linspace(0, 5, 10) # Incremental increases
+                upper_adjustments = np.linspace(0, 5, 10) # Incremental increases
+                
+                # Initialize tracking variables
+                best_candidate_coverage = coverage
+                best_candidate_adjustment = (0, 0)
+                
+                # Try different combinations of adjustments
+                for lower_adj in lower_adjustments:
+                    for upper_adj in upper_adjustments:
+                        # Apply tentative adjustments
+                        candidate_lower = lower_percentile - lower_adj
+                        candidate_upper = upper_percentile + upper_adj
+                        
+                        # Evaluate this candidate
+                        try:
+                            cand_coverage, cand_width, cand_max_width, _, _, cand_time_metrics = evaluate_percentiles(
+                                candidate_lower, candidate_upper
+                            )
+                            
+                            # If width is within limit and coverage is better, update best
+                            if cand_width <= max_width and cand_coverage > best_candidate_coverage:
+                                # Additional check for peak solar times if available
+                                peak_width_ok = True
+                                if have_peak_data:
+                                    peak_width = cand_time_metrics.get('peak_width', 0)
+                                    if peak_width > max_width:
+                                        # If peak width exceeds max, reject this candidate
+                                        peak_width_ok = False
+                                
+                                if peak_width_ok:
+                                    best_candidate_coverage = cand_coverage
+                                    best_candidate_adjustment = (lower_adj, upper_adj)
+                        except Exception as e:
+                            logging.warning(f"Error evaluating candidate: {str(e)}")
+                            continue
+                
+                # Apply the best adjustments found
+                lower_adj, upper_adj = best_candidate_adjustment
+                lower_percentile = lower_percentile - lower_adj
+                upper_percentile = upper_percentile + upper_adj
+            
+            # Re-evaluate with new percentiles
+            try:
+                coverage, avg_width, max_actual_width, lower_bounds, upper_bounds, time_metrics = evaluate_percentiles(
+                    lower_percentile, upper_percentile
+                )
+                
+                # Update best if this is better (width in range and better coverage)
+                if avg_width <= max_width and coverage > best_coverage:
+                    # Additionally check peak solar times if available
+                    peak_width_ok = True
+                    if have_peak_data:
+                        peak_width = time_metrics.get('peak_width', 0)
+                        if peak_width > max_width:
+                            peak_width_ok = False
+                            logging.debug(f"Rejecting solution with peak width {peak_width:.2f} W/m² > max {max_width} W/m²")
+                    
+                    if peak_width_ok:
+                        best_coverage = coverage
+                        best_lower = lower_percentile
+                        best_upper = upper_percentile
+                
+                logging.debug(f"Iteration {iteration+1}: coverage={coverage:.4f}, width={avg_width:.2f}, "
+                             f"lower={lower_percentile:.2f}, upper={upper_percentile:.2f}")
+                
+                if have_peak_data:
+                    logging.debug(f"  Peak metrics: coverage={time_metrics.get('peak_coverage', 0):.4f}, width={time_metrics.get('peak_width', 0):.2f} W/m²")
+            except Exception as e:
+                logging.warning(f"Error in optimization iteration {iteration+1}: {str(e)}")
+                continue
+            
+            # Check for convergence
+            if iteration > 3 and abs(avg_width - max_width) < 0.5:
+                logging.debug("Optimization converged on width")
+                break
+        
+        # Final check - force max width constraint for peak times
+        if have_peak_data:
+            try:
+                # Evaluate with current best
+                _, _, _, lower_bounds, upper_bounds, time_metrics = evaluate_percentiles(best_lower, best_upper)
+                peak_width = time_metrics.get('peak_width', 0)
+                
+                # If peak width still exceeds max, apply direct point-wise constraint
+                if peak_width > max_width:
+                    logging.info(f"Applying point-wise width constraint for peak solar times (current width: {peak_width:.2f} W/m²)")
+                    
+                    # Create point-wise constrained intervals
+                    for i in range(len(lower_bounds)):
+                        if peak_solar_times[i]:
+                            width = upper_bounds[i] - lower_bounds[i]
+                            if width > max_width:
+                                # Calculate asymmetric adjustment
+                                excess = width - max_width
+                                
+                                # Adjust bounds to maintain median prediction as center
+                                # but with asymmetric shrinking based on GHI level
+                                midpoint = (upper_bounds[i] + lower_bounds[i]) / 2
+                                pred_level = median_preds[i]
+                                
+                                # High GHI: adjust lower bound more (less uncertainty on upper bound)
+                                # Low GHI: adjust upper bound more (less uncertainty on lower bound)
+                                if pred_level > 300:  # High GHI
+                                    lower_bounds[i] = midpoint - (max_width * 0.6)
+                                    upper_bounds[i] = midpoint + (max_width * 0.4)
+                                else:  # Lower GHI
+                                    lower_bounds[i] = midpoint - (max_width * 0.4)
+                                    upper_bounds[i] = midpoint + (max_width * 0.6)
+                    
+                    # Calculate optimized percentiles from the point-wise adjusted bounds
+                    peak_indices = np.where(peak_solar_times)[0]
+                    if len(peak_indices) > 0:
+                        lower_adj = np.mean(lower_bounds[peak_indices] - median_preds[peak_indices])
+                        upper_adj = np.mean(upper_bounds[peak_indices] - median_preds[peak_indices])
+                        
+                        # Update best percentiles with these point-wise optimized values
+                        best_lower = lower_adj
+                        best_upper = upper_adj
+                        
+                        logging.info(f"Point-wise optimization resulted in percentiles: ({best_lower:.2f}, {best_upper:.2f})")
+            except Exception as e:
+                logging.warning(f"Error in final peak time constraint check: {str(e)}")
+                # Fall back to best values found during optimization
+        
+        # Return the best percentiles found
+        logging.info(f"Optimized interval: coverage={best_coverage:.4f}, with percentiles "
+                    f"({best_lower:.2f}, {best_upper:.2f})")
+        
+        return best_lower, best_upper
+
+    def optimize_model_parameters(self, X_train, y_train, X_val, y_val, max_interval_width=100):
+        """
+        Optimize model hyperparameters for each forecast horizon with interval width constraint.
         
         Parameters:
         -----------
@@ -1144,12 +1327,13 @@ class GHIPredictionModel:
         y_train: Training targets
         X_val: Validation features
         y_val: Validation targets
+        max_interval_width: Maximum allowed width between lower and upper bounds in W/m²
         
         Returns:
         --------
         dict: Best parameters for each horizon
         """
-        print("Optimizing model hyperparameters for each horizon...")
+        print("Optimizing model hyperparameters for each horizon with width constraint...")
         
         # Initialize best parameters dictionary
         self.best_params = {}
@@ -1177,7 +1361,7 @@ class GHIPredictionModel:
                 model = xgb.XGBRegressor(objective='reg:squarederror', **params, random_state=42)
                 model.fit(X_train, y_train[target_col])
                 preds = model.predict(X_val)
-                return mean_squared_error(y_val[target_col], preds, squared=False)  # RMSE
+                return mean_squared_error(y_val[target_col], preds, squared=False)
             
             study_median.optimize(objective_median, n_trials=15)
             best_params_median = study_median.best_params
@@ -1186,8 +1370,13 @@ class GHIPredictionModel:
                 print(f"  {param}: {value}")
             print(f"Best validation score: {study_median.best_value:.4f}")
             
+            # Train median model to use for interval estimation
+            median_model = xgb.XGBRegressor(objective='reg:squarederror', **best_params_median, random_state=42)
+            median_model.fit(X_train, y_train[target_col])
+            median_preds = median_model.predict(X_val)
+            
             # Optimize lower model (prediction intervals)
-            print(f"Optimizing lower ({horizon}h) model (running 10 trials)...")
+            print(f"Optimizing lower ({horizon}h) model with width constraint (running 10 trials)...")
             study_lower = optuna.create_study(direction='minimize')
             
             def objective_lower(trial):
@@ -1202,15 +1391,35 @@ class GHIPredictionModel:
                     'reg_lambda': trial.suggest_float('reg_lambda', 0.01, 1.0, log=True)
                 }
                 
+                # Train lower bound model
                 model = xgb.XGBRegressor(objective='reg:squarederror', **params, random_state=42)
                 model.fit(X_train, y_train[target_col])
-                preds = model.predict(X_val)
+                lower_preds = model.predict(X_val)
                 
                 # For lower bound, penalize overestimation more than underestimation (asymmetric loss)
-                errors = y_val[target_col] - preds
+                errors = y_val[target_col] - lower_preds
+                
                 # Penalty for overestimation (negative errors)
                 asymmetric_errors = np.where(errors < 0, errors * 2.0, errors * 0.5)
-                return np.mean(np.abs(asymmetric_errors))
+                asymmetric_loss = np.mean(np.abs(asymmetric_errors))
+                
+                # Estimate what the interval width might be
+                # Predict an approximate upper bound using error percentiles from median model
+                actual_errors = y_val[target_col] - median_preds
+                upper_error = np.percentile(actual_errors, 95)  # 95th percentile of errors
+                approx_upper = median_preds + upper_error
+                
+                # Ensure non-negative predictions
+                lower_preds = np.maximum(0, lower_preds)
+                approx_upper = np.maximum(lower_preds, approx_upper)  # Upper must be >= lower
+                
+                # Calculate estimated interval width
+                est_width = np.mean(approx_upper - lower_preds)
+                
+                # Add penalty if estimated width exceeds max allowed
+                width_penalty = max(0, est_width - max_interval_width) * 0.1
+                
+                return asymmetric_loss + width_penalty
             
             study_lower.optimize(objective_lower, n_trials=10)
             best_params_lower = study_lower.best_params
@@ -1219,8 +1428,13 @@ class GHIPredictionModel:
                 print(f"  {param}: {value}")
             print(f"Best validation score: {study_lower.best_value:.4f}")
             
+            # Train lower model to use for upper bound estimation
+            lower_model = xgb.XGBRegressor(objective='reg:squarederror', **best_params_lower, random_state=42)
+            lower_model.fit(X_train, y_train[target_col])
+            lower_preds = lower_model.predict(X_val)
+            
             # Optimize upper model (prediction intervals)
-            print(f"Optimizing upper ({horizon}h) model (running 10 trials)...")
+            print(f"Optimizing upper ({horizon}h) model with width constraint (running 10 trials)...")
             study_upper = optuna.create_study(direction='minimize')
             
             def objective_upper(trial):
@@ -1235,15 +1449,30 @@ class GHIPredictionModel:
                     'reg_lambda': trial.suggest_float('reg_lambda', 0.01, 1.0, log=True)
                 }
                 
+                # Train upper bound model
                 model = xgb.XGBRegressor(objective='reg:squarederror', **params, random_state=42)
                 model.fit(X_train, y_train[target_col])
-                preds = model.predict(X_val)
+                upper_preds = model.predict(X_val)
                 
                 # For upper bound, penalize underestimation more than overestimation (asymmetric loss)
-                errors = y_val[target_col] - preds
+                errors = y_val[target_col] - upper_preds
+                
                 # Penalty for underestimation (positive errors)
                 asymmetric_errors = np.where(errors > 0, errors * 2.0, errors * 0.5)
-                return np.mean(np.abs(asymmetric_errors))
+                asymmetric_loss = np.mean(np.abs(asymmetric_errors))
+                
+                # We already have lower predictions from the trained lower model
+                # Ensure non-negative predictions
+                lower_preds_safe = np.maximum(0, lower_preds) 
+                upper_preds = np.maximum(lower_preds_safe, upper_preds)  # Upper must be >= lower
+                
+                # Calculate actual interval width
+                actual_width = np.mean(upper_preds - lower_preds_safe)
+                
+                # Add penalty if width exceeds max allowed
+                width_penalty = max(0, actual_width - max_interval_width) * 0.1
+                
+                return asymmetric_loss + width_penalty
             
             study_upper.optimize(objective_upper, n_trials=10)
             best_params_upper = study_upper.best_params
@@ -1721,7 +1950,7 @@ class GHIPredictionModel:
         return X_train, X_test, X_val, y_train, y_test, y_val
 
     def evaluate_validation(self, X_val, y_val):
-        """Evaluate models on validation data with correct error percentiles."""
+        """Evaluate models on validation data with interval width metrics."""
         metrics = {}
         
         for horizon in self.forecast_horizons:
@@ -1742,7 +1971,10 @@ class GHIPredictionModel:
             else:
                 mape = np.nan
             
-            # Calculate prediction interval coverage using error percentiles
+            # Calculate prediction interval coverage and width using error percentiles
+            interval_width = None
+            interval_max_width = None
+            
             if hasattr(self, 'error_percentiles') and horizon in self.error_percentiles:
                 lower_err, upper_err = self.error_percentiles[horizon]
                 
@@ -1754,6 +1986,10 @@ class GHIPredictionModel:
                 lower_bounds = np.maximum(0, lower_bounds)
                 upper_bounds = np.maximum(lower_bounds, upper_bounds)
                 
+                # Calculate width metrics
+                interval_width = np.mean(upper_bounds - lower_bounds)
+                interval_max_width = np.max(upper_bounds - lower_bounds)
+                
                 # Calculate coverage
                 coverage = 100 * np.mean((actual >= lower_bounds) & (actual <= upper_bounds))
             # Fallback to old method
@@ -1764,8 +2000,14 @@ class GHIPredictionModel:
                 
                 # Calculate coverage (percentage of actual values within prediction interval)
                 coverage = 100 * np.mean((y_val[target_col] >= lower_preds) & (y_val[target_col] <= upper_preds))
+                
+                # Calculate width metrics
+                interval_width = np.mean(upper_preds - lower_preds)
+                interval_max_width = np.max(upper_preds - lower_preds)
             else:
                 coverage = np.nan
+                interval_width = np.nan
+                interval_max_width = np.nan
             
             # Calculate skill score against persistence forecast
             # For GHI forecasting, persistence means using current value as prediction
@@ -1798,6 +2040,8 @@ class GHIPredictionModel:
                 'rmse': rmse,
                 'mape': mape,
                 'coverage': coverage,
+                'interval_width': interval_width,
+                'interval_max_width': interval_max_width,
                 'skill_score_mae': skill_score_mae,
                 'skill_score_rmse': skill_score_rmse
             }
@@ -1813,6 +2057,23 @@ class GHIPredictionModel:
         
         if data is None:
             raise ValueError("No data provided for prediction")
+        
+        # Add validation for datetime column
+        if 'datetime' in data.columns and data['datetime'].isna().any():
+            self.logger.warning("Missing datetime values detected in input data")
+            # Fill missing datetimes with the most recent valid datetime + 1 hour
+            last_valid_datetime = data['datetime'].dropna().iloc[-1] if not data['datetime'].dropna().empty else pd.Timestamp.now()
+            data['datetime'] = data['datetime'].fillna(last_valid_datetime)
+        
+        # Ensure all datetime-related columns are properly filled
+        if 'Date' in data.columns and data['Date'].isna().any():
+            data['Date'] = data['Date'].fillna(data['datetime'].dt.date if 'datetime' in data.columns else pd.Timestamp.now().date())
+        
+        if 'Start Period' in data.columns and data['Start Period'].isna().any():
+            data['Start Period'] = data['Start Period'].fillna(data['datetime'].dt.strftime('%H:%M:%S') if 'datetime' in data.columns else pd.Timestamp.now().strftime('%H:%M:%S'))
+        
+        if 'End Period' in data.columns and data['End Period'].isna().any():
+            data['End Period'] = data['End Period'].fillna(data['datetime'].dt.strftime('%H:%M:%S') if 'datetime' in data.columns else pd.Timestamp.now().strftime('%H:%M:%S'))
         
         # Preprocess and create features
         data = self.preprocess_data(data)
@@ -2101,134 +2362,689 @@ class GHIPredictionModel:
         if 'CSI_smooth' not in df.columns:
             df = self.add_diurnal_decomposition(df)
         
+        # Check for and handle NaN values in datetime features before processing
+        if 'datetime' in data.columns:
+            # Ensure datetime column is actually datetime type
+            if not pd.api.types.is_datetime64_any_dtype(data['datetime']):
+                try:
+                    data['datetime'] = pd.to_datetime(data['datetime'])
+                except Exception as e:
+                    self.logger.error(f"Error converting datetime column: {str(e)}")
+                    # Create a valid datetime as fallback
+                    data['datetime'] = pd.Timestamp.now()
+            
+            # Fill any remaining NaT values
+            if data['datetime'].isna().any():
+                data['datetime'] = data['datetime'].fillna(method='ffill')
+                # If still has NaT (e.g., first row), fill with current time
+                data['datetime'] = data['datetime'].fillna(pd.Timestamp.now())
+        
         # Only return the last row which has all the lagged features filled
         return df.iloc[[-1]].copy()
         
     def save_models(self, model_dir=None):
         """
-        Save all trained models and scalers to files.
+        Save trained models and associated metadata.
         
         Parameters:
         -----------
-        model_dir (str): Directory to save the models
+        model_dir (str): Directory to save models (default: current directory)
         """
-        # Use the same directory as main.py if no model_dir is specified
         if model_dir is None:
-            model_dir = self.base_dir
+            model_dir = os.path.dirname(os.path.abspath(__file__))
         
-        print(f"Saving models and scalers to {model_dir}...")
-        
-        # Create directory if it doesn't exist
-        os.makedirs(model_dir, exist_ok=True)
-        
-        # Save feature columns to JSON
-        with open(os.path.join(model_dir, 'feature_columns.json'), 'w') as f:
-            json.dump(self.feature_columns, f)
-        
-        # Save scalers
-        joblib.dump(self.scaler, os.path.join(model_dir, 'features_scaler.joblib'))
-        
-        # Save each forecast horizon model
-        for horizon in self.forecast_horizons:
-            # Save median model
-            if horizon in self.models_median:
-                self.models_median[horizon].save_model(os.path.join(model_dir, f'xgboost_model_hour_{horizon}.json'))
+        try:
+            os.makedirs(model_dir, exist_ok=True)
             
-            # Save lower bound model
-            if horizon in self.models_lower:
-                self.models_lower[horizon].save_model(os.path.join(model_dir, f'xgboost_model_lower_hour_{horizon}.json'))
+            # Save median, lower, and upper bound models
+            for horizon in self.forecast_horizons:
+                # Save median model
+                if horizon in self.models_median:
+                    model_path = os.path.join(model_dir, f'xgboost_model_hour_{horizon}.json')
+                    self.models_median[horizon].save_model(model_path)
+                    logging.info(f"Saved median model for horizon {horizon}h to {model_path}")
+                
+                # Save lower bound model
+                if horizon in self.models_lower:
+                    model_path = os.path.join(model_dir, f'xgboost_model_lower_hour_{horizon}.json')
+                    self.models_lower[horizon].save_model(model_path)
+                    logging.info(f"Saved lower bound model for horizon {horizon}h to {model_path}")
+                
+                # Save upper bound model
+                if horizon in self.models_upper:
+                    model_path = os.path.join(model_dir, f'xgboost_model_upper_hour_{horizon}.json')
+                    self.models_upper[horizon].save_model(model_path)
+                    logging.info(f"Saved upper bound model for horizon {horizon}h to {model_path}")
             
-            # Save upper bound model
-            if horizon in self.models_upper:
-                self.models_upper[horizon].save_model(os.path.join(model_dir, f'xgboost_model_upper_hour_{horizon}.json'))
-        
-        # Save error percentiles if available
-        if hasattr(self, 'error_percentiles') and self.error_percentiles:
-            joblib.dump(self.error_percentiles, os.path.join(model_dir, 'error_percentiles.joblib'))
-        
-        print(f"Models and scalers saved successfully to {model_dir}")
-    
+            # Save feature scaler for preprocessing
+            scaler_path = os.path.join(model_dir, 'features_scaler.joblib')
+            joblib.dump(self.scaler, scaler_path)
+            logging.info(f"Saved feature scaler to {scaler_path}")
+            
+            # Save feature columns for prediction
+            if self.feature_columns is not None:
+                feature_cols_path = os.path.join(model_dir, 'feature_columns.json')
+                with open(feature_cols_path, 'w') as f:
+                    json.dump(self.feature_columns, f)
+                logging.info(f"Saved feature columns to {feature_cols_path}")
+            
+            # Save calibrated error percentiles
+            if hasattr(self, 'error_percentiles'):
+                percentiles_path = os.path.join(model_dir, 'error_percentiles.joblib')
+                joblib.dump(self.error_percentiles, percentiles_path)
+                logging.info(f"Saved error percentiles to {percentiles_path}")
+            
+            # Save interval widths metadata
+            if hasattr(self, 'interval_widths'):
+                widths_path = os.path.join(model_dir, 'interval_widths.json')
+                with open(widths_path, 'w') as f:
+                    json.dump({str(k): float(v) for k, v in self.interval_widths.items()}, f)
+                logging.info(f"Saved interval widths to {widths_path}")
+            
+            return True
+        except Exception as e:
+            logging.error(f"Error saving models: {str(e)}")
+            return False
+
     def load_models(self, model_dir=None):
         """
-        Load all trained models and scalers from files.
+        Load trained models and associated metadata.
         
         Parameters:
         -----------
-        model_dir (str): Directory to load the models from
+        model_dir (str): Directory where models are saved (default: current directory)
         
         Returns:
         --------
-        bool: True if models loaded successfully, False otherwise
+        bool: True if models were loaded successfully, False otherwise
         """
-        # Use the same directory as main.py if no model_dir is specified
         if model_dir is None:
-            model_dir = self.base_dir
-        
-        print(f"Loading models and scalers from {model_dir}...")
+            model_dir = os.path.dirname(os.path.abspath(__file__))
         
         try:
             # Load feature columns
-            feature_columns_path = os.path.join(model_dir, 'feature_columns.json')
-            if os.path.exists(feature_columns_path):
-                with open(feature_columns_path, 'r') as f:
+            feature_cols_path = os.path.join(model_dir, 'feature_columns.json')
+            if os.path.exists(feature_cols_path):
+                with open(feature_cols_path, 'r') as f:
                     self.feature_columns = json.load(f)
-                print(f"Loaded {len(self.feature_columns)} feature columns")
-            else:
-                print(f"Warning: Feature columns file not found at {feature_columns_path}")
-                return False
+                logging.info(f"Loaded feature columns from {feature_cols_path}")
             
-            # Load scaler
+            # Load feature scaler
             scaler_path = os.path.join(model_dir, 'features_scaler.joblib')
             if os.path.exists(scaler_path):
                 self.scaler = joblib.load(scaler_path)
-                print("Loaded feature scaler")
-            else:
-                print(f"Warning: Scaler file not found at {scaler_path}")
-                return False
+                logging.info(f"Loaded feature scaler from {scaler_path}")
+            
+            # Load calibrated error percentiles
+            percentiles_path = os.path.join(model_dir, 'error_percentiles.joblib')
+            if os.path.exists(percentiles_path):
+                self.error_percentiles = joblib.load(percentiles_path)
+                logging.info(f"Loaded error percentiles from {percentiles_path}")
+            
+            # Load interval widths metadata
+            widths_path = os.path.join(model_dir, 'interval_widths.json')
+            if os.path.exists(widths_path):
+                with open(widths_path, 'r') as f:
+                    # Convert string keys back to integers
+                    width_data = json.load(f)
+                    self.interval_widths = {int(k): v for k, v in width_data.items()}
+                logging.info(f"Loaded interval widths from {widths_path}")
             
             # Initialize model dictionaries
             self.models_median = {}
             self.models_lower = {}
             self.models_upper = {}
             
-            # Load each forecast horizon model
+            # Load all horizon models
             for horizon in self.forecast_horizons:
                 # Load median model
-                median_model_path = os.path.join(model_dir, f'xgboost_model_hour_{horizon}.json')
-                if os.path.exists(median_model_path):
-                    self.models_median[horizon] = xgb.XGBRegressor()
-                    self.models_median[horizon].load_model(median_model_path)
-                    print(f"Loaded median model for horizon {horizon}h")
+                model_path = os.path.join(model_dir, f'xgboost_model_hour_{horizon}.json')
+                if os.path.exists(model_path):
+                    model = xgb.XGBRegressor()
+                    model.load_model(model_path)
+                    self.models_median[horizon] = model
+                    logging.info(f"Loaded median model for horizon {horizon}h from {model_path}")
                 else:
-                    print(f"Warning: Median model for horizon {horizon}h not found")
-                    return False
+                    logging.warning(f"Median model for horizon {horizon}h not found at {model_path}")
                 
                 # Load lower bound model
-                lower_model_path = os.path.join(model_dir, f'xgboost_model_lower_hour_{horizon}.json')
-                if os.path.exists(lower_model_path):
-                    self.models_lower[horizon] = xgb.XGBRegressor()
-                    self.models_lower[horizon].load_model(lower_model_path)
-                    print(f"Loaded lower bound model for horizon {horizon}h")
+                model_path = os.path.join(model_dir, f'xgboost_model_lower_hour_{horizon}.json')
+                if os.path.exists(model_path):
+                    model = xgb.XGBRegressor()
+                    model.load_model(model_path)
+                    self.models_lower[horizon] = model
+                    logging.info(f"Loaded lower bound model for horizon {horizon}h from {model_path}")
                 
                 # Load upper bound model
-                upper_model_path = os.path.join(model_dir, f'xgboost_model_upper_hour_{horizon}.json')
-                if os.path.exists(upper_model_path):
-                    self.models_upper[horizon] = xgb.XGBRegressor()
-                    self.models_upper[horizon].load_model(upper_model_path)
-                    print(f"Loaded upper bound model for horizon {horizon}h")
+                model_path = os.path.join(model_dir, f'xgboost_model_upper_hour_{horizon}.json')
+                if os.path.exists(model_path):
+                    model = xgb.XGBRegressor()
+                    model.load_model(model_path)
+                    self.models_upper[horizon] = model
+                    logging.info(f"Loaded upper bound model for horizon {horizon}h from {model_path}")
             
-            # Load error percentiles if available
-            error_percentiles_path = os.path.join(model_dir, 'error_percentiles.joblib')
-            if os.path.exists(error_percentiles_path):
-                self.error_percentiles = joblib.load(error_percentiles_path)
-                print("Loaded error percentiles for calibrated intervals")
-            
-            print("All models and scalers loaded successfully")
-            return True
-            
+            return len(self.models_median) > 0
         except Exception as e:
-            print(f"Error loading models: {str(e)}")
+            logging.error(f"Error loading models: {str(e)}")
             return False
+
+    def analyze_interval_widths_by_hour(self, X_data, y_data, horizon=1):
+        """
+        Analyze prediction interval widths broken down by hour of day.
+        This helps identify times when the interval width constraint may be harder to satisfy.
+        
+        Parameters:
+        -----------
+        X_data: DataFrame with features 
+        y_data: DataFrame with target values
+        horizon: Forecast horizon to analyze (default: 1 hour ahead)
+        
+        Returns:
+        --------
+        DataFrame: Interval width statistics by hour of day
+        """
+        if not hasattr(self, 'error_percentiles') or horizon not in self.error_percentiles:
+            logging.error(f"No calibrated error percentiles available for horizon {horizon}h")
+            return None
+        
+        if 'datetime' not in X_data.columns:
+            logging.error("Datetime column required for hour-of-day analysis")
+            return None
+        
+        logging.info(f"Analyzing interval widths by hour of day for horizon {horizon}h...")
+        
+        # Get the target column
+        target_col = f'target_GHI_{horizon}h'
+        if target_col not in y_data.columns:
+            logging.error(f"Target column {target_col} not found in validation data")
+            return None
+        
+        # Get actual values and hour of day
+        hours = X_data['datetime'].dt.hour
+        actual = y_data[target_col].values
+        
+        # Filter metadata columns from required features
+        if not hasattr(self, 'feature_columns') or self.feature_columns is None:
+            logging.error("Feature columns not available. Model may not be trained.")
+            return None
+        
+        # Define metadata columns that should be excluded
+        metadata_cols = ['Date', 'datetime', 'Start Period', 'End Period']
+        
+        # Filter to only include feature columns
+        feature_cols = [col for col in self.feature_columns if col not in metadata_cols]
+        
+        # Check if all required feature columns are present
+        missing_features = [col for col in feature_cols if col not in X_data.columns]
+        if missing_features:
+            logging.error(f"Missing required feature columns: {missing_features}")
+            return None
+        
+        # Get median predictions using only the feature columns
+        try:
+            median_preds = self.models_median[horizon].predict(X_data[feature_cols])
+        except Exception as e:
+            logging.error(f"Error making predictions: {str(e)}")
+            return None
+        
+        # Get error percentiles
+        lower_percentile, upper_percentile = self.error_percentiles[horizon]
+        
+        # Calculate prediction bounds
+        lower_bounds = median_preds + lower_percentile
+        upper_bounds = median_preds + upper_percentile
+        
+        # Ensure non-negative bounds and proper ordering
+        lower_bounds = np.maximum(0, lower_bounds)
+        upper_bounds = np.maximum(lower_bounds, upper_bounds)
+        
+        # Calculate interval widths
+        widths = upper_bounds - lower_bounds
+        
+        # Calculate coverage
+        coverage = (actual >= lower_bounds) & (actual <= upper_bounds)
+        
+        # Create a dataframe for analysis
+        analysis_df = pd.DataFrame({
+            'hour': hours,
+            'actual': actual,
+            'predicted': median_preds,
+            'lower_bound': lower_bounds,
+            'upper_bound': upper_bounds,
+            'width': widths,
+            'coverage': coverage
+        })
+        
+        # Group by hour of day and calculate statistics
+        hourly_stats = analysis_df.groupby('hour').agg({
+            'width': ['mean', 'max', 'min', 'std'],
+            'coverage': 'mean',
+            'actual': 'mean',
+            'predicted': 'mean'
+        })
+        
+        # Flatten the multi-index columns
+        hourly_stats.columns = ['_'.join(col).strip() for col in hourly_stats.columns.values]
+        
+        # Add percentage of intervals exceeding max width
+        max_width = 100  # W/m²
+        for hour in range(24):
+            if hour in hourly_stats.index:
+                hour_mask = hours == hour
+                widths_hour = widths[hour_mask]
+                hourly_stats.loc[hour, 'pct_exceeding_max'] = 100 * np.mean(widths_hour > max_width)
+                hourly_stats.loc[hour, 'n_samples'] = np.sum(hour_mask)
+        
+        # Print summary of problematic hours
+        problem_hours = hourly_stats[hourly_stats['width_max'] > max_width].sort_values('width_max', ascending=False)
+        if not problem_hours.empty:
+            logging.info(f"Hours with interval widths exceeding {max_width} W/m² (horizon {horizon}h):")
+            for hour, row in problem_hours.iterrows():
+                logging.info(f"  Hour {hour}: Max width {row['width_max']:.2f} W/m², Avg width {row['width_mean']:.2f} W/m², "
+                            f"Coverage {row['coverage_mean']*100:.2f}%, "
+                            f"{row['pct_exceeding_max']:.1f}% of intervals exceed max width")
+        
+        return hourly_stats
+
+    def predict(self, X_new, return_intervals=True):
+        """
+        Make predictions with empirically calibrated intervals.
+        """
+        logging.info(f"Making multi-horizon predictions for horizons {self.forecast_horizons}...")
+        
+        # Handle metadata columns gracefully - check which ones are available
+        metadata_cols = ['Date', 'datetime', 'Start Period', 'End Period']
+        available_cols = [col for col in metadata_cols if col in X_new.columns]
+        missing_cols = set(metadata_cols) - set(available_cols)
+        
+        # Instead of raising an error, just log the info about missing columns
+        if missing_cols:
+            logging.info(f"Some metadata columns are not in input data: {missing_cols}")
+            logging.info("Continuing with prediction without these columns...")
+        
+        # Get feature columns from the model
+        if self.feature_columns is None:
+            raise ValueError("Model has not been trained (feature_columns is None)")
+        
+        # Filter out metadata columns from required features
+        required_features = [col for col in self.feature_columns 
+                              if col not in metadata_cols]
+        
+        # Get only the columns needed for prediction
+        available_features = [col for col in required_features if col in X_new.columns]
+        missing_features = set(required_features) - set(available_features)
+        
+        if missing_features:
+            raise ValueError(f"Missing required feature columns: {missing_features}")
+        
+        # Debug info about predictions structure
+        self.debug_logger.debug(f"Debug - predictions keys: {self.forecast_horizons}")
+        
+        # Create predictions for each forecast horizon
+        predictions = {}
+        
+        # Create a DataFrame to log nighttime detections for exporting
+        nighttime_log = []
+        
+        for horizon in self.forecast_horizons:
+            if horizon not in self.models_median:
+                raise ValueError(f"No trained model available for {horizon}h horizon")
+            
+            # Make median prediction
+            median_preds = self.models_median[horizon].predict(X_new[available_features])
+            
+            # Initialize predictions dictionary for this horizon
+            horizon_preds = {}
+            
+            # Apply a robust nighttime check for future predictions
+            is_night = np.zeros_like(median_preds, dtype=bool)
+            is_transition = np.zeros_like(median_preds, dtype=bool)  # For dawn/dusk transitions
+            
+            # If datetime information is available, use it to check nighttime directly
+            if 'datetime' in X_new.columns:
+                try:
+                    # Calculate target prediction timestamps for this horizon
+                    future_timestamps = X_new['datetime'] + pd.Timedelta(hours=horizon)
+                    
+                    # For each timestamp, determine if it's nighttime based on time and season
+                    for i, timestamp in enumerate(future_timestamps):
+                        # Extract hour (0-23) from timestamp
+                        hour = timestamp.hour
+                        month = timestamp.month
+                        
+                        # SIMPLIFIED NIGHTTIME DETECTION BASED ON PHILIPPINES CLIMATE
+                        # For Davao City, Philippines (latitude: 7.07)
+                        # The Philippines has two main seasons:
+                        
+                        # For Philippines climate (Tropical)
+                        # Cool dry season (December to February)
+                        if month in [12, 1, 2]:  
+                            is_nighttime = (hour >= 18) or (hour < 6)  # Earlier sunset, later sunrise
+                            is_transition_time = hour == 6 or hour == 17  # Dawn/dusk transition hours
+                            season = "Cool dry"
+                        # Hot dry season (March to May)
+                        elif month in [3, 4, 5]:
+                            is_nighttime = (hour >= 18) or (hour < 5)  # Later sunset, earlier sunrise
+                            is_transition_time = hour == 5 or hour == 17  # Dawn/dusk transition hours
+                            season = "Hot dry"
+                        # Rainy season (June to November)
+                        else:  # months 6-11
+                            is_nighttime = (hour >= 18) or (hour < 6)  # More cloud cover, affects daylight
+                            is_transition_time = hour == 6 or hour == 17  # Dawn/dusk transition hours
+                            season = "Rainy"
+                        
+                        if is_nighttime:
+                            is_night[i] = True
+                            self.debug_logger.debug(f"Horizon {horizon}h prediction at {timestamp} will be during nighttime (hour: {hour}, month: {month}, season: {season})")
+                        elif is_transition_time:
+                            is_transition[i] = True
+                            self.debug_logger.debug(f"Horizon {horizon}h prediction at {timestamp} will be during transition period (hour: {hour}, month: {month}, season: {season})")
+                            
+                        # Add to nighttime log for export
+                        nighttime_log.append({
+                            'horizon': horizon,
+                            'timestamp': timestamp,
+                            'hour': hour,
+                            'month': month,
+                            'season': season,
+                            'is_nighttime': is_nighttime,
+                            'is_transition': is_transition_time
+                        })
+                
+                    # Log summary of detections
+                    self.debug_logger.debug(f"Nighttime check result for horizon {horizon}h: {np.sum(is_night)}/{len(is_night)} nighttime periods detected")
+                    if np.any(is_transition):
+                        self.debug_logger.debug(f"Transition check result for horizon {horizon}h: {np.sum(is_transition)}/{len(is_transition)} transition periods detected")
+                    
+                    # Only show essential info in console
+                    logging.info(f"Horizon {horizon}h: {np.sum(is_night)}/{len(is_night)} nighttime periods, {np.sum(is_transition)}/{len(is_transition)} transition periods detected")
+                    
+                except Exception as e:
+                    logging.warning(f"Could not perform timestamp nighttime check: {str(e)}")
+                    logging.info(f"Falling back to simpler detection for horizon {horizon}h")
+                    
+                    # Fallback: check if horizon extends into typical night hours
+                    current_hour = X_new['datetime'].dt.hour.values[0]
+                    target_hour = (current_hour + horizon) % 24
+                    
+                    # Conservative nighttime check (6 PM to 6 AM)
+                    if target_hour >= 18 or target_hour < 6:
+                        is_night[:] = True
+                        logging.info(f"Fallback: Horizon {horizon}h (target hour {target_hour}) detected as nighttime")
+                    # Check transition periods
+                    elif target_hour == 6 or target_hour == 17:
+                        is_transition[:] = True
+                        logging.info(f"Fallback: Horizon {horizon}h (target hour {target_hour}) detected as transition period")
+            else:
+                # If datetime not available, use solar zenith from the data
+                current_night_mask = X_new['solar_zenith_cos'] <= 0.01
+                is_night |= current_night_mask.values
+                
+                # If available, use transition zone info
+                if 'is_transition' in X_new.columns:
+                    is_transition |= X_new['is_transition'].values.astype(bool)
+                
+                logging.info(f"No datetime available. Using solar zenith and transition indicators for horizon {horizon}h.")
+            
+            # Apply night mask to predictions
+            if np.any(is_night):
+                original_preds = median_preds.copy()
+                median_preds = np.where(is_night, 0, median_preds)
+                logging.info(f"Set {np.sum(is_night)} nighttime predictions to 0 for horizon {horizon}h")
+                # Avoid printing full arrays, just show summary
+                self.debug_logger.debug(f"Before: Mean={np.mean(original_preds):.2f}, After: Mean={np.mean(median_preds):.2f}")
+            
+            # Apply transition adjustments (reduce predictions during dawn/dusk by 70%)
+            if np.any(is_transition):
+                # First ensure no negative values
+                median_preds = np.maximum(0, median_preds)
+                
+                transition_factor = 0.3  # Reduce to 30% of original value
+                original_trans_preds = median_preds.copy()
+                median_preds = np.where(is_transition, median_preds * transition_factor, median_preds)
+                logging.info(f"Reduced {np.sum(is_transition)} transition period predictions to 30% for horizon {horizon}h")
+                self.debug_logger.debug(f"Before transition: Mean={np.mean(original_trans_preds):.2f}, After: Mean={np.mean(median_preds):.2f}")
+            
+            # Store median predictions
+            horizon_preds['predicted'] = median_preds
+            
+            # Add prediction intervals if requested
+            if return_intervals:
+                # Use error percentiles if available (new approach)
+                if hasattr(self, 'error_percentiles') and horizon in self.error_percentiles:
+                    lower_percentile, upper_percentile = self.error_percentiles[horizon]
+                    
+                    # Calculate prediction bounds using error percentiles
+                    lower_bounds = median_preds + lower_percentile
+                    upper_bounds = median_preds + upper_percentile
+                    
+                    # Apply night mask to bounds as well
+                    if np.any(is_night):
+                        lower_bounds = np.where(is_night, 0, lower_bounds)
+                        upper_bounds = np.where(is_night, 0, upper_bounds)
+                    
+                    # Ensure non-negative values before applying transition factor
+                    lower_bounds = np.maximum(0, lower_bounds)
+                    upper_bounds = np.maximum(0, upper_bounds)
+                    
+                    # Apply transition adjustments to bounds as well
+                    if np.any(is_transition):
+                        transition_factor = 0.3  # Same factor as for median predictions
+                        lower_bounds = np.where(is_transition, lower_bounds * transition_factor, lower_bounds)
+                        upper_bounds = np.where(is_transition, upper_bounds * transition_factor, upper_bounds)
+                    
+                    # Enforce maximum interval width constraint, especially at peak solar times
+                    max_interval_width = 100  # W/m²
+                    
+                    # Check for peaks during daytime (not for night or transition)
+                    peak_solar_times = np.zeros_like(median_preds, dtype=bool)
+                    
+                    # If datetime information is available, detect peak solar hours (11am-1pm)
+                    if 'datetime' in X_new.columns:
+                        try:
+                            # Calculate target prediction timestamps for this horizon
+                            future_timestamps = X_new['datetime'] + pd.Timedelta(hours=horizon)
+                            
+                            # Create specific mask for noon and broader peak solar times
+                            noon_times = future_timestamps.dt.hour == 12
+                            peak_solar_times = (future_timestamps.dt.hour >= 11) & (future_timestamps.dt.hour <= 13)
+                            
+                            # Exclude nights and transitions
+                            noon_times = noon_times & ~is_night & ~is_transition
+                            peak_solar_times = peak_solar_times & ~is_night & ~is_transition
+                            
+                            if np.any(peak_solar_times):
+                                self.debug_logger.debug(f"Horizon {horizon}h: {np.sum(peak_solar_times)} peak solar time predictions detected")
+                            if np.any(noon_times):
+                                self.debug_logger.debug(f"Horizon {horizon}h: {np.sum(noon_times)} noon time predictions detected")
+                        except Exception as e:
+                            logging.warning(f"Could not detect peak solar times from timestamps: {str(e)}")
+                            # Continue with empty arrays (all False)
+                            noon_times = np.zeros_like(median_preds, dtype=bool)
+                            peak_solar_times = np.zeros_like(median_preds, dtype=bool)
+                    else:
+                        noon_times = np.zeros_like(median_preds, dtype=bool)
+                        peak_solar_times = np.zeros_like(median_preds, dtype=bool)
+                    
+                    # For non-peak daytime, enforce max width but with more lenient constraint
+                    daytime = ~is_night & ~is_transition & ~peak_solar_times
+                    
+                    # Apply strict width constraints for ALL hours based on calibration results
+                    # This is necessary because our analysis showed that all hours are exceeding the constraints
+                    try:
+                        # Create a copy of the original bounds
+                        original_lower = lower_bounds.copy()
+                        original_upper = upper_bounds.copy()
+                        
+                        # First pass: modify all predictions to respect max width
+                        for i in range(len(lower_bounds)):
+                            # Skip night and transition periods
+                            if is_night[i] or is_transition[i]:
+                                continue
+                                
+                            width = upper_bounds[i] - lower_bounds[i]
+                            if width > max_interval_width:
+                                # For all daytime predictions, enforce max width
+                                midpoint = (upper_bounds[i] + lower_bounds[i]) / 2
+                                pred_level = median_preds[i]
+                                
+                                # Special handling for exact noon (12 PM)
+                                if noon_times[i]:
+                                    # Use more aggressive constraint for noon - 98% of max width to guarantee it stays under limit
+                                    # Apply asymmetric adjustment based on prediction level
+                                    if pred_level > 300:  # Very high GHI (common at noon)
+                                        # More aggressive shrinkage on lower bound since upper bound uncertainty is more critical
+                                        lower_bounds[i] = midpoint - (max_interval_width * 0.58)
+                                        upper_bounds[i] = midpoint + (max_interval_width * 0.4)
+                                    else:
+                                        # Symmetric but reduced scale to ensure we stay under max width
+                                        lower_bounds[i] = midpoint - (max_interval_width * 0.49)
+                                        upper_bounds[i] = midpoint + (max_interval_width * 0.49)
+                                
+                                # Other peak solar times (11am, 1pm)
+                                elif peak_solar_times[i]:
+                                    # High GHI: adjust lower bound more (preserve upper bound)
+                                    if pred_level > 300:
+                                        lower_bounds[i] = midpoint - (max_interval_width * 0.6)
+                                        upper_bounds[i] = midpoint + (max_interval_width * 0.4)
+                                    else:
+                                        lower_bounds[i] = midpoint - (max_interval_width * 0.5)
+                                        upper_bounds[i] = midpoint + (max_interval_width * 0.5)
+                                else:
+                                    # Regular daytime: more symmetric adjustment
+                                    lower_bounds[i] = midpoint - (max_interval_width * 0.5)
+                                    upper_bounds[i] = midpoint + (max_interval_width * 0.5)
+                        
+                        # Second pass: special verification for noon hours to ensure width constraint is strictly met
+                        if np.any(noon_times):
+                            for i in range(len(lower_bounds)):
+                                if noon_times[i]:
+                                    # Check if still exceeding max width
+                                    width = upper_bounds[i] - lower_bounds[i]
+                                    if width > max_interval_width:
+                                        # Force strict adherence to max width by proportional shrinking
+                                        excess = width - max_interval_width
+                                        midpoint = (upper_bounds[i] + lower_bounds[i]) / 2
+                                        
+                                        # Apply a guaranteed width reduction to 99% of max width
+                                        scaling_factor = 0.99 * max_interval_width / width
+                                        half_width = (width * scaling_factor) / 2
+                                        
+                                        lower_bounds[i] = midpoint - half_width
+                                        upper_bounds[i] = midpoint + half_width
+                                        
+                                        logging.info(f"Applied strict noon enforcement: Reduced width from {width:.2f} to {upper_bounds[i] - lower_bounds[i]:.2f} W/m²")
+                        
+                        # Log adjustments if any were made
+                        adjustments_made = np.any(original_lower != lower_bounds)
+                        
+                        if adjustments_made:
+                            # Get statistics on the adjustments
+                            indices = np.where(original_lower != lower_bounds)[0]
+                            widths_before = original_upper[indices] - original_lower[indices]
+                            widths_after = upper_bounds[indices] - lower_bounds[indices]
+                            
+                            # Report overall adjustments
+                            logging.info(f"Horizon {horizon}h: Adjusted {len(indices)} intervals to enforce max width")
+                            logging.info(f"  Average width before: {np.mean(widths_before):.2f} W/m², after: {np.mean(widths_after):.2f} W/m²")
+                            logging.info(f"  Max width before: {np.max(widths_before):.2f} W/m², after: {np.max(widths_after):.2f} W/m²")
+                            
+                            # Report peak hour adjustments specifically
+                            if np.any(peak_solar_times):
+                                peak_indices = np.where(peak_solar_times & (original_lower != lower_bounds))[0]
+                                if len(peak_indices) > 0:
+                                    peak_widths_before = original_upper[peak_indices] - original_lower[peak_indices]
+                                    peak_widths_after = upper_bounds[peak_indices] - lower_bounds[peak_indices]
+                                    logging.info(f"  Peak hours: Adjusted {len(peak_indices)} intervals from "
+                                                f"avg width {np.mean(peak_widths_before):.2f} to {np.mean(peak_widths_after):.2f} W/m²")
+                            
+                            # Report noon hour adjustments specifically
+                            if np.any(noon_times):
+                                noon_indices = np.where(noon_times & (original_lower != lower_bounds))[0]
+                                if len(noon_indices) > 0:
+                                    noon_widths_before = original_upper[noon_indices] - original_lower[noon_indices]
+                                    noon_widths_after = upper_bounds[noon_indices] - lower_bounds[noon_indices]
+                                    logging.info(f"  Noon hours: Adjusted {len(noon_indices)} intervals from "
+                                                f"avg width {np.mean(noon_widths_before):.2f} to {np.mean(noon_widths_after):.2f} W/m²")
+                                    logging.info(f"  Noon hours max width: {np.max(noon_widths_after):.2f} W/m²")
+                    except Exception as e:
+                        logging.error(f"Error enforcing width constraints: {str(e)}")
+                        # Continue with original bounds
+                    
+                    # Final check to ensure bounds are non-negative and lower <= upper
+                    lower_bounds = np.maximum(0, lower_bounds)
+                    upper_bounds = np.maximum(lower_bounds, upper_bounds)
+                    
+                    # One last validation of max width
+                    max_final_width = np.max(upper_bounds - lower_bounds)
+                    if max_final_width > max_interval_width:
+                        logging.warning(f"After all adjustments, max width is still {max_final_width:.2f} W/m²")
+                    
+                    horizon_preds['lower'] = lower_bounds
+                    horizon_preds['upper'] = upper_bounds
+                
+                # Fallback to old approach if error percentiles aren't available
+                elif horizon in self.models_lower and horizon in self.models_upper:
+                    lower_preds = self.models_lower[horizon].predict(X_new[available_features])
+                    upper_preds = self.models_upper[horizon].predict(X_new[available_features])
+                    
+                    # Apply night mask to bounds
+                    if np.any(is_night):
+                        lower_preds = np.where(is_night, 0, lower_preds)
+                        upper_preds = np.where(is_night, 0, upper_preds)
+                        self.debug_logger.debug(f"Set upper/lower bounds to 0 for nighttime predictions")
+                    
+                    # Ensure non-negative values before applying transition factor
+                    lower_preds = np.maximum(0, lower_preds)
+                    upper_preds = np.maximum(0, upper_preds)
+                    
+                    # Apply transition adjustments to bounds
+                    if np.any(is_transition):
+                        transition_factor = 0.3  # Same factor as for median predictions
+                        lower_preds = np.where(is_transition, lower_preds * transition_factor, lower_preds)
+                        upper_preds = np.where(is_transition, upper_preds * transition_factor, upper_preds)
+                        self.debug_logger.debug(f"Reduced upper/lower bounds to 30% for transition period predictions")
+                    
+                    # Enforce max interval width here too
+                    try:
+                        for i in range(len(lower_preds)):
+                            # Skip night and transition periods
+                            if is_night[i] or is_transition[i]:
+                                continue
+                                
+                            width = upper_preds[i] - lower_preds[i]
+                            if width > max_interval_width:
+                                # Enforce max width constraint
+                                midpoint = (upper_preds[i] + lower_preds[i]) / 2
+                                lower_preds[i] = midpoint - (max_interval_width / 2)
+                                upper_preds[i] = midpoint + (max_interval_width / 2)
+                    except Exception as e:
+                        logging.error(f"Error enforcing width constraints (fallback mode): {str(e)}")
+                    
+                    # Final check to ensure bounds are non-negative and lower <= upper
+                    lower_preds = np.maximum(0, lower_preds)
+                    upper_preds = np.maximum(lower_preds, upper_preds)
+                    
+                    horizon_preds['lower'] = lower_preds
+                    horizon_preds['upper'] = upper_preds
+            
+            # Store predictions for this horizon
+            predictions[horizon] = horizon_preds
+        
+        # Print debug info about the first horizon's predictions
+        if predictions and len(predictions) > 0:
+            first_horizon = list(predictions.keys())[0]
+            self.debug_logger.debug(f"Debug - predictions[{first_horizon}] keys: {list(predictions[first_horizon].keys())}")
+        
+        # Save the nighttime detection log to CSV
+        if nighttime_log:
+            os.makedirs('logs', exist_ok=True)
+            nighttime_df = pd.DataFrame(nighttime_log)
+            nighttime_csv = os.path.join('logs', f'nighttime_detection_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+            nighttime_df.to_csv(nighttime_csv, index=False)
+            logging.info(f"Nighttime detection details saved to: {nighttime_csv}")
+        
+        return predictions
 
 
 # Main execution
@@ -2257,6 +3073,7 @@ if __name__ == "__main__":
         val_size = 0.1
         lag_hours = 3
         random_state = 42
+        max_interval_width = 100  # Maximum width between lower and upper bounds in W/m²
         
         # Run the entire pipeline for multi-horizon forecasting
         result = model.run_pipeline(
@@ -2264,7 +3081,8 @@ if __name__ == "__main__":
             test_size=test_size,
             val_size=val_size,
             lag_hours=lag_hours,
-            random_state=random_state
+            random_state=random_state,
+            max_interval_width=max_interval_width
         )
         
         print("\n--- Final Multi-Horizon Metrics ---")
@@ -2320,9 +3138,8 @@ if __name__ == "__main__":
         print("\n===== Making Predictions with Existing Models =====")
         
         # Check if models exist
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        model_file = os.path.join(base_dir, 'xgboost_model_hour_1.json')
-        if not os.path.exists(model_file):
+        model_dir = os.path.dirname(os.path.abspath(__file__))
+        if not os.path.exists(os.path.join(model_dir, 'xgboost_model_hour_1.json')):
             print("\nError: No trained models found. Please train models first (Option 1).")
             return
         
@@ -2336,8 +3153,17 @@ if __name__ == "__main__":
         
         # Generate predictions for future hours
         print("\n--- Predicting Future Hours ---")
+        base_dir = os.path.dirname(os.path.abspath(__file__))
         file_path = os.path.join(base_dir, 'dataset.csv')
-        predictions = model.predict_future_hours(file_path=file_path)
+        num_hours = 4
+        predictions = model.predict_future_hours(file_path=file_path, num_hours=num_hours)
+        
+        # Display interval width information if available
+        if hasattr(model, 'interval_widths') and model.interval_widths:
+            print("\n--- Prediction Interval Widths ---")
+            for horizon, width in model.interval_widths.items():
+                if horizon in model.forecast_horizons:
+                    print(f"Horizon {horizon}h: Average width = {width:.2f} W/m²")
         
         print("\nPrediction completed successfully!")
     
